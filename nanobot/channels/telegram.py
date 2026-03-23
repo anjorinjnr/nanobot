@@ -18,6 +18,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import TelegramConfig
+from nanobot.providers.transcription import TranscriptionProvider
 from nanobot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
@@ -169,11 +170,11 @@ class TelegramChannel(BaseChannel):
         self,
         config: TelegramConfig,
         bus: MessageBus,
-        gemini_api_key: str = "",
+        transcription_provider: TranscriptionProvider | None = None,
     ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
-        self.gemini_api_key = gemini_api_key
+        self._transcription_provider = transcription_provider
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
@@ -618,13 +619,7 @@ class TelegramChannel(BaseChannel):
 
                 # Handle voice/audio transcription
                 if media_type == "voice" or media_type == "audio":
-                    provider_name = os.environ.get(
-                        "VOICE_TRANSCRIPTION_PROVIDER", "gemini"
-                    ).lower()
-                    if provider_name == "disabled":
-                        logger.debug(
-                            "Voice transcription disabled (VOICE_TRANSCRIPTION_PROVIDER=disabled)"
-                        )
+                    if self._transcription_provider is None:
                         content_parts.append(f"[{media_type}: {file_path}]")
                     else:
                         # Read audio into memory; keep path out of media_paths so Homer
@@ -638,15 +633,11 @@ class TelegramChannel(BaseChannel):
                             audio_bytes = b""
 
                         if audio_bytes:
-                            from nanobot.providers.transcription import GeminiTranscriptionProvider
                             mime_type = getattr(media_file, "mime_type", None) or (
                                 "audio/ogg" if media_type == "voice" else "audio/mpeg"
                             )
                             duration = getattr(media_file, "duration", None)
-                            transcriber = GeminiTranscriptionProvider(
-                                api_key=self.gemini_api_key
-                            )
-                            transcription = await transcriber.transcribe_bytes(
+                            transcription = await self._transcription_provider.transcribe(
                                 audio_bytes=audio_bytes,
                                 mime_type=mime_type,
                                 duration_seconds=duration,

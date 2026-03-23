@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Any
 
 from loguru import logger
@@ -12,6 +11,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
+from nanobot.providers.transcription import create_transcription_provider
 
 
 class ChannelManager:
@@ -35,6 +35,13 @@ class ChannelManager:
     def _init_channels(self) -> None:
         """Initialize channels based on config."""
 
+        # Build transcription provider once; inject into any channel that handles voice.
+        # Provider selection and API key resolution are fully encapsulated here —
+        # channels receive only the provider interface and never touch API keys directly.
+        transcription_provider = create_transcription_provider(
+            api_key=self.config.providers.gemini.api_key or None,
+        )
+
         # Telegram channel
         if self.config.channels.telegram.enabled:
             try:
@@ -42,9 +49,7 @@ class ChannelManager:
                 self.channels["telegram"] = TelegramChannel(
                     self.config.channels.telegram,
                     self.bus,
-                    gemini_api_key=os.environ.get(
-                        "GEMINI_API_KEY", self.config.providers.gemini.api_key
-                    ),
+                    transcription_provider=transcription_provider,
                 )
                 logger.info("Telegram channel enabled")
             except ImportError as e:
@@ -57,9 +62,7 @@ class ChannelManager:
                 self.channels["whatsapp"] = WhatsAppChannel(
                     self.config.channels.whatsapp,
                     self.bus,
-                    gemini_api_key=os.environ.get(
-                        "GEMINI_API_KEY", self.config.providers.gemini.api_key
-                    ),
+                    transcription_provider=transcription_provider,
                 )
                 logger.info("WhatsApp channel enabled")
             except ImportError as e:

@@ -4,7 +4,6 @@ import asyncio
 import base64
 import json
 import mimetypes
-import os
 from collections import OrderedDict
 
 from loguru import logger
@@ -13,6 +12,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import WhatsAppConfig
+from nanobot.providers.transcription import TranscriptionProvider
 
 
 class WhatsAppChannel(BaseChannel):
@@ -29,11 +29,11 @@ class WhatsAppChannel(BaseChannel):
         self,
         config: WhatsAppConfig,
         bus: MessageBus,
-        gemini_api_key: str = "",
+        transcription_provider: TranscriptionProvider | None = None,
     ):
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
-        self.gemini_api_key = gemini_api_key
+        self._transcription_provider = transcription_provider
         self._ws = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
@@ -216,11 +216,10 @@ class WhatsAppChannel(BaseChannel):
             logger.error("WhatsApp bridge error: {}", data.get('error'))
 
     async def _transcribe_audio(self, audio_data: dict, sender_id: str) -> str:
-        """
-        Transcribe a voice/audio message using the configured transcription provider.
+        """Transcribe a voice/audio message via the injected transcription provider.
 
-        Audio bytes are received from the bridge as base64-encoded data and decoded
-        entirely in memory — nothing is written to disk on the Python side.
+        Audio bytes from the bridge are base64-encoded and decoded in memory —
+        nothing is written to disk on the Python side.
 
         Args:
             audio_data: Dict with keys ``data`` (base64 str), ``mimetype`` (str),
@@ -230,10 +229,7 @@ class WhatsAppChannel(BaseChannel):
         Returns:
             Transcript string, or a sentinel message on failure.
         """
-        provider_name = os.environ.get("VOICE_TRANSCRIPTION_PROVIDER", "gemini").lower()
-
-        if provider_name == "disabled":
-            logger.debug("Voice transcription disabled (VOICE_TRANSCRIPTION_PROVIDER=disabled)")
+        if self._transcription_provider is None:
             return "[Voice Message]"
 
         try:
@@ -250,25 +246,11 @@ class WhatsAppChannel(BaseChannel):
             sender_id, len(audio_bytes), mimetype, duration,
         )
 
-        if provider_name == "gemini":
-            from nanobot.providers.transcription import GeminiTranscriptionProvider
-            transcriber = GeminiTranscriptionProvider(api_key=self.gemini_api_key)
-            transcript = await transcriber.transcribe_bytes(
-                audio_bytes=audio_bytes,
-                mime_type=mimetype,
-                duration_seconds=duration,
-            )
-        else:
-            logger.warning(
-                "Unknown VOICE_TRANSCRIPTION_PROVIDER '{}', falling back to gemini", provider_name
-            )
-            from nanobot.providers.transcription import GeminiTranscriptionProvider
-            transcriber = GeminiTranscriptionProvider(api_key=self.gemini_api_key)
-            transcript = await transcriber.transcribe_bytes(
-                audio_bytes=audio_bytes,
-                mime_type=mimetype,
-                duration_seconds=duration,
-            )
+        transcript = await self._transcription_provider.transcribe(
+            audio_bytes=audio_bytes,
+            mime_type=mimetype,
+            duration_seconds=duration,
+        )
 
         if transcript:
             logger.info("Transcribed voice message from {}: {}...", sender_id, transcript[:80])
