@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 import unicodedata
@@ -168,11 +169,11 @@ class TelegramChannel(BaseChannel):
         self,
         config: TelegramConfig,
         bus: MessageBus,
-        groq_api_key: str = "",
+        gemini_api_key: str = "",
     ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
-        self.groq_api_key = groq_api_key
+        self.gemini_api_key = gemini_api_key
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
@@ -615,16 +616,48 @@ class TelegramChannel(BaseChannel):
 
                 media_paths.append(str(file_path))
 
-                # Handle voice transcription
+                # Handle voice/audio transcription
                 if media_type == "voice" or media_type == "audio":
-                    from nanobot.providers.transcription import GroqTranscriptionProvider
-                    transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
-                    transcription = await transcriber.transcribe(file_path)
-                    if transcription:
-                        logger.info("Transcribed {}: {}...", media_type, transcription[:50])
-                        content_parts.append(f"[transcription: {transcription}]")
-                    else:
+                    provider_name = os.environ.get(
+                        "VOICE_TRANSCRIPTION_PROVIDER", "gemini"
+                    ).lower()
+                    if provider_name == "disabled":
+                        logger.debug(
+                            "Voice transcription disabled (VOICE_TRANSCRIPTION_PROVIDER=disabled)"
+                        )
                         content_parts.append(f"[{media_type}: {file_path}]")
+                    else:
+                        # Read audio into memory; keep path out of media_paths so Homer
+                        # only sees plain text (the transcript).
+                        media_paths.pop()  # remove the audio file path we just added
+                        try:
+                            with open(file_path, "rb") as af:
+                                audio_bytes = af.read()
+                        except Exception as read_err:
+                            logger.error("Failed to read audio file {}: {}", file_path, read_err)
+                            audio_bytes = b""
+
+                        if audio_bytes:
+                            from nanobot.providers.transcription import GeminiTranscriptionProvider
+                            mime_type = getattr(media_file, "mime_type", None) or (
+                                "audio/ogg" if media_type == "voice" else "audio/mpeg"
+                            )
+                            duration = getattr(media_file, "duration", None)
+                            transcriber = GeminiTranscriptionProvider(
+                                api_key=self.gemini_api_key
+                            )
+                            transcription = await transcriber.transcribe_bytes(
+                                audio_bytes=audio_bytes,
+                                mime_type=mime_type,
+                                duration_seconds=duration,
+                            )
+                            logger.info(
+                                "Transcribed {} from {}: {}...",
+                                media_type, sender_id, transcription[:80],
+                            )
+                            content_parts.append(transcription)
+                        else:
+                            content_parts.append("[Voice message - transcription failed]")
                 else:
                     content_parts.append(f"[{media_type}: {file_path}]")
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 from loguru import logger
@@ -41,7 +42,9 @@ class ChannelManager:
                 self.channels["telegram"] = TelegramChannel(
                     self.config.channels.telegram,
                     self.bus,
-                    groq_api_key=self.config.providers.groq.api_key,
+                    gemini_api_key=os.environ.get(
+                        "GEMINI_API_KEY", self.config.providers.gemini.api_key
+                    ),
                 )
                 logger.info("Telegram channel enabled")
             except ImportError as e:
@@ -52,7 +55,11 @@ class ChannelManager:
             try:
                 from nanobot.channels.whatsapp import WhatsAppChannel
                 self.channels["whatsapp"] = WhatsAppChannel(
-                    self.config.channels.whatsapp, self.bus
+                    self.config.channels.whatsapp,
+                    self.bus,
+                    gemini_api_key=os.environ.get(
+                        "GEMINI_API_KEY", self.config.providers.gemini.api_key
+                    ),
                 )
                 logger.info("WhatsApp channel enabled")
             except ImportError as e:

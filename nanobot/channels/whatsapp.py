@@ -1,8 +1,10 @@
 """WhatsApp channel implementation using Node.js bridge."""
 
 import asyncio
+import base64
 import json
 import mimetypes
+import os
 from collections import OrderedDict
 
 from loguru import logger
@@ -23,9 +25,15 @@ class WhatsAppChannel(BaseChannel):
 
     name = "whatsapp"
 
-    def __init__(self, config: WhatsAppConfig, bus: MessageBus):
+    def __init__(
+        self,
+        config: WhatsAppConfig,
+        bus: MessageBus,
+        gemini_api_key: str = "",
+    ):
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
+        self.gemini_api_key = gemini_api_key
         self._ws = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
@@ -160,10 +168,10 @@ class WhatsAppChannel(BaseChannel):
             sender_id = user_id.split("@")[0] if "@" in user_id else user_id
             logger.info("Sender {}", sender)
 
-            # Handle voice transcription if it's a voice message
-            if content == "[Voice Message]":
-                logger.info("Voice message received from {}, but direct download from bridge is not yet supported.", sender_id)
-                content = "[Voice Message: Transcription not available for WhatsApp yet]"
+            # Handle voice/audio message transcription
+            audio_data = data.get("audio")
+            if audio_data:
+                content = await self._transcribe_audio(audio_data, sender_id)
 
             # Extract media paths (images/documents/videos downloaded by the bridge)
             media_paths = data.get("media") or []
@@ -206,3 +214,66 @@ class WhatsAppChannel(BaseChannel):
 
         elif msg_type == "error":
             logger.error("WhatsApp bridge error: {}", data.get('error'))
+
+    async def _transcribe_audio(self, audio_data: dict, sender_id: str) -> str:
+        """
+        Transcribe a voice/audio message using the configured transcription provider.
+
+        Audio bytes are received from the bridge as base64-encoded data and decoded
+        entirely in memory — nothing is written to disk on the Python side.
+
+        Args:
+            audio_data: Dict with keys ``data`` (base64 str), ``mimetype`` (str),
+                        and optionally ``duration`` (float seconds).
+            sender_id: Sender identifier used for log context.
+
+        Returns:
+            Transcript string, or a sentinel message on failure.
+        """
+        provider_name = os.environ.get("VOICE_TRANSCRIPTION_PROVIDER", "gemini").lower()
+
+        if provider_name == "disabled":
+            logger.debug("Voice transcription disabled (VOICE_TRANSCRIPTION_PROVIDER=disabled)")
+            return "[Voice Message]"
+
+        try:
+            audio_bytes = base64.b64decode(audio_data.get("data", ""))
+        except Exception as e:
+            logger.error("Failed to decode audio bytes from bridge for {}: {}", sender_id, e)
+            return "[Voice message - transcription failed]"
+
+        mimetype = audio_data.get("mimetype", "audio/ogg; codecs=opus")
+        duration = audio_data.get("duration")
+
+        logger.info(
+            "Transcribing voice message from {} ({} bytes, mimetype={}, duration={}s)",
+            sender_id, len(audio_bytes), mimetype, duration,
+        )
+
+        if provider_name == "gemini":
+            from nanobot.providers.transcription import GeminiTranscriptionProvider
+            transcriber = GeminiTranscriptionProvider(api_key=self.gemini_api_key)
+            transcript = await transcriber.transcribe_bytes(
+                audio_bytes=audio_bytes,
+                mime_type=mimetype,
+                duration_seconds=duration,
+            )
+        else:
+            logger.warning(
+                "Unknown VOICE_TRANSCRIPTION_PROVIDER '{}', falling back to gemini", provider_name
+            )
+            from nanobot.providers.transcription import GeminiTranscriptionProvider
+            transcriber = GeminiTranscriptionProvider(api_key=self.gemini_api_key)
+            transcript = await transcriber.transcribe_bytes(
+                audio_bytes=audio_bytes,
+                mime_type=mimetype,
+                duration_seconds=duration,
+            )
+
+        if transcript:
+            logger.info("Transcribed voice message from {}: {}...", sender_id, transcript[:80])
+        else:
+            logger.warning("Empty transcript for voice message from {}", sender_id)
+            transcript = "[Voice message - transcription failed]"
+
+        return transcript
