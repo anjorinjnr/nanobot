@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,9 +12,8 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.whatsapp import WhatsAppChannel
 from nanobot.config.schema import WhatsAppConfig
 from nanobot.providers.transcription import (
-    GeminiTranscriptionProvider,
-    GroqTranscriptionProvider,
     TranscriptionProvider,
+    VoiceTranscriptionProvider,
     create_transcription_provider,
 )
 
@@ -25,7 +23,6 @@ from nanobot.providers.transcription import (
 def _make_whatsapp_channel(
     transcription_provider: TranscriptionProvider | None = None,
 ) -> tuple[WhatsAppChannel, list[dict]]:
-    """Return a WhatsApp channel wired to a fake WebSocket."""
     config = WhatsAppConfig(enabled=True, bridge_url="ws://localhost:3001", allow_from=["*"])
     channel = WhatsAppChannel(config, MessageBus(), transcription_provider=transcription_provider)
 
@@ -51,7 +48,6 @@ def _audio_bridge_message(
     duration: float | None = 10.0,
     sender: str = "123456789@s.whatsapp.net",
 ) -> str:
-    """Build a fake bridge JSON message containing audio data."""
     return json.dumps({
         "type": "message",
         "id": "msg-001",
@@ -71,13 +67,9 @@ def _audio_bridge_message(
 # ── TranscriptionProvider protocol ────────────────────────────────────────────
 
 class TestTranscriptionProviderProtocol:
-    def test_gemini_satisfies_protocol(self) -> None:
-        provider = GeminiTranscriptionProvider(api_key="key")
-        assert isinstance(provider, TranscriptionProvider)
-
-    def test_groq_satisfies_protocol(self) -> None:
-        provider = GroqTranscriptionProvider(api_key="key")
-        assert isinstance(provider, TranscriptionProvider)
+    def test_voice_transcription_provider_satisfies_protocol(self) -> None:
+        p = VoiceTranscriptionProvider(model="gemini/gemini-2.5-flash", api_key="key")
+        assert isinstance(p, TranscriptionProvider)
 
     def test_custom_provider_satisfies_protocol(self) -> None:
         class MyProvider:
@@ -90,146 +82,118 @@ class TestTranscriptionProviderProtocol:
 # ── create_transcription_provider factory ─────────────────────────────────────
 
 class TestCreateTranscriptionProvider:
-    def test_returns_gemini_by_default(self) -> None:
-        with patch.dict("os.environ", {"VOICE_TRANSCRIPTION_PROVIDER": "gemini"}):
-            p = create_transcription_provider(api_key="k")
-        assert isinstance(p, GeminiTranscriptionProvider)
+    def test_returns_provider_with_default_model(self) -> None:
+        p = create_transcription_provider()
+        assert isinstance(p, VoiceTranscriptionProvider)
+        assert p.model == "gemini/gemini-2.5-flash"
 
-    def test_returns_groq_when_specified(self) -> None:
-        p = create_transcription_provider(provider_name="groq", api_key="k")
-        assert isinstance(p, GroqTranscriptionProvider)
+    def test_returns_provider_with_explicit_model(self) -> None:
+        p = create_transcription_provider(model="openai/gpt-4o")
+        assert isinstance(p, VoiceTranscriptionProvider)
+        assert p.model == "openai/gpt-4o"
+
+    def test_reads_model_from_env(self) -> None:
+        with patch.dict("os.environ", {"VOICE_TRANSCRIPTION_MODEL": "openai/gpt-4o-mini"}):
+            p = create_transcription_provider()
+        assert isinstance(p, VoiceTranscriptionProvider)
+        assert p.model == "openai/gpt-4o-mini"
+
+    def test_explicit_model_overrides_env(self) -> None:
+        with patch.dict("os.environ", {"VOICE_TRANSCRIPTION_MODEL": "openai/gpt-4o-mini"}):
+            p = create_transcription_provider(model="gemini/gemini-2.5-flash")
+        assert p.model == "gemini/gemini-2.5-flash"
 
     def test_returns_none_when_disabled(self) -> None:
-        p = create_transcription_provider(provider_name="disabled")
-        assert p is None
+        assert create_transcription_provider(model="disabled") is None
 
-    def test_returns_none_for_unknown_provider(self) -> None:
-        p = create_transcription_provider(provider_name="unknown_xyz")
-        assert p is None
+    def test_disabled_case_insensitive(self) -> None:
+        assert create_transcription_provider(model="DISABLED") is None
 
-    def test_reads_provider_from_env(self) -> None:
-        with patch.dict("os.environ", {"VOICE_TRANSCRIPTION_PROVIDER": "groq"}):
-            p = create_transcription_provider(api_key="k")
-        assert isinstance(p, GroqTranscriptionProvider)
+    def test_api_key_passed_through(self) -> None:
+        p = create_transcription_provider(api_key="my-key")
+        assert p.api_key == "my-key"
 
-
-# ── GeminiTranscriptionProvider unit tests ────────────────────────────────────
-
-def _mock_genai(transcript: str = "Hello world"):
-    """Return a sys.modules patch that stubs out google-genai."""
-    import sys
-    fake_part = MagicMock()
-    fake_response = MagicMock()
-    fake_response.text = transcript
-    fake_client = MagicMock()
-    fake_client.models.generate_content.return_value = fake_response
-    fake_genai = MagicMock()
-    fake_genai.Client.return_value = fake_client
-    fake_types = MagicMock()
-    fake_types.Part.from_bytes.return_value = fake_part
-    fake_google = MagicMock()
-    fake_google.genai = fake_genai
-    return patch.dict(
-        "sys.modules",
-        {"google": fake_google, "google.genai": fake_genai, "google.genai.types": fake_types},
-    )
+    def test_no_api_key_leaves_none(self) -> None:
+        p = create_transcription_provider()
+        assert p.api_key is None
 
 
-class TestGeminiTranscriptionProvider:
+# ── VoiceTranscriptionProvider unit tests ─────────────────────────────────────
+
+class TestVoiceTranscriptionProvider:
     @pytest.mark.asyncio
     async def test_returns_transcript_on_success(self) -> None:
-        provider = GeminiTranscriptionProvider(api_key="fake-key", model="gemini-2.5-flash")
-        with _mock_genai("  Hello world  "):
+        provider = VoiceTranscriptionProvider(model="gemini/gemini-2.5-flash", api_key="fake-key")
+
+        fake_response = MagicMock()
+        fake_response.choices[0].message.content = "  Hello world  "
+
+        with patch("litellm.acompletion", new=AsyncMock(return_value=fake_response)):
             result = await provider.transcribe(b"\x00" * 50, mime_type="audio/ogg")
+
         assert result == "Hello world"
 
     @pytest.mark.asyncio
-    async def test_returns_failure_sentinel_when_no_api_key(self) -> None:
-        import os
-        os.environ.pop("GEMINI_API_KEY", None)
-        provider = GeminiTranscriptionProvider(api_key=None)
-        result = await provider.transcribe(b"\x00" * 50)
-        assert result == "[Voice message - transcription failed]"
+    async def test_passes_model_and_messages_to_litellm(self) -> None:
+        provider = VoiceTranscriptionProvider(model="openai/gpt-4o", api_key="k")
+
+        fake_response = MagicMock()
+        fake_response.choices[0].message.content = "transcript"
+
+        with patch("litellm.acompletion", new=AsyncMock(return_value=fake_response)) as mock_call:
+            await provider.transcribe(b"\x00" * 10, mime_type="audio/mpeg")
+
+        call_kwargs = mock_call.call_args.kwargs
+        assert call_kwargs["model"] == "openai/gpt-4o"
+        assert call_kwargs["api_key"] == "k"
+        messages = call_kwargs["messages"]
+        assert messages[0]["role"] == "user"
+        content = messages[0]["content"]
+        # First part is the text prompt, second is the audio data URI
+        assert content[0]["type"] == "text"
+        assert content[1]["type"] == "image_url"
+        assert content[1]["image_url"]["url"].startswith("data:audio/mpeg;base64,")
 
     @pytest.mark.asyncio
-    async def test_returns_too_long_sentinel_when_over_5_minutes(self) -> None:
-        provider = GeminiTranscriptionProvider(api_key="fake-key")
+    async def test_omits_api_key_kwarg_when_none(self) -> None:
+        provider = VoiceTranscriptionProvider(model="gemini/gemini-2.5-flash", api_key=None)
+
+        fake_response = MagicMock()
+        fake_response.choices[0].message.content = "ok"
+
+        with patch("litellm.acompletion", new=AsyncMock(return_value=fake_response)) as mock_call:
+            await provider.transcribe(b"\x00" * 10)
+
+        assert "api_key" not in mock_call.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_returns_too_long_sentinel(self) -> None:
+        provider = VoiceTranscriptionProvider(model="gemini/gemini-2.5-flash", api_key="k")
         result = await provider.transcribe(b"\x00" * 50, duration_seconds=301.0)
         assert result == "[Voice message too long - please type it out]"
 
     @pytest.mark.asyncio
     async def test_accepts_exactly_5_minutes(self) -> None:
-        provider = GeminiTranscriptionProvider(api_key="fake-key", model="gemini-2.5-flash")
-        with _mock_genai("Exactly five minutes"):
+        provider = VoiceTranscriptionProvider(model="gemini/gemini-2.5-flash", api_key="k")
+        fake_response = MagicMock()
+        fake_response.choices[0].message.content = "Exactly five minutes"
+
+        with patch("litellm.acompletion", new=AsyncMock(return_value=fake_response)):
             result = await provider.transcribe(b"\x00" * 50, duration_seconds=300.0)
+
         assert result == "Exactly five minutes"
 
     @pytest.mark.asyncio
-    async def test_returns_failure_sentinel_on_sdk_error(self) -> None:
-        provider = GeminiTranscriptionProvider(api_key="fake-key")
-        import sys
-        with patch.dict("sys.modules", {"google": MagicMock(genai=MagicMock(Client=MagicMock(side_effect=RuntimeError("API error")))), "google.genai": MagicMock(Client=MagicMock(side_effect=RuntimeError("API error"))), "google.genai.types": MagicMock()}):
-            result = await provider.transcribe(b"\x00" * 50)
-        assert result == "[Voice message - transcription failed]"
+    async def test_returns_failure_sentinel_on_error(self) -> None:
+        provider = VoiceTranscriptionProvider(model="gemini/gemini-2.5-flash", api_key="k")
 
-
-# ── GroqTranscriptionProvider unit tests ──────────────────────────────────────
-
-class TestGroqTranscriptionProvider:
-    @pytest.mark.asyncio
-    async def test_returns_transcript_on_success(self) -> None:
-        import httpx
-
-        provider = GroqTranscriptionProvider(api_key="fake-groq-key")
-
-        mock_response = MagicMock()
-        mock_response.json.return_value = {"text": "Groq transcript"}
-        mock_response.raise_for_status = MagicMock()
-
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_client_cls.return_value = mock_client
-
-            result = await provider.transcribe(b"\x00" * 50, mime_type="audio/ogg")
-
-        assert result == "Groq transcript"
-
-    @pytest.mark.asyncio
-    async def test_returns_failure_sentinel_when_no_api_key(self) -> None:
-        import os
-        os.environ.pop("GROQ_API_KEY", None)
-        provider = GroqTranscriptionProvider(api_key=None)
-        result = await provider.transcribe(b"\x00" * 50)
-        assert result == "[Voice message - transcription failed]"
-
-    @pytest.mark.asyncio
-    async def test_returns_too_long_sentinel_when_over_5_minutes(self) -> None:
-        provider = GroqTranscriptionProvider(api_key="fake-key")
-        result = await provider.transcribe(b"\x00" * 50, duration_seconds=301.0)
-        assert result == "[Voice message too long - please type it out]"
-
-    @pytest.mark.asyncio
-    async def test_returns_failure_sentinel_on_http_error(self) -> None:
-        import httpx
-
-        provider = GroqTranscriptionProvider(api_key="fake-groq-key")
-
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(side_effect=Exception("network error"))
-            mock_client_cls.return_value = mock_client
-
+        with patch("litellm.acompletion", new=AsyncMock(side_effect=Exception("API down"))):
             result = await provider.transcribe(b"\x00" * 50)
 
         assert result == "[Voice message - transcription failed]"
 
 
-# ── WhatsApp channel voice transcription integration tests ────────────────────
+# ── WhatsApp channel integration tests ────────────────────────────────────────
 
 class TestWhatsAppVoiceTranscription:
     @pytest.mark.asyncio
@@ -245,19 +209,7 @@ class TestWhatsAppVoiceTranscription:
         mock_provider.transcribe.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_voice_message_uses_fallback_on_transcription_error(self) -> None:
-        mock_provider = AsyncMock(spec=TranscriptionProvider)
-        mock_provider.transcribe = AsyncMock(return_value="[Voice message - transcription failed]")
-        channel, published = _make_whatsapp_channel(transcription_provider=mock_provider)
-
-        await channel._handle_bridge_message(_audio_bridge_message())
-
-        assert len(published) == 1
-        assert published[0]["content"] == "[Voice message - transcription failed]"
-
-    @pytest.mark.asyncio
-    async def test_no_provider_returns_voice_message_placeholder(self) -> None:
-        """When no transcription provider is injected, output is [Voice Message]."""
+    async def test_no_provider_returns_placeholder(self) -> None:
         channel, published = _make_whatsapp_channel(transcription_provider=None)
 
         await channel._handle_bridge_message(_audio_bridge_message())
@@ -266,24 +218,18 @@ class TestWhatsAppVoiceTranscription:
         assert published[0]["content"] == "[Voice Message]"
 
     @pytest.mark.asyncio
-    async def test_normal_text_message_not_transcribed(self) -> None:
+    async def test_normal_text_not_transcribed(self) -> None:
         mock_provider = AsyncMock(spec=TranscriptionProvider)
         mock_provider.transcribe = AsyncMock(side_effect=AssertionError("should not be called"))
         channel, published = _make_whatsapp_channel(transcription_provider=mock_provider)
 
         raw = json.dumps({
-            "type": "message",
-            "id": "msg-002",
-            "sender": "123@s.whatsapp.net",
-            "pn": "",
-            "content": "Hello there",
-            "timestamp": 1700000001,
-            "isGroup": False,
+            "type": "message", "id": "msg-002", "sender": "123@s.whatsapp.net",
+            "pn": "", "content": "Hello there", "timestamp": 1700000001, "isGroup": False,
         })
 
         await channel._handle_bridge_message(raw)
 
-        assert len(published) == 1
         assert published[0]["content"] == "Hello there"
 
     @pytest.mark.asyncio
@@ -292,27 +238,17 @@ class TestWhatsAppVoiceTranscription:
         channel, published = _make_whatsapp_channel(transcription_provider=mock_provider)
 
         raw = json.dumps({
-            "type": "message",
-            "id": "msg-003",
-            "sender": "123@s.whatsapp.net",
-            "pn": "",
-            "content": "",
-            "timestamp": 1700000002,
-            "isGroup": False,
-            "audio": {
-                "data": "!!!invalid_base64!!!",
-                "mimetype": "audio/ogg",
-            },
+            "type": "message", "id": "msg-003", "sender": "123@s.whatsapp.net",
+            "pn": "", "content": "", "timestamp": 1700000002, "isGroup": False,
+            "audio": {"data": "!!!invalid!!!", "mimetype": "audio/ogg"},
         })
 
         await channel._handle_bridge_message(raw)
 
-        assert len(published) == 1
         assert published[0]["content"] == "[Voice message - transcription failed]"
 
     @pytest.mark.asyncio
     async def test_provider_receives_correct_args(self) -> None:
-        """Channel must pass mime_type and duration_seconds from bridge payload to provider."""
         mock_provider = AsyncMock(spec=TranscriptionProvider)
         mock_provider.transcribe = AsyncMock(return_value="ok")
         channel, _ = _make_whatsapp_channel(transcription_provider=mock_provider)

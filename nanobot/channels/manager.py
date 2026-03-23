@@ -38,8 +38,15 @@ class ChannelManager:
         # Build transcription provider once; inject into any channel that handles voice.
         # Provider selection and API key resolution are fully encapsulated here —
         # channels receive only the provider interface and never touch API keys directly.
+        t = self.config.providers.transcription
+        t_model = t.model or None
+        # Derive fallback API key from the model's provider prefix (e.g. "gemini/..." → providers.gemini)
+        t_api_key = t.api_key or self._fallback_api_key_for_model(
+            t_model or "gemini/gemini-2.5-flash"
+        )
         transcription_provider = create_transcription_provider(
-            api_key=self.config.providers.gemini.api_key or None,
+            model=t_model,
+            api_key=t_api_key or None,
         )
 
         # Telegram channel
@@ -161,6 +168,17 @@ class ChannelManager:
                 logger.warning("Matrix channel not available: {}", e)
 
         self._validate_allow_from()
+
+    def _fallback_api_key_for_model(self, model: str) -> str:
+        """Return the configured API key for the provider inferred from the model prefix.
+
+        "gemini/gemini-2.5-flash" → providers.gemini.api_key
+        "openai/gpt-4o"          → providers.openai.api_key
+        Unrecognised prefix       → ""  (LiteLLM will read from env)
+        """
+        prefix = model.split("/")[0] if "/" in model else ""
+        provider_cfg = getattr(self.config.providers, prefix, None)
+        return provider_cfg.api_key if provider_cfg is not None else ""
 
     def _validate_allow_from(self) -> None:
         for name, ch in self.channels.items():
