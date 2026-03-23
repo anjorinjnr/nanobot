@@ -82,10 +82,11 @@ class TestTranscriptionProviderProtocol:
 # ── create_transcription_provider factory ─────────────────────────────────────
 
 class TestCreateTranscriptionProvider:
-    def test_returns_provider_with_default_model(self) -> None:
-        p = create_transcription_provider()
-        assert isinstance(p, VoiceTranscriptionProvider)
-        assert p.model == "gemini/gemini-2.5-flash"
+    def test_returns_none_when_no_model_configured(self) -> None:
+        # Transcription is opt-in — no config means disabled
+        with patch.dict("os.environ", {}, clear=True):
+            p = create_transcription_provider()
+        assert p is None
 
     def test_returns_provider_with_explicit_model(self) -> None:
         p = create_transcription_provider(model="openai/gpt-4o")
@@ -110,11 +111,11 @@ class TestCreateTranscriptionProvider:
         assert create_transcription_provider(model="DISABLED") is None
 
     def test_api_key_passed_through(self) -> None:
-        p = create_transcription_provider(api_key="my-key")
+        p = create_transcription_provider(model="gemini/gemini-2.5-flash", api_key="my-key")
         assert p.api_key == "my-key"
 
     def test_no_api_key_leaves_none(self) -> None:
-        p = create_transcription_provider()
+        p = create_transcription_provider(model="gemini/gemini-2.5-flash")
         assert p.api_key is None
 
 

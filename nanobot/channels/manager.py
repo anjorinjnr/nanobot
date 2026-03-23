@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 from loguru import logger
@@ -36,14 +37,19 @@ class ChannelManager:
         """Initialize channels based on config."""
 
         # Build transcription provider once; inject into any channel that handles voice.
-        # Provider selection and API key resolution are fully encapsulated here —
-        # channels receive only the provider interface and never touch API keys directly.
+        # Model resolution order:
+        #   1. providers.transcription.model (explicit override)
+        #   2. VOICE_TRANSCRIPTION_MODEL env var
+        #   3. agents.defaults.model (reuse the main agent model — most are multimodal)
+        # API key resolution: transcription.api_key → provider key for the resolved model.
         t = self.config.providers.transcription
-        t_model = t.model or None
-        # Derive fallback API key from the model's provider prefix (e.g. "gemini/..." → providers.gemini)
-        t_api_key = t.api_key or self._fallback_api_key_for_model(
-            t_model or "gemini/gemini-2.5-flash"
+        t_model = (
+            t.model
+            or os.environ.get("VOICE_TRANSCRIPTION_MODEL")
+            or self.config.agents.defaults.model
+            or None
         )
+        t_api_key = t.api_key or (self.config.get_api_key(t_model) if t_model else None)
         transcription_provider = create_transcription_provider(
             model=t_model,
             api_key=t_api_key or None,
@@ -168,17 +174,6 @@ class ChannelManager:
                 logger.warning("Matrix channel not available: {}", e)
 
         self._validate_allow_from()
-
-    def _fallback_api_key_for_model(self, model: str) -> str:
-        """Return the configured API key for the provider inferred from the model prefix.
-
-        "gemini/gemini-2.5-flash" → providers.gemini.api_key
-        "openai/gpt-4o"          → providers.openai.api_key
-        Unrecognised prefix       → ""  (LiteLLM will read from env)
-        """
-        prefix = model.split("/")[0] if "/" in model else ""
-        provider_cfg = getattr(self.config.providers, prefix, None)
-        return provider_cfg.api_key if provider_cfg is not None else ""
 
     def _validate_allow_from(self) -> None:
         for name, ch in self.channels.items():

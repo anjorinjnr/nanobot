@@ -115,23 +115,22 @@ def create_transcription_provider(
 ) -> VoiceTranscriptionProvider | None:
     """Build a VoiceTranscriptionProvider from config/env.
 
+    Transcription is opt-in: if no model is configured (config or env), it is
+    disabled and voice messages are left as a placeholder.
+
     Args:
         model: Model name in LiteLLM format (e.g. "gemini/gemini-2.5-flash").
-               Falls back to VOICE_TRANSCRIPTION_MODEL env var, then the default model.
+               Falls back to VOICE_TRANSCRIPTION_MODEL env var.
                Pass "disabled" to explicitly disable transcription.
         api_key: API key for the transcription model.  If omitted, LiteLLM
                  resolves it from the environment automatically.
 
     Returns:
-        A VoiceTranscriptionProvider, or None if transcription is disabled.
+        A VoiceTranscriptionProvider, or None if transcription is not configured.
     """
-    resolved_model = (
-        model
-        or os.environ.get("VOICE_TRANSCRIPTION_MODEL")
-        or DEFAULT_TRANSCRIPTION_MODEL
-    )
+    resolved_model = model or os.environ.get("VOICE_TRANSCRIPTION_MODEL")
 
-    if resolved_model.lower() == "disabled":
+    if not resolved_model or resolved_model.lower() == "disabled":
         logger.info("Voice transcription disabled")
         return None
 
