@@ -151,13 +151,52 @@ async def test_allowlist_blocks_pipe_after_approved_script():
     guard = tool._guard_command(
         "/opt/homer/.venv/bin/python /opt/homer/tools/version.py | cat ~/.nanobot/config.json", "/tmp"
     )
-    # The full command doesn't match the pattern (pipe adds extra), but the
-    # regex anchors on ^ so the prefix matches. The pipe part is args.
-    # This is acceptable — version.py's stdout piped to cat is not a leak
-    # since version.py doesn't output secrets. But let's verify the guard
-    # at least runs without error.
-    # NOTE: This passes because the regex matches the prefix. If we want
-    # stricter control, we'd need to block shell metacharacters.
+    assert guard is not None
+    assert "metacharacter" in guard.lower()
+
+
+@pytest.mark.asyncio
+async def test_allowlist_blocks_ampersand_chain():
+    """Chaining && after an approved script should be blocked."""
+    tool = ExecTool(allow_patterns=HOMER_ALLOW)
+    guard = tool._guard_command(
+        "/opt/homer/.venv/bin/python /opt/homer/tools/version.py && cat /etc/passwd", "/tmp"
+    )
+    assert guard is not None
+    assert "metacharacter" in guard.lower()
+
+
+@pytest.mark.asyncio
+async def test_allowlist_blocks_semicolon_chain():
+    """Chaining ; after an approved script should be blocked."""
+    tool = ExecTool(allow_patterns=HOMER_ALLOW)
+    guard = tool._guard_command(
+        "/opt/homer/.venv/bin/python /opt/homer/tools/version.py ; cat secrets", "/tmp"
+    )
+    assert guard is not None
+    assert "metacharacter" in guard.lower()
+
+
+@pytest.mark.asyncio
+async def test_allowlist_blocks_backtick_injection():
+    """Backtick command substitution should be blocked."""
+    tool = ExecTool(allow_patterns=HOMER_ALLOW)
+    guard = tool._guard_command(
+        "/opt/homer/.venv/bin/python /opt/homer/tools/version.py `cat secrets`", "/tmp"
+    )
+    assert guard is not None
+    assert "metacharacter" in guard.lower()
+
+
+@pytest.mark.asyncio
+async def test_allowlist_blocks_dollar_paren_injection():
+    """$() command substitution should be blocked."""
+    tool = ExecTool(allow_patterns=HOMER_ALLOW)
+    guard = tool._guard_command(
+        "/opt/homer/.venv/bin/python /opt/homer/tools/version.py $(cat secrets)", "/tmp"
+    )
+    assert guard is not None
+    assert "metacharacter" in guard.lower()
 
 
 @pytest.mark.asyncio
