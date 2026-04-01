@@ -31,6 +31,8 @@ class ChannelManager:
         self.bus = bus
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        self._channel_queues: dict[str, asyncio.Queue[tuple[BaseChannel, OutboundMessage]]] = {}
+        self._channel_workers: dict[str, asyncio.Task] = {}
 
         self._init_channels()
 
@@ -106,6 +108,16 @@ class ChannelManager:
             except asyncio.CancelledError:
                 pass
 
+        # Stop per-channel workers
+        for name, task in self._channel_workers.items():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._channel_workers.clear()
+        self._channel_queues.clear()
+
         # Stop all channels
         for name, channel in self.channels.items():
             try:
@@ -151,7 +163,7 @@ class ChannelManager:
 
                 channel = self.channels.get(msg.channel)
                 if channel:
-                    await self._send_with_retry(channel, msg)
+                    await self._enqueue_channel_send(msg.channel, channel, msg)
                 else:
                     logger.warning("Unknown channel: {}", msg.channel)
                     if msg._delivery_future and not msg._delivery_future.done():
@@ -163,6 +175,31 @@ class ChannelManager:
                 continue
             except asyncio.CancelledError:
                 break
+
+    async def _enqueue_channel_send(
+        self, channel_name: str, channel: BaseChannel, msg: OutboundMessage
+    ) -> None:
+        """Enqueue a message for per-channel delivery (non-blocking for other channels)."""
+        if channel_name not in self._channel_queues:
+            q: asyncio.Queue[tuple[BaseChannel, OutboundMessage]] = asyncio.Queue()
+            self._channel_queues[channel_name] = q
+            self._channel_workers[channel_name] = asyncio.create_task(
+                self._channel_worker(channel_name, q)
+            )
+        await self._channel_queues[channel_name].put((channel, msg))
+
+    async def _channel_worker(
+        self, name: str, q: asyncio.Queue[tuple[BaseChannel, OutboundMessage]]
+    ) -> None:
+        """Process outbound messages for a single channel, preserving order."""
+        while True:
+            try:
+                channel, msg = await q.get()
+                await self._send_with_retry(channel, msg)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Channel worker {} error: {}", name, e)
 
     @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
