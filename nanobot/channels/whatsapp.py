@@ -180,7 +180,7 @@ class WhatsAppChannel(BaseChannel):
         msg_id = self._next_msg_id()
         payload["msg_id"] = msg_id
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut: asyncio.Future[None] = loop.create_future()
         self._pending_acks[msg_id] = fut
 
@@ -209,7 +209,11 @@ class WhatsAppChannel(BaseChannel):
                 logger.error("Error sending WhatsApp message: {}", e)
                 raise
 
+        already_sent = set(msg.metadata.get("_sent_media", []))
+        sent_media: list[str] = list(already_sent)
         for i, media_path in enumerate(msg.media or []):
+            if media_path in already_sent:
+                continue
             try:
                 mime, _ = mimetypes.guess_type(media_path)
                 payload = {
@@ -219,10 +223,13 @@ class WhatsAppChannel(BaseChannel):
                     "mimetype": mime or "application/octet-stream",
                     "fileName": media_path.rsplit("/", 1)[-1],
                 }
-                if i == 0 and msg.content:
+                if i == 0 and msg.content and not already_sent:
                     payload["caption"] = msg.content
                 await self._send_and_await_ack(payload)
+                sent_media.append(media_path)
             except Exception as e:
+                # Record which media succeeded so retries can skip them
+                msg.metadata["_sent_media"] = sent_media
                 logger.error("Error sending WhatsApp media {}: {}", media_path, e)
                 raise
 

@@ -95,7 +95,7 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         delivery_future: asyncio.Future[None] = loop.create_future()
 
         msg = OutboundMessage(
