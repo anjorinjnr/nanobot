@@ -135,8 +135,12 @@ class ChannelManager:
 
                 if msg.metadata.get("_progress"):
                     if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
+                        if msg._delivery_future and not msg._delivery_future.done():
+                            msg._delivery_future.set_result(None)
                         continue
                     if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
+                        if msg._delivery_future and not msg._delivery_future.done():
+                            msg._delivery_future.set_result(None)
                         continue
 
                 # Coalesce consecutive _stream_delta messages for the same (channel, chat_id)
@@ -200,6 +204,9 @@ class ChannelManager:
             if same_target and is_delta and not final_metadata.get("_stream_end"):
                 # Accumulate content
                 combined_content += next_msg.content
+                # Resolve consumed message's delivery future (content merged into first_msg)
+                if next_msg._delivery_future and not next_msg._delivery_future.done():
+                    next_msg._delivery_future.set_result(None)
                 # If we see _stream_end, remember it and stop coalescing this stream
                 if is_end:
                     final_metadata["_stream_end"] = True

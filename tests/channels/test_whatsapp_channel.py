@@ -127,6 +127,35 @@ async def test_send_when_disconnected_raises():
 
 
 @pytest.mark.asyncio
+async def test_send_raises_on_bridge_error():
+    """When the bridge returns an error, send() should raise RuntimeError."""
+    bus = MagicMock()
+    ch = WhatsAppChannel({"enabled": True}, bus)
+    ch._ws = AsyncMock()
+    ch._connected = True
+
+    # Simulate bridge error: when send() is called, resolve the pending ack with an error
+    async def _mock_send_error(data, **kwargs):
+        payload = json.loads(data)
+        msg_id = payload.get("msg_id")
+        if msg_id and msg_id in ch._pending_acks:
+            ch._pending_acks[msg_id].set_exception(
+                RuntimeError("WhatsApp bridge error: sendMediaMessage is not a function")
+            )
+
+    ch._ws.send = AsyncMock(side_effect=_mock_send_error)
+
+    msg = OutboundMessage(
+        channel="whatsapp",
+        chat_id="123@s.whatsapp.net",
+        content="check this",
+        media=["/tmp/photo.jpg"],
+    )
+    with pytest.raises(RuntimeError, match="sendMediaMessage is not a function"):
+        await ch.send(msg)
+
+
+@pytest.mark.asyncio
 async def test_group_policy_mention_skips_unmentioned_group_message():
     ch = WhatsAppChannel({"enabled": True, "groupPolicy": "mention"}, MagicMock())
     ch._handle_message = AsyncMock()
