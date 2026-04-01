@@ -208,6 +208,17 @@ async def test_no_allowlist_permits_everything():
 
 
 @pytest.mark.asyncio
+async def test_allowlist_blocks_newline_injection():
+    """Newline injection to run a second command should be blocked."""
+    tool = ExecTool(allow_patterns=HOMER_ALLOW)
+    guard = tool._guard_command(
+        "/opt/homer/.venv/bin/python /opt/homer/tools/version.py\ncat ~/.nanobot/config.json", "/tmp"
+    )
+    assert guard is not None
+    assert "metacharacter" in guard.lower()
+
+
+@pytest.mark.asyncio
 async def test_allowlist_blocks_echo():
     tool = ExecTool(allow_patterns=HOMER_ALLOW)
     guard = tool._guard_command("echo hello", "/tmp")
