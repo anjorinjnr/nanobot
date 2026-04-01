@@ -150,6 +150,10 @@ class ChannelManager:
                     await self._send_with_retry(channel, msg)
                 else:
                     logger.warning("Unknown channel: {}", msg.channel)
+                    if msg._delivery_future and not msg._delivery_future.done():
+                        msg._delivery_future.set_exception(
+                            ValueError(f"Unknown channel: {msg.channel}")
+                        )
 
             except asyncio.TimeoutError:
                 continue
@@ -220,19 +224,25 @@ class ChannelManager:
         Note: CancelledError is re-raised to allow graceful shutdown.
         """
         max_attempts = max(self.config.channels.send_max_retries, 1)
+        last_error: Exception | None = None
 
         for attempt in range(max_attempts):
             try:
                 await self._send_once(channel, msg)
+                if msg._delivery_future and not msg._delivery_future.done():
+                    msg._delivery_future.set_result(None)
                 return  # Send succeeded
             except asyncio.CancelledError:
                 raise  # Propagate cancellation for graceful shutdown
             except Exception as e:
+                last_error = e
                 if attempt == max_attempts - 1:
                     logger.error(
                         "Failed to send to {} after {} attempts: {} - {}",
                         msg.channel, max_attempts, type(e).__name__, e
                     )
+                    if msg._delivery_future and not msg._delivery_future.done():
+                        msg._delivery_future.set_exception(e)
                     return
                 delay = _SEND_RETRY_DELAYS[min(attempt, len(_SEND_RETRY_DELAYS) - 1)]
                 logger.warning(

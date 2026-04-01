@@ -10,6 +10,7 @@ interface SendCommand {
   type: 'send';
   to: string;
   text: string;
+  msg_id?: string;
 }
 
 interface SendMediaCommand {
@@ -19,6 +20,7 @@ interface SendMediaCommand {
   mimetype: string;
   caption?: string;
   fileName?: string;
+  msg_id?: string;
 }
 
 interface TypingCommand {
@@ -90,11 +92,14 @@ export class BridgeServer {
     ws.on('message', async (data) => {
       try {
         const cmd = JSON.parse(data.toString()) as BridgeCommand;
+        const msgId = ('msg_id' in cmd) ? cmd.msg_id : undefined;
         await this.handleCommand(cmd);
-        ws.send(JSON.stringify({ type: 'sent', to: cmd.to }));
+        ws.send(JSON.stringify({ type: 'sent', to: cmd.to, msg_id: msgId }));
       } catch (error) {
+        const cmd = (() => { try { return JSON.parse(data.toString()); } catch { return {}; } })();
+        const msgId = cmd.msg_id;
         console.error('Error handling command:', error);
-        ws.send(JSON.stringify({ type: 'error', error: String(error) }));
+        ws.send(JSON.stringify({ type: 'error', error: String(error), msg_id: msgId }));
       }
     });
 
