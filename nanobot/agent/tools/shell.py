@@ -165,18 +165,23 @@ class ExecTool(Tool):
             if re.search(pattern, lower):
                 return "Error: Command blocked by safety guard (dangerous pattern detected)"
 
+        allowlisted = False
         if self.allow_patterns:
             shell_meta = re.search(r'[|&;<>`\n\r]|\$\(', cmd)
             if shell_meta:
                 return "Error: Command blocked by safety guard (shell metacharacters not allowed with allowlist)"
             if not any(re.search(p, cmd, re.IGNORECASE) for p in self.allow_patterns):
                 return "Error: Command blocked by safety guard (not in allowlist)"
+            allowlisted = True
 
         from nanobot.security.network import contains_internal_url
         if contains_internal_url(cmd):
             return "Error: Command blocked by safety guard (internal/private URL detected)"
 
-        if self.restrict_to_workspace:
+        # Skip workspace path check for allowlisted commands — the allowlist
+        # already constrains what can run, and whitelisted tools necessarily
+        # reference paths outside the workspace (e.g. /opt/homer/.venv/bin/python).
+        if self.restrict_to_workspace and not allowlisted:
             if "..\\" in cmd or "../" in cmd:
                 return "Error: Command blocked by safety guard (path traversal detected)"
 
