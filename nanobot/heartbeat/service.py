@@ -82,6 +82,7 @@ class HeartbeatService:
         last_run_tracking: bool = False,
         timezone: str | None = None,
         suppress_errors: bool = False,
+        pre_check_registry: dict[str, str] | None = None,
     ):
         self.workspace = workspace
         self.provider = provider
@@ -93,6 +94,7 @@ class HeartbeatService:
         self.last_run_tracking = last_run_tracking
         self.timezone = timezone
         self.suppress_errors = suppress_errors
+        self.pre_check_registry = pre_check_registry or {}
         self._running = False
         self._task: asyncio.Task | None = None
 
@@ -174,7 +176,7 @@ class HeartbeatService:
                 raw = model_match.group(1).strip()
                 model = MODEL_PRESETS.get(raw, raw)  # resolve preset or use as-is
 
-            pre_check_match = re.search(r"^Pre-check:\s*(.+)", block, re.MULTILINE)
+            pre_check_match = re.search(r"^Pre-check:\s*(\S+)", block, re.MULTILINE)
             pre_check = pre_check_match.group(1).strip() if pre_check_match else None
 
             if now >= schedule_dt:
@@ -389,13 +391,24 @@ class HeartbeatService:
             return True  # On error, proceed with LLM to be safe
 
     async def _filter_by_pre_checks(self, tasks: list[DueTask]) -> list[DueTask]:
-        """Run pre-check commands and filter out tasks with no work to do."""
+        """Run pre-check commands and filter out tasks with no work to do.
+
+        The task's pre_check field is a registry key, resolved to an actual
+        command via self.pre_check_registry. Unknown keys are logged and skipped
+        (task proceeds to LLM).
+        """
         result = []
         for task in tasks:
             if not task.pre_check:
                 result.append(task)
                 continue
-            has_work = await self._run_pre_check(task.pre_check)
+            command = self.pre_check_registry.get(task.pre_check)
+            if not command:
+                logger.warning("Heartbeat: unknown pre-check key '{}' for '{}' — proceeding with LLM",
+                               task.pre_check, task.name)
+                result.append(task)
+                continue
+            has_work = await self._run_pre_check(command)
             if has_work:
                 result.append(task)
             else:

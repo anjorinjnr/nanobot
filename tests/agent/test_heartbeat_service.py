@@ -945,11 +945,11 @@ def test_compute_due_tasks_parses_pre_check() -> None:
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     content = _make_heartbeat(
         f"\n### Check escalations\nType: system\nSchedule: {past}\n"
-        "Recur: every 30 minutes\nPre-check: /opt/homer/tools/scope_store.py --pending-escalations\n"
+        "Recur: every 30 minutes\nPre-check: escalations\n"
     )
     due = HeartbeatService._compute_due_tasks(content, datetime.now())
     assert len(due) == 1
-    assert due[0].pre_check == "/opt/homer/tools/scope_store.py --pending-escalations"
+    assert due[0].pre_check == "escalations"
 
 
 def test_compute_due_tasks_no_pre_check_returns_none() -> None:
@@ -1008,11 +1008,12 @@ async def test_filter_by_pre_checks_removes_empty_tasks(tmp_path) -> None:
     service = HeartbeatService(
         workspace=tmp_path, provider=provider, model="test",
         last_run_tracking=True,
+        pre_check_registry={"escalations": "echo []"},
     )
     tasks = [
         DueTask(name="Gmail scan", task_type="system", schedule="2026-01-01"),
         DueTask(name="Check escalations", task_type="system", schedule="2026-01-01",
-                pre_check="echo '[]'"),
+                pre_check="escalations"),
     ]
     result = await service._filter_by_pre_checks(tasks)
     assert len(result) == 1
@@ -1026,10 +1027,28 @@ async def test_filter_by_pre_checks_keeps_tasks_with_data(tmp_path) -> None:
     service = HeartbeatService(
         workspace=tmp_path, provider=provider, model="test",
         last_run_tracking=True,
+        pre_check_registry={"escalations": "echo [{}]"},
     )
     tasks = [
         DueTask(name="Check escalations", task_type="system", schedule="2026-01-01",
-                pre_check='echo \'[{"id": "abc"}]\''),
+                pre_check="escalations"),
+    ]
+    result = await service._filter_by_pre_checks(tasks)
+    assert len(result) == 1
+
+
+@pytest.mark.asyncio
+async def test_filter_by_pre_checks_unknown_key_proceeds(tmp_path) -> None:
+    """Unknown pre-check key → task proceeds to LLM."""
+    provider = DummyProvider([])
+    service = HeartbeatService(
+        workspace=tmp_path, provider=provider, model="test",
+        last_run_tracking=True,
+        pre_check_registry={},
+    )
+    tasks = [
+        DueTask(name="Check escalations", task_type="system", schedule="2026-01-01",
+                pre_check="unknown_key"),
     ]
     result = await service._filter_by_pre_checks(tasks)
     assert len(result) == 1
@@ -1041,7 +1060,7 @@ async def test_tick_skips_llm_when_pre_check_empty(tmp_path) -> None:
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     heartbeat = _make_heartbeat(
         f"\n### Check escalations\nType: system\nSchedule: {past}\n"
-        "Recur: every 30 minutes\nPre-check: echo '[]'\n"
+        "Recur: every 30 minutes\nPre-check: escalations\n"
     )
     (tmp_path / "HEARTBEAT.md").write_text(heartbeat)
 
@@ -1055,6 +1074,7 @@ async def test_tick_skips_llm_when_pre_check_empty(tmp_path) -> None:
     service = HeartbeatService(
         workspace=tmp_path, provider=provider, model="test",
         on_execute=mock_execute, last_run_tracking=True,
+        pre_check_registry={"escalations": "echo []"},
     )
 
     await service._tick()
@@ -1067,7 +1087,7 @@ async def test_tick_calls_llm_when_pre_check_has_data(tmp_path) -> None:
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     heartbeat = _make_heartbeat(
         f"\n### Check escalations\nType: system\nSchedule: {past}\n"
-        'Recur: every 30 minutes\nPre-check: echo \'[{{"id": "abc"}}]\'\n'
+        "Recur: every 30 minutes\nPre-check: escalations\n"
     )
     (tmp_path / "HEARTBEAT.md").write_text(heartbeat)
 
@@ -1081,6 +1101,7 @@ async def test_tick_calls_llm_when_pre_check_has_data(tmp_path) -> None:
     service = HeartbeatService(
         workspace=tmp_path, provider=provider, model="test",
         on_execute=mock_execute, last_run_tracking=True,
+        pre_check_registry={"escalations": "echo [{}]"},
     )
 
     await service._tick()
@@ -1094,7 +1115,7 @@ async def test_tick_mixed_pre_check_only_runs_tasks_with_work(tmp_path) -> None:
     heartbeat = _make_heartbeat(
         f"\n### Gmail scan\nType: system\nSchedule: {past}\nRecur: every 1 hour\n"
         f"\n### Check escalations\nType: system\nSchedule: {past}\n"
-        "Recur: every 30 minutes\nPre-check: echo '[]'\n"
+        "Recur: every 30 minutes\nPre-check: escalations\n"
     )
     (tmp_path / "HEARTBEAT.md").write_text(heartbeat)
 
@@ -1108,6 +1129,7 @@ async def test_tick_mixed_pre_check_only_runs_tasks_with_work(tmp_path) -> None:
     service = HeartbeatService(
         workspace=tmp_path, provider=provider, model="test",
         on_execute=mock_execute, last_run_tracking=True,
+        pre_check_registry={"escalations": "echo []"},
     )
 
     await service._tick()
