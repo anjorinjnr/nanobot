@@ -434,7 +434,10 @@ class HeartbeatService:
                 return
 
             # Run pre-checks to filter out tasks with no work
-            if due_tasks:
+            # Only applies when last_run_tracking=True (structured due_tasks).
+            # LLM fallback path (due_tasks empty) reads raw HEARTBEAT.md and
+            # has no awareness of pre-check results.
+            if self.last_run_tracking and due_tasks:
                 due_tasks = await self._filter_by_pre_checks(due_tasks)
                 if not due_tasks:
                     logger.info("Heartbeat: all tasks skipped by pre-checks")
