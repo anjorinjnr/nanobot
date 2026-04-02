@@ -46,6 +46,7 @@ class DueTask:
     task_type: Literal["announcement", "system", "reminder"]
     schedule: str | None  # None for announcements
     model: str | None = None  # Optional per-task model override
+    pre_check: str | None = None  # Optional command to run before LLM dispatch
 
 
 MODEL_PRESETS: dict[str, str] = {
@@ -172,8 +173,14 @@ class HeartbeatService:
                 raw = model_match.group(1).strip()
                 model = MODEL_PRESETS.get(raw, raw)  # resolve preset or use as-is
 
+            pre_check_match = re.search(r"^Pre-check:\s*(.+)", block, re.MULTILINE)
+            pre_check = pre_check_match.group(1).strip() if pre_check_match else None
+
             if now >= schedule_dt:
-                due.append(DueTask(name=task_name, task_type=task_type, schedule=schedule_str, model=model))
+                due.append(DueTask(
+                    name=task_name, task_type=task_type, schedule=schedule_str,
+                    model=model, pre_check=pre_check,
+                ))
 
         return due
 
@@ -345,6 +352,47 @@ class HeartbeatService:
             except Exception as e:
                 logger.error("Heartbeat error: {}", e)
 
+    @staticmethod
+    async def _run_pre_check(command: str) -> bool:
+        """Run a pre-check command. Returns True if the task has work to do.
+
+        A task is skipped (returns False) when the command exits successfully
+        and its output is empty, an empty JSON array '[]', or starts with 'SKIP'.
+        Non-zero exit codes are treated as errors → proceed with LLM to be safe.
+        """
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode != 0:
+                logger.warning("Pre-check exited {} for '{}' — proceeding with LLM",
+                               proc.returncode, command)
+                return True
+            output = stdout.decode().strip() if stdout else ""
+            if not output or output == "[]" or output.upper().startswith("SKIP"):
+                return False
+            return True
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning("Pre-check failed for '{}': {} — proceeding with LLM", command, e)
+            return True  # On error, proceed with LLM to be safe
+
+    async def _filter_by_pre_checks(self, tasks: list[DueTask]) -> list[DueTask]:
+        """Run pre-check commands and filter out tasks with no work to do."""
+        result = []
+        for task in tasks:
+            if not task.pre_check:
+                result.append(task)
+                continue
+            has_work = await self._run_pre_check(task.pre_check)
+            if has_work:
+                result.append(task)
+            else:
+                logger.info("Heartbeat: pre-check skipped '{}' (no work)", task.name)
+        return result
+
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
         from nanobot.utils.evaluator import evaluate_response
@@ -362,6 +410,13 @@ class HeartbeatService:
             if action != "run":
                 logger.info("Heartbeat: OK (nothing to report)")
                 return
+
+            # Run pre-checks to filter out tasks with no work
+            if due_tasks:
+                due_tasks = await self._filter_by_pre_checks(due_tasks)
+                if not due_tasks:
+                    logger.info("Heartbeat: all tasks skipped by pre-checks")
+                    return
 
             logger.info("Heartbeat: tasks found, executing...")
             if self.on_execute:
