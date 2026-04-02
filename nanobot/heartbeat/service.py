@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shlex
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -360,9 +361,11 @@ class HeartbeatService:
         and its output is empty, an empty JSON array '[]', or starts with 'SKIP'.
         Non-zero exit codes are treated as errors → proceed with LLM to be safe.
         """
+        proc = None
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            args = shlex.split(command)
+            proc = await asyncio.create_subprocess_exec(
+                *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -375,7 +378,13 @@ class HeartbeatService:
             if not output or output == "[]" or output.upper().startswith("SKIP"):
                 return False
             return True
-        except (asyncio.TimeoutError, Exception) as e:
+        except asyncio.TimeoutError:
+            logger.warning("Pre-check timed out for '{}' — proceeding with LLM", command)
+            if proc:
+                proc.kill()
+                await proc.communicate()
+            return True
+        except Exception as e:
             logger.warning("Pre-check failed for '{}': {} — proceeding with LLM", command, e)
             return True  # On error, proceed with LLM to be safe
 
