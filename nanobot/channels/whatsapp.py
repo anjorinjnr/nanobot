@@ -446,7 +446,8 @@ class WhatsAppChannel(BaseChannel):
         lid_map_path = get_data_dir() / "lid_map.json"
         if lid_map_path.exists():
             try:
-                lid_map = json.loads(lid_map_path.read_text(encoding="utf-8"))
+                raw = json.loads(lid_map_path.read_text(encoding="utf-8"))
+                lid_map = {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
                 logger.debug("Loaded lid_map with {} entries", len(lid_map))
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("Failed to load lid_map.json: {}", e)
@@ -480,16 +481,20 @@ class WhatsAppChannel(BaseChannel):
         lid_prefix = lid.split("@")[0] if "@" in lid else lid
         phone_digits = phone_jid.split("@")[0] if "@" in phone_jid else phone_jid
 
-        if self._lid_map.get(lid_prefix, {}).get("phone") == phone_digits:
+        existing = self._lid_map.get(lid_prefix)
+        if isinstance(existing, dict) and existing.get("phone") == phone_digits:
             return  # Already mapped
 
         # Update in-memory cache — merge to preserve existing fields (e.g. name)
-        self._lid_map.setdefault(lid_prefix, {})["phone"] = phone_digits
+        if not isinstance(existing, dict):
+            self._lid_map[lid_prefix] = {"phone": phone_digits}
+        else:
+            existing["phone"] = phone_digits
 
-        # Persist to disk under lock — snapshot inside lock to prevent stale writes
+        # Snapshot under lock, write outside lock (atomic write is safe without lock)
         async with self._lid_map_lock:
             snapshot = dict(self._lid_map)
-            await asyncio.to_thread(self._write_lid_map, snapshot)
+        await asyncio.to_thread(self._write_lid_map, snapshot)
         logger.info("LID mapping saved: {} → {}", lid_prefix, phone_digits)
 
     @staticmethod
@@ -501,8 +506,9 @@ class WhatsAppChannel(BaseChannel):
         map_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             fd, tmp_path = tempfile.mkstemp(dir=map_path.parent, suffix=".tmp")
+            os.close(fd)  # Close fd immediately; reopen with standard open
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
                 Path(tmp_path).replace(map_path)
             except Exception:
