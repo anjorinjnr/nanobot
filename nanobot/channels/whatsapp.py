@@ -62,8 +62,8 @@ class WhatsAppChannel(BaseChannel):
         self._lid_map_lock = asyncio.Lock()
         self._lid_map_loaded = False
         self._sender_map: dict[str, str] = {}  # in-memory cache of sender_map.json
-        self._sender_map_loaded = False
-        self._first_message_sessions: set[str] = set()  # tracks first message per session
+        self._allowed_lids: set[str] = set()  # dynamically authorized LIDs (separate from config)
+        self._greeted_sessions: OrderedDict[str, None] = OrderedDict()  # tracks first-message injection
 
     async def login(self, force: bool = False) -> bool:
         """
@@ -298,10 +298,12 @@ class WhatsAppChannel(BaseChannel):
                 await self._start_typing(sender)
 
             # Resolve sender name and inject on first message in session
+            # Skip for media-only messages (empty content) to avoid phantom text
             session_key = f"whatsapp:{sender}"
-            sender_name = self._resolve_sender_name(sender_id, session_key)
-            if sender_name:
-                content = f"[Sender: {sender_name}]\n{content}"
+            if content:
+                sender_name = self._resolve_sender_name(sender_id, session_key)
+                if sender_name:
+                    content = f"[Sender: {sender_name}]\n{content}"
 
             await self._handle_message(
                 sender_id=sender_id,
@@ -355,13 +357,13 @@ class WhatsAppChannel(BaseChannel):
         """
         if super().is_allowed(sender_id):
             return True
+        if sender_id in self._allowed_lids:
+            return True
         info = self._lid_map.get(sender_id)
         if isinstance(info, dict):
             phone = info.get("phone", "")
             if phone and super().is_allowed(phone):
-                # Dynamically add to allow_from so future checks are fast
-                if hasattr(self.config, "allow_from"):
-                    self.config.allow_from.append(sender_id)
+                self._allowed_lids.add(sender_id)
                 return True
         return False
 
@@ -369,11 +371,13 @@ class WhatsAppChannel(BaseChannel):
         """Resolve sender_id to a guest name using sender_map + lid_map.
 
         Only returns a name on the first message in a session to avoid the LLM
-        parroting the name in every response.
+        parroting the name in every response. Bounded to 500 sessions max.
         """
-        if session_key in self._first_message_sessions:
+        if session_key in self._greeted_sessions:
             return None  # Already injected for this session
-        self._first_message_sessions.add(session_key)
+        self._greeted_sessions[session_key] = None
+        while len(self._greeted_sessions) > 500:
+            self._greeted_sessions.popitem(last=False)
 
         # Check sender_map (build-time: phone/LID → name)
         if sender_id in self._sender_map:
@@ -408,8 +412,9 @@ class WhatsAppChannel(BaseChannel):
         if lid_map_path.exists():
             try:
                 self._lid_map = json.loads(lid_map_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
+                logger.debug("Loaded lid_map with {} entries", len(self._lid_map))
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning("Failed to load lid_map.json: {}", e)
 
         # sender_map.json — check workspace paths
         for candidate in self._sender_map_paths():
@@ -418,9 +423,10 @@ class WhatsAppChannel(BaseChannel):
                     data = json.loads(candidate.read_text(encoding="utf-8"))
                     if isinstance(data, dict):
                         self._sender_map = {k: v for k, v in data.items() if isinstance(v, str)}
+                        logger.debug("Loaded sender_map with {} entries from {}", len(self._sender_map), candidate)
                         break
-                except (json.JSONDecodeError, OSError):
-                    pass
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning("Failed to load sender_map from {}: {}", candidate, e)
 
     def _sender_map_paths(self) -> list[Path]:
         """Return candidate sender_map.json paths.
