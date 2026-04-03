@@ -289,6 +289,10 @@ class WhatsAppChannel(BaseChannel):
             # Load identity maps on first message (if enabled)
             if self.config.identity_resolution:
                 await self._ensure_maps_loaded()
+                # Learn LID↔phone from inbound messages (handles case where
+                # user messages bot before bot has ever messaged them)
+                if pn and sender and pn != sender:
+                    await self._save_lid_mapping(pn, sender)
 
             # Handle voice/audio message transcription
             audio_data = data.get("audio")
@@ -309,9 +313,9 @@ class WhatsAppChannel(BaseChannel):
             if self.is_allowed(sender_id):
                 await self._start_typing(sender)
 
-            # Resolve sender name and inject on first message in session
-            # Skip for media-only messages (empty content) to avoid phantom text
-            if self.config.identity_resolution and content:
+            # Resolve sender name and inject on first message in session.
+            # Skip for: media-only (empty content), slash commands (starts with /)
+            if self.config.identity_resolution and content and not content.startswith("/"):
                 session_key = f"whatsapp:{sender}"
                 sender_name = self._resolve_sender_name(sender_id, session_key)
                 if sender_name:
