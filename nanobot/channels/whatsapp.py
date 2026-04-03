@@ -57,6 +57,13 @@ class WhatsAppChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._pending_acks: dict[str, asyncio.Future[None]] = {}
         self._msg_id_counter = 0
+        # LID identity resolution state
+        self._lid_map: dict[str, dict] = {}  # in-memory cache of lid_map.json
+        self._lid_map_lock = asyncio.Lock()
+        self._lid_map_loaded = False
+        self._sender_map: dict[str, str] = {}  # in-memory cache of sender_map.json
+        self._sender_map_loaded = False
+        self._first_message_sessions: set[str] = set()  # tracks first message per session
 
     async def login(self, force: bool = False) -> bool:
         """
@@ -245,9 +252,7 @@ class WhatsAppChannel(BaseChannel):
 
         if msg_type == "message":
             # Incoming message from WhatsApp
-            # Deprecated by whatsapp: old phone number style typically: <phone>@s.whatspp.net
             pn = data.get("pn", "")
-            # New LID sytle typically:
             sender = data.get("sender", "")
             content = data.get("content", "")
             message_id = data.get("id", "")
@@ -259,7 +264,6 @@ class WhatsAppChannel(BaseChannel):
                 while len(self._processed_message_ids) > 1000:
                     self._processed_message_ids.popitem(last=False)
 
-            # Extract just the phone number or lid as chat_id
             is_group = data.get("isGroup", False)
             was_mentioned = data.get("wasMentioned", False)
 
@@ -270,6 +274,9 @@ class WhatsAppChannel(BaseChannel):
             # Always use LID (sender) as canonical identifier — pn is unreliable
             sender_id = sender.split("@")[0] if "@" in sender else sender
             logger.info("Sender {} (pn={})", sender, pn or "none")
+
+            # Load identity maps on first message
+            await self._ensure_maps_loaded()
 
             # Handle voice/audio message transcription
             audio_data = data.get("audio")
@@ -289,6 +296,12 @@ class WhatsAppChannel(BaseChannel):
 
             if self.is_allowed(sender_id):
                 await self._start_typing(sender)
+
+            # Resolve sender name and inject on first message in session
+            session_key = f"whatsapp:{sender}"
+            sender_name = self._resolve_sender_name(sender_id, session_key)
+            if sender_name:
+                content = f"[Sender: {sender_name}]\n{content}"
 
             await self._handle_message(
                 sender_id=sender_id,
@@ -321,7 +334,7 @@ class WhatsAppChannel(BaseChannel):
             lid = data.get("lid", "")
             to = data.get("to", "")
             if lid and to and lid != to:
-                self._save_lid_mapping(to, lid)
+                await self._save_lid_mapping(to, lid)
             if msg_id and msg_id in self._pending_acks:
                 self._pending_acks[msg_id].set_result(None)
 
@@ -337,57 +350,126 @@ class WhatsAppChannel(BaseChannel):
     def is_allowed(self, sender_id: str) -> bool:
         """Check if sender_id is permitted, including dynamic LID resolution.
 
-        Extends base is_allowed to also check lid_map.json: if this sender_id
-        is a LID that maps to an authorized phone, allow it. This handles the
-        case where Homer sent the first outbound (bridge learned the LID) but
-        build_context hasn't been re-run to update allow_from yet.
+        Extends base is_allowed to also check the in-memory lid_map: if this
+        sender_id is a LID that maps to an authorized phone, allow it.
         """
         if super().is_allowed(sender_id):
             return True
-        # Check lid_map: if this LID maps to a phone in allow_from, allow it
+        info = self._lid_map.get(sender_id)
+        if isinstance(info, dict):
+            phone = info.get("phone", "")
+            if phone and super().is_allowed(phone):
+                # Dynamically add to allow_from so future checks are fast
+                if hasattr(self.config, "allow_from"):
+                    self.config.allow_from.append(sender_id)
+                return True
+        return False
+
+    def _resolve_sender_name(self, sender_id: str, session_key: str) -> str | None:
+        """Resolve sender_id to a guest name using sender_map + lid_map.
+
+        Only returns a name on the first message in a session to avoid the LLM
+        parroting the name in every response.
+        """
+        if session_key in self._first_message_sessions:
+            return None  # Already injected for this session
+        self._first_message_sessions.add(session_key)
+
+        # Check sender_map (build-time: phone/LID → name)
+        if sender_id in self._sender_map:
+            return self._sender_map[sender_id]
+
+        # Check lid_map (runtime: LID → {phone, name?})
+        info = self._lid_map.get(sender_id)
+        if isinstance(info, dict):
+            name = info.get("name", "")
+            if name:
+                return name
+            phone = info.get("phone", "")
+            if phone and phone in self._sender_map:
+                return self._sender_map[phone]
+
+        return None
+
+    async def _ensure_maps_loaded(self) -> None:
+        """Load sender_map.json and lid_map.json into memory on first use."""
+        if not self._lid_map_loaded:
+            async with self._lid_map_lock:
+                if not self._lid_map_loaded:
+                    await asyncio.to_thread(self._load_maps_from_disk)
+                    self._lid_map_loaded = True
+
+    def _load_maps_from_disk(self) -> None:
+        """Synchronous disk reads, called via asyncio.to_thread."""
         from nanobot.config.paths import get_data_dir
+
+        # lid_map.json
         lid_map_path = get_data_dir() / "lid_map.json"
         if lid_map_path.exists():
             try:
-                lid_map = json.loads(lid_map_path.read_text(encoding="utf-8"))
-                info = lid_map.get(sender_id)
-                if isinstance(info, dict):
-                    phone = info.get("phone", "")
-                    if phone and super().is_allowed(phone):
-                        # Dynamically add to allow_from so future checks are fast
-                        if hasattr(self.config, "allow_from"):
-                            self.config.allow_from.append(sender_id)
-                        return True
+                self._lid_map = json.loads(lid_map_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 pass
-        return False
 
-    def _save_lid_mapping(self, phone_jid: str, lid: str) -> None:
-        """Persist a phone→LID mapping learned from an outbound send ack.
+        # sender_map.json — check workspace paths
+        for candidate in self._sender_map_paths():
+            if candidate.exists():
+                try:
+                    data = json.loads(candidate.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        self._sender_map = {k: v for k, v in data.items() if isinstance(v, str)}
+                        break
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-        Stores {lid_prefix: {phone: phone_digits}} in lid_map.json.
-        The agent loop enriches this with names from the ACL/scope.
+    def _sender_map_paths(self) -> list[Path]:
+        """Return candidate sender_map.json paths.
+
+        Homer writes sender_map.json to both the workspace and the data dir.
+        We check common locations without needing the workspace path.
         """
         from nanobot.config.paths import get_data_dir
+        data_dir = get_data_dir()
+        paths = [data_dir / "sender_map.json"]
+        # Also check the workspace parent (sender_map written to both workspaces)
+        # The data dir is typically ~/.nanobot/, workspace is set in config
+        config_path = data_dir / "config.json"
+        if config_path.exists():
+            try:
+                cfg = json.loads(config_path.read_text(encoding="utf-8"))
+                ws = cfg.get("agents", {}).get("defaults", {}).get("workspace", "")
+                if ws:
+                    paths.insert(0, Path(ws) / "sender_map.json")
+            except (json.JSONDecodeError, OSError, KeyError):
+                pass
+        return paths
 
+    async def _save_lid_mapping(self, phone_jid: str, lid: str) -> None:
+        """Persist a phone→LID mapping learned from an outbound send ack.
+
+        Updates in-memory cache immediately and persists to disk asynchronously
+        under a lock to prevent concurrent write corruption.
+        """
         lid_prefix = lid.split("@")[0] if "@" in lid else lid
         phone_digits = phone_jid.split("@")[0] if "@" in phone_jid else phone_jid
 
-        map_path = get_data_dir() / "lid_map.json"
-        lid_map: dict = {}
-        if map_path.exists():
-            try:
-                lid_map = json.loads(map_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        if lid_map.get(lid_prefix, {}).get("phone") == phone_digits:
+        if self._lid_map.get(lid_prefix, {}).get("phone") == phone_digits:
             return  # Already mapped
 
-        lid_map[lid_prefix] = {"phone": phone_digits}
+        # Update in-memory cache immediately
+        self._lid_map[lid_prefix] = {"phone": phone_digits}
+
+        # Persist to disk under lock
+        async with self._lid_map_lock:
+            await asyncio.to_thread(self._write_lid_map)
+        logger.info("LID mapping saved: {} → {}", lid_prefix, phone_digits)
+
+    def _write_lid_map(self) -> None:
+        """Synchronous disk write, called via asyncio.to_thread under lock."""
+        from nanobot.config.paths import get_data_dir
+        map_path = get_data_dir() / "lid_map.json"
         try:
-            map_path.write_text(json.dumps(lid_map, indent=2, ensure_ascii=False), encoding="utf-8")
-            logger.info("LID mapping saved: {} → {}", lid_prefix, phone_digits)
+            map_path.write_text(json.dumps(self._lid_map, indent=2, ensure_ascii=False), encoding="utf-8")
         except OSError as e:
             logger.warning("Failed to save LID mapping: {}", e)
 
