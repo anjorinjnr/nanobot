@@ -63,7 +63,6 @@ class WhatsAppChannel(BaseChannel):
         self._lid_map_lock = asyncio.Lock()
         self._lid_map_loaded = False
         self._sender_map: dict[str, str] = {}  # in-memory cache of sender_map.json
-        self._allowed_lids: set[str] = set()  # dynamically authorized LIDs (separate from config)
         self._greeted_sessions: OrderedDict[str, None] = OrderedDict()  # tracks first-message injection
 
     async def login(self, force: bool = False) -> bool:
@@ -370,16 +369,14 @@ class WhatsAppChannel(BaseChannel):
 
         Extends base is_allowed to also check the in-memory lid_map: if this
         sender_id is a LID that maps to an authorized phone, allow it.
+        Evaluates allow_from on every call so config changes take effect.
         """
         if super().is_allowed(sender_id):
-            return True
-        if sender_id in self._allowed_lids:
             return True
         info = self._lid_map.get(sender_id)
         if isinstance(info, dict):
             phone = info.get("phone", "")
             if phone and super().is_allowed(phone):
-                self._allowed_lids.add(sender_id)
                 return True
         return False
 
