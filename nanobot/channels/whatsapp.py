@@ -372,28 +372,34 @@ class WhatsAppChannel(BaseChannel):
 
         Only returns a name on the first message in a session to avoid the LLM
         parroting the name in every response. Bounded to 500 sessions max.
+        Only marks session as greeted if a name is actually resolved.
         """
         if session_key in self._greeted_sessions:
             return None  # Already injected for this session
-        self._greeted_sessions[session_key] = None
-        while len(self._greeted_sessions) > 500:
-            self._greeted_sessions.popitem(last=False)
+
+        name: str | None = None
 
         # Check sender_map (build-time: phone/LID → name)
         if sender_id in self._sender_map:
-            return self._sender_map[sender_id]
+            name = self._sender_map[sender_id]
 
         # Check lid_map (runtime: LID → {phone, name?})
-        info = self._lid_map.get(sender_id)
-        if isinstance(info, dict):
-            name = info.get("name", "")
-            if name:
-                return name
-            phone = info.get("phone", "")
-            if phone and phone in self._sender_map:
-                return self._sender_map[phone]
+        if not name:
+            info = self._lid_map.get(sender_id)
+            if isinstance(info, dict):
+                name = info.get("name") or None
+                if not name:
+                    phone = info.get("phone", "")
+                    if phone and phone in self._sender_map:
+                        name = self._sender_map[phone]
 
-        return None
+        # Only mark as greeted if we actually resolved a name
+        if name:
+            self._greeted_sessions[session_key] = None
+            while len(self._greeted_sessions) > 500:
+                self._greeted_sessions.popitem(last=False)
+
+        return name
 
     async def _ensure_maps_loaded(self) -> None:
         """Load sender_map.json and lid_map.json into memory on first use."""
@@ -471,11 +477,23 @@ class WhatsAppChannel(BaseChannel):
         logger.info("LID mapping saved: {} → {}", lid_prefix, phone_digits)
 
     def _write_lid_map(self) -> None:
-        """Synchronous disk write, called via asyncio.to_thread under lock."""
+        """Synchronous atomic disk write, called via asyncio.to_thread under lock."""
+        import tempfile
         from nanobot.config.paths import get_data_dir
         map_path = get_data_dir() / "lid_map.json"
         try:
-            map_path.write_text(json.dumps(self._lid_map, indent=2, ensure_ascii=False), encoding="utf-8")
+            # Atomic write: write to temp file then replace
+            fd, tmp_path = tempfile.mkstemp(dir=map_path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self._lid_map, f, indent=2, ensure_ascii=False)
+                Path(tmp_path).replace(map_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         except OSError as e:
             logger.warning("Failed to save LID mapping: {}", e)
 
