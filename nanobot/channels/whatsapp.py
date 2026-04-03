@@ -267,9 +267,9 @@ class WhatsAppChannel(BaseChannel):
                 if not was_mentioned:
                     return
 
-            user_id = pn if pn else sender
-            sender_id = user_id.split("@")[0] if "@" in user_id else user_id
-            logger.info("Sender {}", sender)
+            # Always use LID (sender) as canonical identifier — pn is unreliable
+            sender_id = sender.split("@")[0] if "@" in sender else sender
+            logger.info("Sender {} (pn={})", sender, pn or "none")
 
             # Handle voice/audio message transcription
             audio_data = data.get("audio")
@@ -318,6 +318,10 @@ class WhatsAppChannel(BaseChannel):
 
         elif msg_type == "sent":
             msg_id = data.get("msg_id")
+            lid = data.get("lid", "")
+            to = data.get("to", "")
+            if lid and to and lid != to:
+                self._save_lid_mapping(to, lid)
             if msg_id and msg_id in self._pending_acks:
                 self._pending_acks[msg_id].set_result(None)
 
@@ -329,6 +333,63 @@ class WhatsAppChannel(BaseChannel):
                 self._pending_acks[msg_id].set_exception(
                     RuntimeError(f"WhatsApp bridge error: {error_text}")
                 )
+
+    def is_allowed(self, sender_id: str) -> bool:
+        """Check if sender_id is permitted, including dynamic LID resolution.
+
+        Extends base is_allowed to also check lid_map.json: if this sender_id
+        is a LID that maps to an authorized phone, allow it. This handles the
+        case where Homer sent the first outbound (bridge learned the LID) but
+        build_context hasn't been re-run to update allow_from yet.
+        """
+        if super().is_allowed(sender_id):
+            return True
+        # Check lid_map: if this LID maps to a phone in allow_from, allow it
+        from nanobot.config.paths import get_data_dir
+        lid_map_path = get_data_dir() / "lid_map.json"
+        if lid_map_path.exists():
+            try:
+                lid_map = json.loads(lid_map_path.read_text(encoding="utf-8"))
+                info = lid_map.get(sender_id)
+                if isinstance(info, dict):
+                    phone = info.get("phone", "")
+                    if phone and super().is_allowed(phone):
+                        # Dynamically add to allow_from so future checks are fast
+                        if hasattr(self.config, "allow_from"):
+                            self.config.allow_from.append(sender_id)
+                        return True
+            except (json.JSONDecodeError, OSError):
+                pass
+        return False
+
+    def _save_lid_mapping(self, phone_jid: str, lid: str) -> None:
+        """Persist a phone→LID mapping learned from an outbound send ack.
+
+        Stores {lid_prefix: {phone: phone_digits}} in lid_map.json.
+        The agent loop enriches this with names from the ACL/scope.
+        """
+        from nanobot.config.paths import get_data_dir
+
+        lid_prefix = lid.split("@")[0] if "@" in lid else lid
+        phone_digits = phone_jid.split("@")[0] if "@" in phone_jid else phone_jid
+
+        map_path = get_data_dir() / "lid_map.json"
+        lid_map: dict = {}
+        if map_path.exists():
+            try:
+                lid_map = json.loads(map_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if lid_map.get(lid_prefix, {}).get("phone") == phone_digits:
+            return  # Already mapped
+
+        lid_map[lid_prefix] = {"phone": phone_digits}
+        try:
+            map_path.write_text(json.dumps(lid_map, indent=2, ensure_ascii=False), encoding="utf-8")
+            logger.info("LID mapping saved: {} → {}", lid_prefix, phone_digits)
+        except OSError as e:
+            logger.warning("Failed to save LID mapping: {}", e)
 
     async def _transcribe_audio(self, audio_data: dict, sender_id: str) -> str:
         """Transcribe a voice/audio message using base channel transcription.

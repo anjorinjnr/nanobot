@@ -113,6 +113,7 @@ class AgentLoop:
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._processing_lock = asyncio.Lock()
         self._guest_agent_cache: dict[Path, tuple[ContextBuilder, SessionManager]] = {}
+        self._sender_map_cache: dict[Path, dict[str, str]] = {}
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -219,6 +220,73 @@ class AgentLoop:
                 blocked,
             )
         return self._guest_agent_cache[guest_agent_workspace]
+
+    def _resolve_sender_name(self, sender_id: str, workspace: Path) -> str | None:
+        """Look up sender_id in sender_map.json (build-time) or lid_map.json (runtime).
+
+        sender_map.json is cached (build-time, changes only on deploy/rebuild).
+        lid_map.json is read fresh each call (runtime, changes when bridge
+        learns a new LID on outbound ack — possibly from a different process).
+
+        For lid_map entries that only have phone (no name), cross-references
+        against sender_map to resolve the name.
+
+        Returns the guest's name if found, None otherwise.
+        """
+        # Phase 1: Check cached sender_map (build-time, phone/LID → name)
+        if workspace not in self._sender_map_cache:
+            merged: dict[str, str] = {}
+            sm_path = workspace / "sender_map.json"
+            if sm_path.exists():
+                try:
+                    data = json.loads(sm_path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        for k, v in data.items():
+                            if isinstance(v, str):
+                                merged[k] = v
+                except (json.JSONDecodeError, OSError):
+                    pass
+            self._sender_map_cache[workspace] = merged
+
+        cached = self._sender_map_cache.get(workspace, {})
+        if sender_id in cached:
+            return cached[sender_id]
+
+        # Phase 2: Check lid_map.json fresh (runtime, may change between calls)
+        for lid_map_path in self._lid_map_paths(workspace):
+            if not lid_map_path.exists():
+                continue
+            try:
+                data = json.loads(lid_map_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    continue
+                info = data.get(sender_id)
+                if isinstance(info, dict):
+                    name = info.get("name", "")
+                    if name:
+                        return name
+                    phone = info.get("phone", "")
+                    if phone and phone in cached:
+                        return cached[phone]
+                elif isinstance(info, str):
+                    return info
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        return None
+
+    @staticmethod
+    def _lid_map_paths(workspace: Path) -> list[Path]:
+        """Return candidate lid_map.json paths to check."""
+        paths = [workspace / "lid_map.json"]
+        try:
+            from nanobot.config.paths import get_data_dir
+            data_dir_map = get_data_dir() / "lid_map.json"
+            if data_dir_map not in paths:
+                paths.append(data_dir_map)
+        except Exception:
+            pass
+        return paths
 
     @staticmethod
     def _load_blocked_tools(workspace: Path) -> frozenset[str]:
@@ -542,9 +610,19 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
+
+        # Resolve sender name from sender_map / lid_map.
+        # Only inject on first message in session — after that the LLM
+        # already knows who it's talking to and repeating the name every
+        # turn would be unnatural.
+        sender_name = None
+        if msg.sender_id and not history:
+            sender_name = self._resolve_sender_name(msg.sender_id, context.workspace)
+        effective_content = f"[Sender: {sender_name}]\n{msg.content}" if sender_name else msg.content
+
         initial_messages = context.build_messages(
             history=history,
-            current_message=msg.content,
+            current_message=effective_content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
