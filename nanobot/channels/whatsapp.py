@@ -100,6 +100,10 @@ class WhatsAppChannel(BaseChannel):
         """Start the WhatsApp channel by connecting to the bridge."""
         import websockets
 
+        # Load identity maps eagerly so acks arriving before first inbound
+        # message don't trigger premature writes with stale data
+        await self._ensure_maps_loaded()
+
         bridge_url = self.config.bridge_url
 
         logger.info("Connecting to WhatsApp bridge at {}...", bridge_url)
@@ -406,19 +410,31 @@ class WhatsAppChannel(BaseChannel):
         if not self._lid_map_loaded:
             async with self._lid_map_lock:
                 if not self._lid_map_loaded:
-                    await asyncio.to_thread(self._load_maps_from_disk)
+                    lid_map, sender_map = await asyncio.to_thread(self._read_maps_from_disk)
+                    # Merge disk data with any in-memory entries added by acks before load
+                    for k, v in lid_map.items():
+                        if k not in self._lid_map:
+                            self._lid_map[k] = v
+                    self._sender_map = sender_map
                     self._lid_map_loaded = True
 
-    def _load_maps_from_disk(self) -> None:
-        """Synchronous disk reads, called via asyncio.to_thread."""
+    def _read_maps_from_disk(self) -> tuple[dict, dict[str, str]]:
+        """Synchronous disk reads, called via asyncio.to_thread.
+
+        Returns (lid_map, sender_map) — does NOT mutate instance state
+        to avoid thread-safety issues.
+        """
         from nanobot.config.paths import get_data_dir
+
+        lid_map: dict = {}
+        sender_map: dict[str, str] = {}
 
         # lid_map.json
         lid_map_path = get_data_dir() / "lid_map.json"
         if lid_map_path.exists():
             try:
-                self._lid_map = json.loads(lid_map_path.read_text(encoding="utf-8"))
-                logger.debug("Loaded lid_map with {} entries", len(self._lid_map))
+                lid_map = json.loads(lid_map_path.read_text(encoding="utf-8"))
+                logger.debug("Loaded lid_map with {} entries", len(lid_map))
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("Failed to load lid_map.json: {}", e)
 
@@ -428,11 +444,13 @@ class WhatsAppChannel(BaseChannel):
                 try:
                     data = json.loads(candidate.read_text(encoding="utf-8"))
                     if isinstance(data, dict):
-                        self._sender_map = {k: v for k, v in data.items() if isinstance(v, str)}
-                        logger.debug("Loaded sender_map with {} entries from {}", len(self._sender_map), candidate)
+                        sender_map = {k: v for k, v in data.items() if isinstance(v, str)}
+                        logger.debug("Loaded sender_map with {} entries from {}", len(sender_map), candidate)
                         break
                 except (json.JSONDecodeError, OSError) as e:
                     logger.warning("Failed to load sender_map from {}: {}", candidate, e)
+
+        return lid_map, sender_map
 
     def _sender_map_paths(self) -> list[Path]:
         """Return candidate sender_map.json paths.
@@ -471,22 +489,23 @@ class WhatsAppChannel(BaseChannel):
         # Update in-memory cache immediately
         self._lid_map[lid_prefix] = {"phone": phone_digits}
 
-        # Persist to disk under lock
+        # Persist to disk under lock — pass a snapshot to avoid thread-safety issues
+        snapshot = dict(self._lid_map)
         async with self._lid_map_lock:
-            await asyncio.to_thread(self._write_lid_map)
+            await asyncio.to_thread(self._write_lid_map, snapshot)
         logger.info("LID mapping saved: {} → {}", lid_prefix, phone_digits)
 
-    def _write_lid_map(self) -> None:
+    @staticmethod
+    def _write_lid_map(data: dict) -> None:
         """Synchronous atomic disk write, called via asyncio.to_thread under lock."""
         import tempfile
         from nanobot.config.paths import get_data_dir
         map_path = get_data_dir() / "lid_map.json"
         try:
-            # Atomic write: write to temp file then replace
             fd, tmp_path = tempfile.mkstemp(dir=map_path.parent, suffix=".tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(self._lid_map, f, indent=2, ensure_ascii=False)
+                    json.dump(data, f, indent=2, ensure_ascii=False)
                 Path(tmp_path).replace(map_path)
             except Exception:
                 try:
