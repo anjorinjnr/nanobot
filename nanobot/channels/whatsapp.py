@@ -460,26 +460,11 @@ class WhatsAppChannel(BaseChannel):
 
         return lid_map, sender_map
 
-    def _sender_map_paths(self) -> list[Path]:
-        """Return candidate sender_map.json paths.
-
-        Checks the workspace (from config) and the nanobot data dir.
-        """
+    @staticmethod
+    def _sender_map_paths() -> list[Path]:
+        """Return candidate sender_map.json paths."""
         from nanobot.config.paths import get_data_dir
-        data_dir = get_data_dir()
-        paths = [data_dir / "sender_map.json"]
-        config_path = data_dir / "config.json"
-        if config_path.exists():
-            try:
-                cfg = json.loads(config_path.read_text(encoding="utf-8"))
-                agents = cfg.get("agents") or {}
-                defaults = agents.get("defaults") or {} if isinstance(agents, dict) else {}
-                ws = defaults.get("workspace", "") if isinstance(defaults, dict) else ""
-                if ws:
-                    paths.insert(0, Path(ws) / "sender_map.json")
-            except (json.JSONDecodeError, OSError):
-                pass
-        return paths
+        return [get_data_dir() / "sender_map.json"]
 
     async def _save_lid_mapping(self, phone_jid: str, lid: str) -> None:
         """Persist a phone→LID mapping learned from an outbound send ack.
