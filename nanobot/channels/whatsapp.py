@@ -29,6 +29,7 @@ class WhatsAppConfig(Base):
     bridge_token: str = ""
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"
+    identity_resolution: bool = False  # Enable LID→name resolution via sender_map/lid_map
 
 
 class WhatsAppChannel(BaseChannel):
@@ -100,9 +101,9 @@ class WhatsAppChannel(BaseChannel):
         """Start the WhatsApp channel by connecting to the bridge."""
         import websockets
 
-        # Load identity maps eagerly so acks arriving before first inbound
-        # message don't trigger premature writes with stale data
-        await self._ensure_maps_loaded()
+        # Load identity maps eagerly if identity resolution is enabled
+        if self.config.identity_resolution:
+            await self._ensure_maps_loaded()
 
         bridge_url = self.config.bridge_url
 
@@ -279,8 +280,9 @@ class WhatsAppChannel(BaseChannel):
             sender_id = sender.split("@")[0] if "@" in sender else sender
             logger.info("Sender {} (pn={})", sender, pn or "none")
 
-            # Load identity maps on first message
-            await self._ensure_maps_loaded()
+            # Load identity maps on first message (if enabled)
+            if self.config.identity_resolution:
+                await self._ensure_maps_loaded()
 
             # Handle voice/audio message transcription
             audio_data = data.get("audio")
@@ -303,8 +305,8 @@ class WhatsAppChannel(BaseChannel):
 
             # Resolve sender name and inject on first message in session
             # Skip for media-only messages (empty content) to avoid phantom text
-            session_key = f"whatsapp:{sender}"
-            if content:
+            if self.config.identity_resolution and content:
+                session_key = f"whatsapp:{sender}"
                 sender_name = self._resolve_sender_name(sender_id, session_key)
                 if sender_name:
                     content = f"[Sender: {sender_name}]\n{content}"
@@ -339,7 +341,7 @@ class WhatsAppChannel(BaseChannel):
             msg_id = data.get("msg_id")
             lid = data.get("lid", "")
             to = data.get("to", "")
-            if lid and to and lid != to:
+            if self.config.identity_resolution and lid and to and lid != to:
                 await self._save_lid_mapping(to, lid)
             if msg_id and msg_id in self._pending_acks:
                 self._pending_acks[msg_id].set_result(None)
@@ -455,22 +457,21 @@ class WhatsAppChannel(BaseChannel):
     def _sender_map_paths(self) -> list[Path]:
         """Return candidate sender_map.json paths.
 
-        Homer writes sender_map.json to both the workspace and the data dir.
-        We check common locations without needing the workspace path.
+        Checks the workspace (from config) and the nanobot data dir.
         """
         from nanobot.config.paths import get_data_dir
         data_dir = get_data_dir()
         paths = [data_dir / "sender_map.json"]
-        # Also check the workspace parent (sender_map written to both workspaces)
-        # The data dir is typically ~/.nanobot/, workspace is set in config
         config_path = data_dir / "config.json"
         if config_path.exists():
             try:
                 cfg = json.loads(config_path.read_text(encoding="utf-8"))
-                ws = cfg.get("agents", {}).get("defaults", {}).get("workspace", "")
+                agents = cfg.get("agents") or {}
+                defaults = agents.get("defaults") or {} if isinstance(agents, dict) else {}
+                ws = defaults.get("workspace", "") if isinstance(defaults, dict) else ""
                 if ws:
                     paths.insert(0, Path(ws) / "sender_map.json")
-            except (json.JSONDecodeError, OSError, KeyError):
+            except (json.JSONDecodeError, OSError):
                 pass
         return paths
 
@@ -501,6 +502,7 @@ class WhatsAppChannel(BaseChannel):
         import tempfile
         from nanobot.config.paths import get_data_dir
         map_path = get_data_dir() / "lid_map.json"
+        map_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             fd, tmp_path = tempfile.mkstemp(dir=map_path.parent, suffix=".tmp")
             try:
