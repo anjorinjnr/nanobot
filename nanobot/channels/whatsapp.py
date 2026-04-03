@@ -276,8 +276,14 @@ class WhatsAppChannel(BaseChannel):
                 if not was_mentioned:
                     return
 
-            # Always use LID (sender) as canonical identifier — pn is unreliable
-            sender_id = sender.split("@")[0] if "@" in sender else sender
+            # When identity_resolution is enabled, always use LID (sender) as
+            # canonical identifier. Otherwise, prefer pn for backward compat
+            # with existing allow_from lists that use phone numbers.
+            if self.config.identity_resolution:
+                sender_id = sender.split("@")[0] if "@" in sender else sender
+            else:
+                user_id = pn if pn else sender
+                sender_id = user_id.split("@")[0] if "@" in user_id else user_id
             logger.info("Sender {} (pn={})", sender, pn or "none")
 
             # Load identity maps on first message (if enabled)
@@ -490,9 +496,9 @@ class WhatsAppChannel(BaseChannel):
         # Update in-memory cache immediately
         self._lid_map[lid_prefix] = {"phone": phone_digits}
 
-        # Persist to disk under lock — pass a snapshot to avoid thread-safety issues
-        snapshot = dict(self._lid_map)
+        # Persist to disk under lock — snapshot inside lock to prevent stale writes
         async with self._lid_map_lock:
+            snapshot = dict(self._lid_map)
             await asyncio.to_thread(self._write_lid_map, snapshot)
         logger.info("LID mapping saved: {} → {}", lid_prefix, phone_digits)
 
