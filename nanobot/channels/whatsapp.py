@@ -420,10 +420,14 @@ class WhatsAppChannel(BaseChannel):
             async with self._lid_map_lock:
                 if not self._lid_map_loaded:
                     lid_map, sender_map = await asyncio.to_thread(self._read_maps_from_disk)
-                    # Merge disk data with any in-memory entries added by acks before load
+                    # Merge disk data with in-memory entries (preserve both sides)
                     for k, v in lid_map.items():
                         if k not in self._lid_map:
                             self._lid_map[k] = v
+                        elif isinstance(v, dict) and isinstance(self._lid_map[k], dict):
+                            # Deep merge: disk fields fill in gaps in memory
+                            for field, val in v.items():
+                                self._lid_map[k].setdefault(field, val)
                     self._sender_map = sender_map
                     self._lid_map_loaded = True
 
@@ -479,8 +483,8 @@ class WhatsAppChannel(BaseChannel):
         if self._lid_map.get(lid_prefix, {}).get("phone") == phone_digits:
             return  # Already mapped
 
-        # Update in-memory cache immediately
-        self._lid_map[lid_prefix] = {"phone": phone_digits}
+        # Update in-memory cache — merge to preserve existing fields (e.g. name)
+        self._lid_map.setdefault(lid_prefix, {})["phone"] = phone_digits
 
         # Persist to disk under lock — snapshot inside lock to prevent stale writes
         async with self._lid_map_lock:
