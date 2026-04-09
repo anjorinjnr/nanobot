@@ -1438,3 +1438,51 @@ def test_advance_schedules_minute_recurrence(tmp_path) -> None:
     updated = (tmp_path / "HEARTBEAT.md").read_text()
     # 10:00 + 30min = 10:30 (still past 10:35), so next = 11:00
     assert "Schedule: 2026-03-12 11:00" in updated
+
+
+def test_advance_schedules_extra_whitespace(tmp_path) -> None:
+    """Schedule with extra whitespace after colon is still replaced correctly."""
+    now = datetime(2026, 3, 12, 10, 30)
+    heartbeat = _make_heartbeat(
+        "\n### Gmail scan\nType: system\nSchedule:  2026-03-12 09:00\nRecur: every 1 hour\n"
+    )
+    (tmp_path / "HEARTBEAT.md").write_text(heartbeat, encoding="utf-8")
+
+    provider = DummyProvider([])
+    service = HeartbeatService(
+        workspace=tmp_path, provider=provider, model="test",
+        last_run_tracking=True, timezone="America/New_York",
+    )
+
+    tasks = [DueTask(name="Gmail scan", task_type="system", schedule="2026-03-12 09:00")]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = (tmp_path / "HEARTBEAT.md").read_text()
+    assert "2026-03-12 11:00" in updated
+    assert "2026-03-12 09:00" not in updated
+
+
+def test_advance_schedules_schedule_at_eof(tmp_path) -> None:
+    """Last-run is inserted even when Schedule is the last line with no trailing newline."""
+    now = datetime(2026, 3, 12, 10, 30)
+    # Construct content where Schedule line has no trailing newline
+    content = "# Heartbeat Tasks\n## Announcements\n## User Tasks\n### Task EOF\nType: system\nSchedule: 2026-03-12 09:00\nRecur: every 1 hour"
+    # No trailing newline, no ## Completed
+    (tmp_path / "HEARTBEAT.md").write_text(content, encoding="utf-8")
+
+    provider = DummyProvider([])
+    service = HeartbeatService(
+        workspace=tmp_path, provider=provider, model="test",
+        last_run_tracking=True, timezone="America/New_York",
+    )
+
+    tasks = [DueTask(name="Task EOF", task_type="system", schedule="2026-03-12 09:00")]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = (tmp_path / "HEARTBEAT.md").read_text()
+    assert "2026-03-12 11:00" in updated
+    assert "Last-run: 2026-03-12 10:30" in updated

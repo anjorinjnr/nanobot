@@ -513,15 +513,21 @@ class HeartbeatService:
                 except ValueError:
                     pass
 
-            # Update block: replace Schedule, add/update Last-run
-            updated_block = block.replace(f"Schedule: {schedule_str}", f"Schedule: {next_str}")
+            # Update block: replace Schedule (use regex to handle variable whitespace)
+            updated_block = re.sub(
+                r"(Schedule:\s*)" + re.escape(schedule_str),
+                rf"\g<1>{next_str}",
+                block,
+                count=1,
+            )
             if re.search(r"Last-run:", updated_block):
                 updated_block = re.sub(r"Last-run:[^\n]*", f"Last-run: {now_str}", updated_block)
             else:
                 updated_block = re.sub(
-                    r"(Schedule:[^\n]+\n)",
-                    f"\\1Last-run: {now_str}\n",
+                    r"(Schedule:[^\n]+)(\n|$)",
+                    rf"\1\nLast-run: {now_str}\2",
                     updated_block,
+                    count=1,
                 )
 
             content = content[:m.start()] + updated_block + content[m.end():]
@@ -596,7 +602,8 @@ class HeartbeatService:
 
                     # Deterministically advance schedules for all executed tasks
                     # so they aren't considered due on the next tick.
-                    self._advance_schedules(due_tasks)
+                    if self.last_run_tracking:
+                        self._advance_schedules(due_tasks)
         except Exception:
             logger.exception("Heartbeat execution failed")
 
