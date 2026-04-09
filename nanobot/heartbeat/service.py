@@ -484,6 +484,12 @@ class HeartbeatService:
             except ValueError:
                 continue
 
+            # If the LLM already called --tick during execution, the schedule
+            # will already be in the future — skip to avoid double-advancing.
+            if current_dt > now_naive:
+                logger.info("Heartbeat: '{}' schedule already advanced, skipping", task.name)
+                continue
+
             if recur_unit == "minute":
                 delta = timedelta(minutes=recur_n)
             elif recur_unit == "hour":

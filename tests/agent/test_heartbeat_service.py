@@ -1452,3 +1452,21 @@ def test_advance_schedules_block_stops_at_section_boundary(advance_service) -> N
     assert "Schedule: 2026-03-12 11:00" in updated
     # Verify ## Completed section is untouched
     assert "## Completed" in updated
+
+
+def test_advance_schedules_skips_already_advanced(advance_service) -> None:
+    """If the LLM already ticked the schedule forward, don't double-advance."""
+    now = datetime(2026, 3, 12, 10, 30)
+    # Schedule is already in the future (LLM called --tick during execution)
+    heartbeat = _make_heartbeat(
+        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 11:00\nRecur: every 1 hour\n"
+    )
+    service = advance_service(heartbeat)
+    tasks = [DueTask(name="Gmail scan", task_type="system", schedule="2026-03-12 09:00")]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    # Should stay at 11:00, NOT advance to 12:00
+    assert "Schedule: 2026-03-12 11:00" in updated
