@@ -1470,3 +1470,45 @@ def test_advance_schedules_skips_already_advanced(advance_service) -> None:
     updated = service.heartbeat_file.read_text()
     # Should stay at 11:00, NOT advance to 12:00
     assert "Schedule: 2026-03-12 11:00" in updated
+
+
+@pytest.mark.asyncio
+async def test_tick_advances_per_group_on_failure(tmp_path, monkeypatch) -> None:
+    """If one task group fails, the other group's schedule is still advanced."""
+    past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+    heartbeat = _make_heartbeat(
+        f"\n### Gmail scan\nType: system\nSchedule: {past}\nModel: flash\nRecur: every 1 hour\n\n"
+        f"### Balance check\nType: system\nSchedule: {past}\nModel: pro\nRecur: every 1 day\n"
+    )
+    (tmp_path / "HEARTBEAT.md").write_text(heartbeat, encoding="utf-8")
+
+    call_count = 0
+
+    async def mock_execute(summary: str, model: str | None) -> str:
+        nonlocal call_count
+        call_count += 1
+        if "Balance check" in summary:
+            raise RuntimeError("API error")
+        return "done"
+
+    async def mock_eval(*a, **kw):
+        return False
+
+    monkeypatch.setattr("nanobot.utils.evaluator.evaluate_response", mock_eval)
+
+    service = HeartbeatService(
+        workspace=tmp_path, provider=DummyProvider([]), model="test",
+        on_execute=mock_execute, last_run_tracking=True,
+    )
+
+    await service._tick()
+
+    updated = (tmp_path / "HEARTBEAT.md").read_text()
+    # Gmail scan (flash group) should be advanced despite Balance check failure
+    # Balance check should still have the old schedule (execution failed)
+    gmail_block = updated.split("### Gmail scan")[1].split("###")[0]
+    assert f"Schedule: {past}" not in gmail_block
+    assert "Last-run:" in gmail_block
+    balance_block = updated.split("### Balance check")[1].split("##")[0]
+    assert f"Schedule: {past}" in balance_block
+    assert call_count == 2

@@ -593,7 +593,11 @@ class HeartbeatService:
 
                     for model_override, group_tasks in groups.items():
                         summary = ", ".join(f"{t.name} ({t.task_type})" for t in group_tasks)
-                        response = await self.on_execute(summary, model_override)
+                        try:
+                            response = await self.on_execute(summary, model_override)
+                        except Exception:
+                            logger.exception("Heartbeat: execution failed for {}", summary)
+                            continue
                         if response:
                             should_notify = await evaluate_response(
                                 response, summary, self.provider, self.model,
@@ -604,9 +608,8 @@ class HeartbeatService:
                                 await self.on_notify(response)
                             else:
                                 logger.info("Heartbeat: silenced by post-run evaluation")
-
-                    if self.last_run_tracking:
-                        self._advance_schedules(due_tasks)
+                        if self.last_run_tracking:
+                            self._advance_schedules(group_tasks)
         except Exception:
             logger.exception("Heartbeat execution failed")
 
