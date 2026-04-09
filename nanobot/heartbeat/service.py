@@ -11,9 +11,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Literal
 
 from loguru import logger
+from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
+
+_SCHED_PAT = re.compile(r"Schedule:\s*(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)")
+_RECUR_PAT = re.compile(r"Recur:\s*every\s+(\d+)\s+(minute|hour|day)s?", re.IGNORECASE)
+_UNTIL_PAT = re.compile(r"Until:\s*(\d{4}-\d{2}-\d{2})")
+_LASTRUN_PAT = re.compile(r"Last-run:[^\n]*")
 
 _HEARTBEAT_TOOL = [
     {
@@ -102,6 +108,14 @@ class HeartbeatService:
     @property
     def heartbeat_file(self) -> Path:
         return self.workspace / "HEARTBEAT.md"
+
+    def _now(self) -> datetime:
+        """Return current time in the configured timezone."""
+        try:
+            tz = ZoneInfo(self.timezone) if self.timezone else None
+        except (KeyError, Exception):
+            tz = None
+        return datetime.now(tz=tz) if tz else datetime.now().astimezone()
 
     @staticmethod
     def _compute_due_tasks(content: str, now: datetime) -> list[DueTask]:
@@ -286,12 +300,7 @@ class HeartbeatService:
         due_tasks is populated only when last_run_tracking=True.
         """
         from nanobot.utils.helpers import current_time_str
-        from zoneinfo import ZoneInfo
-        try:
-            tz = ZoneInfo(self.timezone) if self.timezone else None
-        except (KeyError, Exception):
-            tz = None
-        now = datetime.now(tz=tz) if tz else datetime.now().astimezone()
+        now = self._now()
 
         if self.last_run_tracking:
             due = self._compute_due_tasks(content, now.replace(tzinfo=None))
@@ -416,7 +425,7 @@ class HeartbeatService:
                 logger.info("Heartbeat: pre-check skipped '{}' (no work)", task.name)
         return result
 
-    def _advance_schedules(self, tasks: list[DueTask]) -> None:
+    def _advance_schedules(self, tasks: list[DueTask], content: str) -> None:
         """Deterministically advance Schedule for executed recurring tasks.
 
         After a task executes, advance its Schedule past now by its Recur
@@ -424,17 +433,7 @@ class HeartbeatService:
         considered due again on the next heartbeat tick, regardless of
         whether the LLM also calls tasks_update.py --tick.
         """
-        content = self._read_heartbeat_file()
-        if not content:
-            return
-
-        from zoneinfo import ZoneInfo
-        try:
-            tz = ZoneInfo(self.timezone) if self.timezone else None
-        except (KeyError, Exception):
-            tz = None
-        now = datetime.now(tz=tz) if tz else datetime.now().astimezone()
-        now_naive = now.replace(tzinfo=None)
+        now_naive = self._now().replace(tzinfo=None)
         now_str = now_naive.strftime("%Y-%m-%d %H:%M")
 
         changed = False
@@ -442,8 +441,6 @@ class HeartbeatService:
             if task.task_type == "announcement" or not task.schedule:
                 continue
 
-            # Find the task block in HEARTBEAT.md by name
-            # Escape the task name for regex safety
             escaped = re.escape(task.name)
             block_pat = re.compile(
                 rf"(###\s+{escaped}\s*\n)(.*?)(?=\n###\s|\Z)",
@@ -456,17 +453,14 @@ class HeartbeatService:
 
             block = m.group(0)
 
-            # Parse Recur interval
-            recur_m = re.search(r"Recur:\s*every\s+(\d+)\s+(minute|hour|day)s?", block, re.IGNORECASE)
+            recur_m = _RECUR_PAT.search(block)
             if not recur_m:
-                # Non-recurring task — nothing to advance
                 continue
 
             recur_n = int(recur_m.group(1))
             recur_unit = recur_m.group(2).lower()
 
-            # Parse current schedule
-            sched_m = re.search(r"Schedule:\s*(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)", block)
+            sched_m = _SCHED_PAT.search(block)
             if not sched_m:
                 continue
             schedule_str = sched_m.group(1).strip()
@@ -481,16 +475,12 @@ class HeartbeatService:
             except ValueError:
                 continue
 
-            # Compute delta and advance past now
             if recur_unit == "minute":
                 delta = timedelta(minutes=recur_n)
             elif recur_unit == "hour":
                 delta = timedelta(hours=recur_n)
             else:
                 delta = timedelta(days=recur_n)
-
-            if delta.total_seconds() <= 0:
-                continue
 
             next_dt = current_dt + delta
             if next_dt <= now_naive:
@@ -502,8 +492,7 @@ class HeartbeatService:
             else:
                 next_str = next_dt.strftime("%Y-%m-%d")
 
-            # Check Until date
-            until_m = re.search(r"Until:\s*(\d{4}-\d{2}-\d{2})", block)
+            until_m = _UNTIL_PAT.search(block)
             if until_m:
                 try:
                     until_date = datetime.strptime(until_m.group(1), "%Y-%m-%d").date()
@@ -513,15 +502,14 @@ class HeartbeatService:
                 except ValueError:
                     pass
 
-            # Update block: replace Schedule (use regex to handle variable whitespace)
             updated_block = re.sub(
                 r"(Schedule:\s*)" + re.escape(schedule_str),
                 rf"\g<1>{next_str}",
                 block,
                 count=1,
             )
-            if re.search(r"Last-run:", updated_block):
-                updated_block = re.sub(r"Last-run:[^\n]*", f"Last-run: {now_str}", updated_block)
+            if _LASTRUN_PAT.search(updated_block):
+                updated_block = _LASTRUN_PAT.sub(f"Last-run: {now_str}", updated_block)
             else:
                 updated_block = re.sub(
                     r"(Schedule:[^\n]+)(\n|$)",
@@ -600,10 +588,8 @@ class HeartbeatService:
                             else:
                                 logger.info("Heartbeat: silenced by post-run evaluation")
 
-                    # Deterministically advance schedules for all executed tasks
-                    # so they aren't considered due on the next tick.
                     if self.last_run_tracking:
-                        self._advance_schedules(due_tasks)
+                        self._advance_schedules(due_tasks, content)
         except Exception:
             logger.exception("Heartbeat execution failed")
 
