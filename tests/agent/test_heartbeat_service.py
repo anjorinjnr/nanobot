@@ -1295,8 +1295,8 @@ def test_advance_schedules_date_only(advance_service) -> None:
     assert "Schedule: 2026-03-19" in updated
 
 
-def test_advance_schedules_respects_until(advance_service) -> None:
-    """Task past its Until date is not advanced."""
+def test_advance_schedules_advances_past_until(advance_service) -> None:
+    """Schedule is advanced even past Until — _compute_due_tasks handles expiry."""
     now = datetime(2026, 3, 15, 10, 30)
     heartbeat = _make_heartbeat(
         "\n### Temp reminder\nSchedule: 2026-03-14 09:00\nRecur: every 1 day\nUntil: 2026-03-14\n"
@@ -1308,7 +1308,8 @@ def test_advance_schedules_respects_until(advance_service) -> None:
         service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
-    assert "Schedule: 2026-03-14 09:00" in updated
+    # Schedule IS advanced — _compute_due_tasks won't fire it again (past Until)
+    assert "Schedule: 2026-03-16 09:00" in updated
 
 
 @pytest.mark.asyncio

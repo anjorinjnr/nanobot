@@ -509,15 +509,9 @@ class HeartbeatService:
             else:
                 next_str = next_dt.strftime("%Y-%m-%d")
 
-            until_m = _UNTIL_PAT.search(block)
-            if until_m:
-                try:
-                    until_date = datetime.strptime(until_m.group(1), "%Y-%m-%d").date()
-                    if next_dt.date() > until_date:
-                        logger.info("Heartbeat: '{}' past Until date, skipping advance", task.name)
-                        continue
-                except ValueError:
-                    pass
+            # Note: Until date enforcement is handled by _compute_due_tasks,
+            # not here. Always advance the schedule to prevent infinite loops
+            # when now < Until < next_dt.
 
             updated_block = re.sub(
                 r"(Schedule:\s*)" + re.escape(schedule_str),
@@ -598,18 +592,22 @@ class HeartbeatService:
                         except Exception:
                             logger.exception("Heartbeat: execution failed for {}", summary)
                             continue
-                        if response:
-                            should_notify = await evaluate_response(
-                                response, summary, self.provider, self.model,
-                                suppress_errors=self.suppress_errors,
-                            )
-                            if should_notify and self.on_notify:
-                                logger.info("Heartbeat: completed, delivering response")
-                                await self.on_notify(response)
-                            else:
-                                logger.info("Heartbeat: silenced by post-run evaluation")
-                        if self.last_run_tracking:
-                            self._advance_schedules(group_tasks)
+                        try:
+                            if response:
+                                should_notify = await evaluate_response(
+                                    response, summary, self.provider, self.model,
+                                    suppress_errors=self.suppress_errors,
+                                )
+                                if should_notify and self.on_notify:
+                                    logger.info("Heartbeat: completed, delivering response")
+                                    await self.on_notify(response)
+                                else:
+                                    logger.info("Heartbeat: silenced by post-run evaluation")
+                        except Exception:
+                            logger.exception("Heartbeat: notification failed for {}", summary)
+                        finally:
+                            if self.last_run_tracking:
+                                self._advance_schedules(group_tasks)
         except Exception:
             logger.exception("Heartbeat execution failed")
 
