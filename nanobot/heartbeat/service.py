@@ -464,9 +464,7 @@ class HeartbeatService:
             if not recur_m:
                 continue
 
-            recur_n = int(recur_m.group(1))
-            if recur_n == 0:
-                continue
+            recur_n = int(recur_m.group(1)) or 1  # treat 0 as 1 to prevent infinite loops
             recur_unit = recur_m.group(2).lower()
 
             sched_m = _SCHED_PAT.search(block)
@@ -589,10 +587,6 @@ class HeartbeatService:
                         summary = ", ".join(f"{t.name} ({t.task_type})" for t in group_tasks)
                         try:
                             response = await self.on_execute(summary, model_override)
-                        except Exception:
-                            logger.exception("Heartbeat: execution failed for {}", summary)
-                            continue
-                        try:
                             if response:
                                 should_notify = await evaluate_response(
                                     response, summary, self.provider, self.model,
@@ -604,8 +598,11 @@ class HeartbeatService:
                                 else:
                                     logger.info("Heartbeat: silenced by post-run evaluation")
                         except Exception:
-                            logger.exception("Heartbeat: notification failed for {}", summary)
+                            logger.exception("Heartbeat: task failed for {}", summary)
                         finally:
+                            # Always advance schedule — even on failure — to prevent
+                            # retry spam on persistent errors (e.g. API outage).
+                            # The task will run again at its next scheduled time.
                             if self.last_run_tracking:
                                 self._advance_schedules(group_tasks)
         except Exception:

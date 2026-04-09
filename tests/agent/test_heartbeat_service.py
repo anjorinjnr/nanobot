@@ -1421,8 +1421,8 @@ def test_advance_schedules_biweekly_recurrence(advance_service) -> None:
     assert "Schedule: 2026-03-26" in updated
 
 
-def test_advance_schedules_zero_recurrence_skipped(advance_service) -> None:
-    """Recur: every 0 days is skipped to avoid ZeroDivisionError."""
+def test_advance_schedules_zero_recurrence_defaults_to_one(advance_service) -> None:
+    """Recur: every 0 days defaults to 1 day to prevent infinite loops."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
         "\n### Bad task\nSchedule: 2026-03-12 09:00\nRecur: every 0 days\n"
@@ -1434,7 +1434,8 @@ def test_advance_schedules_zero_recurrence_skipped(advance_service) -> None:
         service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
-    assert "Schedule: 2026-03-12 09:00" in updated  # unchanged
+    # 0 days treated as 1 day
+    assert "Schedule: 2026-03-13 09:00" in updated
 
 
 def test_advance_schedules_block_stops_at_section_boundary(advance_service) -> None:
@@ -1505,11 +1506,12 @@ async def test_tick_advances_per_group_on_failure(tmp_path, monkeypatch) -> None
     await service._tick()
 
     updated = (tmp_path / "HEARTBEAT.md").read_text()
-    # Gmail scan (flash group) should be advanced despite Balance check failure
-    # Balance check should still have the old schedule (execution failed)
+    # Both tasks should be advanced — even Balance check (failed) gets advanced
+    # to prevent retry spam on persistent errors
     gmail_block = updated.split("### Gmail scan")[1].split("###")[0]
     assert f"Schedule: {past}" not in gmail_block
     assert "Last-run:" in gmail_block
     balance_block = updated.split("### Balance check")[1].split("##")[0]
-    assert f"Schedule: {past}" in balance_block
+    assert f"Schedule: {past}" not in balance_block
+    assert "Last-run:" in balance_block
     assert call_count == 2
