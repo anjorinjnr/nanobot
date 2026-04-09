@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
 
 _SCHED_PAT = re.compile(r"Schedule:\s*(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)")
-_RECUR_PAT = re.compile(r"Recur:\s*every\s+(\d+)\s+(minute|hour|day)s?", re.IGNORECASE)
+_RECUR_PAT = re.compile(r"Recur:\s*every\s+(\d+)\s+(minute|hour|day|week)s?", re.IGNORECASE)
 _UNTIL_PAT = re.compile(r"Until:\s*(\d{4}-\d{2}-\d{2})")
 _LASTRUN_PAT = re.compile(r"Last-run:[^\n]*")
 
@@ -425,14 +425,21 @@ class HeartbeatService:
                 logger.info("Heartbeat: pre-check skipped '{}' (no work)", task.name)
         return result
 
-    def _advance_schedules(self, tasks: list[DueTask], content: str) -> None:
+    def _advance_schedules(self, tasks: list[DueTask]) -> None:
         """Deterministically advance Schedule for executed recurring tasks.
 
         After a task executes, advance its Schedule past now by its Recur
         interval and write Last-run.  This prevents the task from being
         considered due again on the next heartbeat tick, regardless of
         whether the LLM also calls tasks_update.py --tick.
+
+        Re-reads HEARTBEAT.md fresh to avoid overwriting changes made
+        during task execution (which can take 10-30s).
         """
+        content = self._read_heartbeat_file()
+        if not content:
+            return
+
         now_naive = self._now().replace(tzinfo=None)
         now_str = now_naive.strftime("%Y-%m-%d %H:%M")
 
@@ -443,7 +450,7 @@ class HeartbeatService:
 
             escaped = re.escape(task.name)
             block_pat = re.compile(
-                rf"(###\s+{escaped}\s*\n)(.*?)(?=\n###\s|\Z)",
+                rf"(###\s+{escaped}\s*\n)(.*?)(?=\n###\s|\n##\s|\Z)",
                 re.DOTALL,
             )
             m = block_pat.search(content)
@@ -458,6 +465,8 @@ class HeartbeatService:
                 continue
 
             recur_n = int(recur_m.group(1))
+            if recur_n == 0:
+                continue
             recur_unit = recur_m.group(2).lower()
 
             sched_m = _SCHED_PAT.search(block)
@@ -479,6 +488,8 @@ class HeartbeatService:
                 delta = timedelta(minutes=recur_n)
             elif recur_unit == "hour":
                 delta = timedelta(hours=recur_n)
+            elif recur_unit == "week":
+                delta = timedelta(weeks=recur_n)
             else:
                 delta = timedelta(days=recur_n)
 
@@ -509,7 +520,7 @@ class HeartbeatService:
                 count=1,
             )
             if _LASTRUN_PAT.search(updated_block):
-                updated_block = _LASTRUN_PAT.sub(f"Last-run: {now_str}", updated_block)
+                updated_block = _LASTRUN_PAT.sub(f"Last-run: {now_str}", updated_block, count=1)
             else:
                 updated_block = re.sub(
                     r"(Schedule:[^\n]+)(\n|$)",
@@ -589,7 +600,7 @@ class HeartbeatService:
                                 logger.info("Heartbeat: silenced by post-run evaluation")
 
                     if self.last_run_tracking:
-                        self._advance_schedules(due_tasks, content)
+                        self._advance_schedules(due_tasks)
         except Exception:
             logger.exception("Heartbeat execution failed")
 

@@ -1170,7 +1170,7 @@ def test_advance_schedules_daily_task(advance_service) -> None:
     tasks = [DueTask(name="Gmail scan", task_type="system", schedule="2026-03-12 07:00")]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, heartbeat)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert "Schedule: 2026-03-13 07:00" in updated
@@ -1187,7 +1187,7 @@ def test_advance_schedules_hourly_task(advance_service) -> None:
     tasks = [DueTask(name="Gmail scan", task_type="system", schedule="2026-03-12 09:00")]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, heartbeat)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert "Schedule: 2026-03-12 11:00" in updated
@@ -1203,7 +1203,7 @@ def test_advance_schedules_skips_past_now(advance_service) -> None:
     tasks = [DueTask(name="Balance check", task_type="system", schedule="2026-03-10 09:00")]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, heartbeat)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert "Schedule: 2026-03-13 09:00" in updated
@@ -1220,7 +1220,7 @@ def test_advance_schedules_skips_non_recurring(advance_service) -> None:
     tasks = [DueTask(name="One-time reminder", task_type="reminder", schedule=past)]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, heartbeat)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert f"Schedule: {past}" in updated
@@ -1235,7 +1235,7 @@ def test_advance_schedules_skips_announcements(advance_service) -> None:
     tasks = [DueTask(name="Deploy done", task_type="announcement", schedule=None)]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, heartbeat)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert updated == heartbeat
@@ -1251,7 +1251,7 @@ def test_advance_schedules_updates_existing_last_run(advance_service) -> None:
     tasks = [DueTask(name="Gmail scan", task_type="system", schedule="2026-03-12 09:00")]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, heartbeat)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert updated.count("Last-run:") == 1
@@ -1272,7 +1272,7 @@ def test_advance_schedules_multiple_tasks(advance_service) -> None:
     ]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, heartbeat)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert "Schedule: 2026-03-12 11:00" in updated
@@ -1289,7 +1289,7 @@ def test_advance_schedules_date_only(advance_service) -> None:
     tasks = [DueTask(name="Weekly review", task_type="reminder", schedule="2026-03-12")]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, heartbeat)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert "Schedule: 2026-03-19" in updated
@@ -1305,7 +1305,7 @@ def test_advance_schedules_respects_until(advance_service) -> None:
     tasks = [DueTask(name="Temp reminder", task_type="reminder", schedule="2026-03-14 09:00")]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, heartbeat)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert "Schedule: 2026-03-14 09:00" in updated
@@ -1350,7 +1350,7 @@ def test_advance_schedules_minute_recurrence(advance_service) -> None:
     tasks = [DueTask(name="Frequent check", task_type="system", schedule="2026-03-12 10:00")]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, heartbeat)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert "Schedule: 2026-03-12 11:00" in updated
@@ -1366,7 +1366,7 @@ def test_advance_schedules_extra_whitespace(advance_service) -> None:
     tasks = [DueTask(name="Gmail scan", task_type="system", schedule="2026-03-12 09:00")]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, heartbeat)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert "2026-03-12 11:00" in updated
@@ -1381,8 +1381,74 @@ def test_advance_schedules_schedule_at_eof(advance_service) -> None:
     tasks = [DueTask(name="Task EOF", task_type="system", schedule="2026-03-12 09:00")]
 
     with _fixed_now(now):
-        service._advance_schedules(tasks, content)
+        service._advance_schedules(tasks)
 
     updated = service.heartbeat_file.read_text()
     assert "2026-03-12 11:00" in updated
     assert "Last-run: 2026-03-12 10:30" in updated
+
+
+def test_advance_schedules_weekly_recurrence(advance_service) -> None:
+    """Weekly recurrence advances by 7 days."""
+    now = datetime(2026, 3, 12, 10, 30)
+    heartbeat = _make_heartbeat(
+        "\n### Weekly standup\nSchedule: 2026-03-12\nRecur: every 1 week\n"
+    )
+    service = advance_service(heartbeat)
+    tasks = [DueTask(name="Weekly standup", task_type="reminder", schedule="2026-03-12")]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    assert "Schedule: 2026-03-19" in updated
+
+
+def test_advance_schedules_biweekly_recurrence(advance_service) -> None:
+    """Bi-weekly recurrence advances by 14 days."""
+    now = datetime(2026, 3, 12, 10, 30)
+    heartbeat = _make_heartbeat(
+        "\n### Biweekly review\nSchedule: 2026-03-12\nRecur: every 2 weeks\n"
+    )
+    service = advance_service(heartbeat)
+    tasks = [DueTask(name="Biweekly review", task_type="reminder", schedule="2026-03-12")]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    assert "Schedule: 2026-03-26" in updated
+
+
+def test_advance_schedules_zero_recurrence_skipped(advance_service) -> None:
+    """Recur: every 0 days is skipped to avoid ZeroDivisionError."""
+    now = datetime(2026, 3, 12, 10, 30)
+    heartbeat = _make_heartbeat(
+        "\n### Bad task\nSchedule: 2026-03-12 09:00\nRecur: every 0 days\n"
+    )
+    service = advance_service(heartbeat)
+    tasks = [DueTask(name="Bad task", task_type="system", schedule="2026-03-12 09:00")]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    assert "Schedule: 2026-03-12 09:00" in updated  # unchanged
+
+
+def test_advance_schedules_block_stops_at_section_boundary(advance_service) -> None:
+    """Block regex stops at ## section headers, not just ### task headers."""
+    now = datetime(2026, 3, 12, 10, 30)
+    heartbeat = _make_heartbeat(
+        "\n### Last task\nType: system\nSchedule: 2026-03-12 09:00\nRecur: every 1 hour\n"
+    )
+    service = advance_service(heartbeat)
+    tasks = [DueTask(name="Last task", task_type="system", schedule="2026-03-12 09:00")]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    assert "Schedule: 2026-03-12 11:00" in updated
+    # Verify ## Completed section is untouched
+    assert "## Completed" in updated
