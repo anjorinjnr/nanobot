@@ -804,12 +804,12 @@ def gateway(
 
         # Suppress runner errors structurally — the stop_reason tells us
         # whether the agent actually produced content or just hit an error.
-        stop = resp.metadata.get("_stop_reason", "completed")
+        stop = (resp.metadata or {}).get("_stop_reason", "completed")
         if stop in _HEARTBEAT_ERROR_STOPS:
             logger.info("Heartbeat: suppressed {} response: {}", stop, (resp.content or "")[:120])
             return ""
 
-        return resp.content
+        return resp.content or ""
 
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
