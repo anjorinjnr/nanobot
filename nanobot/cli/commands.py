@@ -640,6 +640,7 @@ def gateway(
     from nanobot.channels.manager import ChannelManager
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
+    from nanobot.agent.runner import STOP_EMPTY_FINAL, STOP_ERROR
     from nanobot.heartbeat.service import HeartbeatService
     from nanobot.session.manager import SessionManager
 
@@ -772,9 +773,7 @@ def gateway(
         return "cli", "direct"
 
     # Create heartbeat service
-    # Stop reasons that indicate the runner failed to produce real content.
-    # Heartbeat should treat these as silence, not forward them to users.
-    _HEARTBEAT_ERROR_STOPS = {"error", "empty_final_response"}
+    _HEARTBEAT_ERROR_STOPS = {STOP_ERROR, STOP_EMPTY_FINAL}
 
     async def on_heartbeat_execute(tasks: str, model_override: str | None = None) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
@@ -802,11 +801,8 @@ def gateway(
         if not resp:
             return ""
 
-        # Suppress runner errors structurally — the stop_reason tells us
-        # whether the agent actually produced content or just hit an error.
-        stop = (resp.metadata or {}).get("_stop_reason", "completed")
-        if stop in _HEARTBEAT_ERROR_STOPS:
-            logger.info("Heartbeat: suppressed {} response: {}", stop, (resp.content or "")[:120])
+        if resp.stop_reason in _HEARTBEAT_ERROR_STOPS:
+            logger.info("Heartbeat: suppressed {} response: {}", resp.stop_reason, (resp.content or "")[:120])
             return ""
 
         return resp.content or ""
