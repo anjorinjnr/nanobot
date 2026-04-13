@@ -21,6 +21,18 @@ _RECUR_PAT = re.compile(r"Recur:\s*every\s+(\d+)\s+(minute|hour|day|week)s?", re
 _UNTIL_PAT = re.compile(r"Until:\s*(\d{4}-\d{2}-\d{2})")
 _LASTRUN_PAT = re.compile(r"Last-run:[^\n]*")
 
+# Generic error messages produced by AgentRunner when the LLM returns
+# empty content (e.g. heartbeat silent-mode compliance) or when the
+# provider fails.  These are not actionable user-facing errors — they're
+# runner plumbing.  Filter them out before wasting an evaluator LLM call.
+_RUNNER_NOISE_PATTERNS = [
+    "I completed the tool steps but couldn't produce a final answer",
+    "Sorry, I encountered an error calling the AI model",
+    "I'm having trouble reaching that right now",
+    "Please try again or narrow the task",
+    "Try asking me again in a bit",
+]
+
 _HEARTBEAT_TOOL = [
     {
         "type": "function",
@@ -334,6 +346,19 @@ class HeartbeatService:
             + "\n".join(lines)
         )
 
+    @staticmethod
+    def _is_runner_noise(response: str) -> bool:
+        """True when response is a generic runner/provider error, not real content.
+
+        The AgentRunner produces these when the LLM returns empty content
+        (heartbeat silent-mode compliance) or the provider call fails.
+        They carry no diagnostic value for the user.
+        """
+        stripped = response.strip()
+        if not stripped:
+            return True
+        return any(pattern in stripped for pattern in _RUNNER_NOISE_PATTERNS)
+
     def _read_heartbeat_file(self) -> str | None:
         if self.heartbeat_file.exists():
             try:
@@ -620,15 +645,18 @@ class HeartbeatService:
                 if not due_tasks:
                     response = await self.on_execute(tasks_str, None)
                     if response:
-                        should_notify = await evaluate_response(
-                            response, tasks_str, self.provider, self.model,
-                            suppress_errors=self.suppress_errors,
-                        )
-                        if should_notify and self.on_notify:
-                            logger.info("Heartbeat: completed, delivering response")
-                            await self.on_notify(response)
+                        if self._is_runner_noise(response):
+                            logger.info("Heartbeat: suppressed runner noise: {}", response[:120])
                         else:
-                            logger.info("Heartbeat: silenced by post-run evaluation")
+                            should_notify = await evaluate_response(
+                                response, tasks_str, self.provider, self.model,
+                                suppress_errors=self.suppress_errors,
+                            )
+                            if should_notify and self.on_notify:
+                                logger.info("Heartbeat: completed, delivering response")
+                                await self.on_notify(response)
+                            else:
+                                logger.info("Heartbeat: silenced by post-run evaluation")
                 else:
                     # Group tasks by model override
                     groups: dict[str | None, list[DueTask]] = {}
@@ -640,15 +668,18 @@ class HeartbeatService:
                         try:
                             response = await self.on_execute(summary, model_override)
                             if response:
-                                should_notify = await evaluate_response(
-                                    response, summary, self.provider, self.model,
-                                    suppress_errors=self.suppress_errors,
-                                )
-                                if should_notify and self.on_notify:
-                                    logger.info("Heartbeat: completed, delivering response")
-                                    await self.on_notify(response)
+                                if self._is_runner_noise(response):
+                                    logger.info("Heartbeat: suppressed runner noise: {}", response[:120])
                                 else:
-                                    logger.info("Heartbeat: silenced by post-run evaluation")
+                                    should_notify = await evaluate_response(
+                                        response, summary, self.provider, self.model,
+                                        suppress_errors=self.suppress_errors,
+                                    )
+                                    if should_notify and self.on_notify:
+                                        logger.info("Heartbeat: completed, delivering response")
+                                        await self.on_notify(response)
+                                    else:
+                                        logger.info("Heartbeat: silenced by post-run evaluation")
                         except Exception:
                             logger.exception("Heartbeat: task failed for {}", summary)
                         finally:

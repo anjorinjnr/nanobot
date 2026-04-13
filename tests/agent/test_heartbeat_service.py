@@ -1515,3 +1515,48 @@ async def test_tick_advances_per_group_on_failure(tmp_path, monkeypatch) -> None
     assert f"Schedule: {past}" not in balance_block
     assert "Last-run:" in balance_block
     assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# _is_runner_noise — filter generic error messages from heartbeat delivery
+# ---------------------------------------------------------------------------
+
+class TestIsRunnerNoise:
+    """Verify that generic runner/provider errors are detected as noise."""
+
+    def test_empty_string(self):
+        assert HeartbeatService._is_runner_noise("") is True
+
+    def test_whitespace_only(self):
+        assert HeartbeatService._is_runner_noise("   \n  ") is True
+
+    def test_empty_final_response(self):
+        assert HeartbeatService._is_runner_noise(
+            "I completed the tool steps but couldn't produce a final answer. "
+            "Please try again or narrow the task."
+        ) is True
+
+    def test_model_error(self):
+        assert HeartbeatService._is_runner_noise(
+            "Sorry, I encountered an error calling the AI model."
+        ) is True
+
+    def test_trouble_reaching(self):
+        assert HeartbeatService._is_runner_noise(
+            "I'm having trouble reaching that right now. Try asking me again in a bit."
+        ) is True
+
+    def test_real_email_alert(self):
+        assert HeartbeatService._is_runner_noise(
+            "You have 3 new emails: one from your accountant about tax docs."
+        ) is False
+
+    def test_real_error_with_detail(self):
+        assert HeartbeatService._is_runner_noise(
+            "Gmail API returned 401 Unauthorized — your OAuth token may have expired."
+        ) is False
+
+    def test_morning_briefing(self):
+        assert HeartbeatService._is_runner_noise(
+            "Good morning! Here's your briefing: 2 meetings today, 1 reminder."
+        ) is False
