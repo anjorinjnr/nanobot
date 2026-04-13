@@ -772,6 +772,10 @@ def gateway(
         return "cli", "direct"
 
     # Create heartbeat service
+    # Stop reasons that indicate the runner failed to produce real content.
+    # Heartbeat should treat these as silence, not forward them to users.
+    _HEARTBEAT_ERROR_STOPS = {"error", "empty_final_response"}
+
     async def on_heartbeat_execute(tasks: str, model_override: str | None = None) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
         channel, chat_id = _pick_heartbeat_target()
@@ -795,7 +799,17 @@ def gateway(
         session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
         agent.sessions.save(session)
 
-        return resp.content if resp else ""
+        if not resp:
+            return ""
+
+        # Suppress runner errors structurally — the stop_reason tells us
+        # whether the agent actually produced content or just hit an error.
+        stop = resp.metadata.get("_stop_reason", "completed")
+        if stop in _HEARTBEAT_ERROR_STOPS:
+            logger.info("Heartbeat: suppressed {} response: {}", stop, (resp.content or "")[:120])
+            return ""
+
+        return resp.content
 
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
