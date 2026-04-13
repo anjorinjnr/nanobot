@@ -805,6 +805,8 @@ def gateway(
 
         if resp.stop_reason == STOP_ERROR:
             logger.warning("Heartbeat: task error for: {}", tasks[:120])
+            if hb_cfg.suppress_errors:
+                return ""
             return f"⚠️ Heartbeat error running: {tasks}. Check logs for details."
 
         return resp.content or ""
