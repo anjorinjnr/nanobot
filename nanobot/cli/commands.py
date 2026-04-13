@@ -773,8 +773,6 @@ def gateway(
         return "cli", "direct"
 
     # Create heartbeat service
-    _HEARTBEAT_ERROR_STOPS = {STOP_ERROR, STOP_EMPTY_FINAL}
-
     async def on_heartbeat_execute(tasks: str, model_override: str | None = None) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
         channel, chat_id = _pick_heartbeat_target()
@@ -801,9 +799,13 @@ def gateway(
         if not resp:
             return ""
 
-        if resp.stop_reason in _HEARTBEAT_ERROR_STOPS:
-            logger.info("Heartbeat: suppressed {} response: {}", resp.stop_reason, (resp.content or "")[:120])
+        if resp.stop_reason == STOP_EMPTY_FINAL:
+            logger.info("Heartbeat: suppressed empty response for: {}", tasks[:120])
             return ""
+
+        if resp.stop_reason == STOP_ERROR:
+            logger.warning("Heartbeat: task error for: {}", tasks[:120])
+            return f"⚠️ Heartbeat error running: {tasks}. Check logs for details."
 
         return resp.content or ""
 
