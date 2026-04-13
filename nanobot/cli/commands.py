@@ -640,8 +640,7 @@ def gateway(
     from nanobot.channels.manager import ChannelManager
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
-    from nanobot.agent.runner import STOP_EMPTY_FINAL, STOP_ERROR
-    from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.heartbeat.service import HeartbeatService, filter_heartbeat_response
     from nanobot.session.manager import SessionManager
 
     if verbose:
@@ -796,20 +795,7 @@ def gateway(
         session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
         agent.sessions.save(session)
 
-        if not resp:
-            return ""
-
-        if resp.stop_reason == STOP_EMPTY_FINAL:
-            logger.info("Heartbeat: suppressed empty response for: {}", tasks[:120])
-            return ""
-
-        if resp.stop_reason == STOP_ERROR:
-            logger.warning("Heartbeat: task error for: {}", tasks[:120])
-            if hb_cfg.suppress_errors:
-                return ""
-            return f"⚠️ Heartbeat error running: {tasks}. Check logs for details."
-
-        return resp.content or ""
+        return filter_heartbeat_response(resp, tasks, suppress_errors=hb_cfg.suppress_errors)
 
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
