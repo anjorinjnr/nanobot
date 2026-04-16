@@ -11,6 +11,7 @@ import asyncio
 import base64
 import html
 import imaplib
+import os
 import pickle
 import re
 import smtplib
@@ -597,9 +598,7 @@ class EmailChannel(BaseChannel):
                 self._known_senders_mtime = mtime
             except Exception as e:
                 logger.warning("Failed to load known_senders_file {}: {}", ks_path, e)
-                self._known_senders_cache = set()  # Cache failure until mtime changes
-                self._known_senders_mtime = mtime
-                return True  # Don't block on bad file
+                return True  # Don't block on bad file; retry next message
 
         _, addr = parseaddr(sender)
         return addr.strip().lower() in self._known_senders_cache
@@ -643,10 +642,13 @@ class EmailChannel(BaseChannel):
         if not getattr(creds, "valid", not creds.expired) and creds.refresh_token:
             from google.auth.transport.requests import Request
             creds.refresh(Request())
-            # Persist refreshed token back to disk
+            # Persist refreshed token atomically (tmp + rename) to avoid
+            # corruption if two nanobot instances refresh concurrently.
             try:
-                with open(self.config.oauth2_credentials_file, "wb") as f:
+                tmp_path = self.config.oauth2_credentials_file + ".tmp"
+                with open(tmp_path, "wb") as f:
                     pickle.dump(creds, f)
+                os.replace(tmp_path, self.config.oauth2_credentials_file)
             except Exception as e:
                 logger.warning("Email OAuth2: failed to persist refreshed token: {}", e)
 
@@ -703,19 +705,21 @@ class EmailChannel(BaseChannel):
                 raise RuntimeError(f"IDLE not accepted: {resp.strip()}")
 
             # Wait for EXISTS or RECENT notification (or timeout).
-            # Use select() with a short timeout so we wake up periodically
-            # to check self._running, avoiding a 25-min hang on shutdown.
-            import select as _select
+            # Use a short socket timeout so we wake up periodically to
+            # check self._running, avoiding a 25-min hang on shutdown.
+            # Socket timeout (not select) is used because imaplib buffers
+            # internally — select() would miss data already in the buffer.
             got_mail = False
             elapsed = 0
             poll_interval = 5  # seconds
+            client.sock.settimeout(poll_interval)
             try:
                 while self._running and elapsed < timeout_seconds:
-                    ready, _, _ = _select.select([client.sock], [], [], poll_interval)
-                    if not ready:
+                    try:
+                        raw_line = client.readline()
+                    except (TimeoutError, OSError):
                         elapsed += poll_interval
                         continue
-                    raw_line = client.readline()
                     if not raw_line:
                         break  # EOF — connection dropped, exit to reconnect
                     line = raw_line.decode(errors="ignore").strip()
@@ -730,7 +734,7 @@ class EmailChannel(BaseChannel):
                     # Tagged response = IDLE ended unexpectedly
                     if line.startswith(tag):
                         break
-            except (TimeoutError, OSError):
+            except Exception:
                 pass  # Connection error — caller handles reconnection
 
             # Exit IDLE

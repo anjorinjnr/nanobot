@@ -1074,11 +1074,12 @@ def test_idle_wait_returns_true_on_exists(tmp_path, monkeypatch) -> None:
         b"A1 OK IDLE terminated\r\n",
     ])
 
-    import socket as _socket
-    r_sock, w_sock = _socket.socketpair()
+    class FakeSocket:
+        def settimeout(self, timeout):
+            pass
 
     class FakeIMAP:
-        sock = r_sock
+        sock = FakeSocket()
         _tag_prefix = b"A"
         _tagnum = 0
 
@@ -1099,12 +1100,7 @@ def test_idle_wait_returns_true_on_exists(tmp_path, monkeypatch) -> None:
             return next(responses)
 
         def logout(self):
-            r_sock.close()
-            w_sock.close()
             return "BYE", [b""]
-
-    # Feed data into the socket so select() reports it as readable
-    w_sock.sendall(b"* 5 EXISTS\r\n")
 
     monkeypatch.setattr("nanobot.channels.email.imaplib.IMAP4_SSL", lambda _h, _p: FakeIMAP())
 
@@ -1116,14 +1112,16 @@ def test_idle_wait_returns_true_on_exists(tmp_path, monkeypatch) -> None:
 
 
 def test_idle_wait_returns_false_on_timeout(tmp_path, monkeypatch) -> None:
-    """_idle_wait should return False when IDLE times out (no data on socket)."""
-    import socket as _socket
-    r_sock, w_sock = _socket.socketpair()
+    """_idle_wait should return False when IDLE times out."""
+
+    class FakeSocket:
+        def settimeout(self, timeout):
+            pass
 
     readline_count = {"n": 0}
 
     class FakeIMAP:
-        sock = r_sock
+        sock = FakeSocket()
         _tagnum = 0
 
         def _new_tag(self):
@@ -1146,8 +1144,6 @@ def test_idle_wait_returns_false_on_timeout(tmp_path, monkeypatch) -> None:
             raise TimeoutError("idle timed out")
 
         def logout(self):
-            r_sock.close()
-            w_sock.close()
             return "BYE", [b""]
 
     monkeypatch.setattr("nanobot.channels.email.imaplib.IMAP4_SSL", lambda _h, _p: FakeIMAP())
@@ -1155,10 +1151,8 @@ def test_idle_wait_returns_false_on_timeout(tmp_path, monkeypatch) -> None:
     cfg = _make_oauth2_config(tmp_path, use_idle=True)
     channel = EmailChannel(cfg, MessageBus())
     channel._running = True
-    # Use a very short timeout so select() times out quickly
     result = channel._idle_wait(timeout_seconds=1)
     assert result is False
-    w_sock.close()
 
 
 @pytest.mark.asyncio
