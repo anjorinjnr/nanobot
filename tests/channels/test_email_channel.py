@@ -1093,6 +1093,9 @@ def test_idle_wait_returns_true_on_exists(tmp_path, monkeypatch) -> None:
         def select(self, _mailbox):
             return "OK", [b"1"]
 
+        def search(self, *_args):
+            return "OK", [b""]  # No unseen messages
+
         def send(self, data):
             pass
 
@@ -1133,6 +1136,9 @@ def test_idle_wait_returns_false_on_timeout(tmp_path, monkeypatch) -> None:
 
         def select(self, _mailbox):
             return "OK", [b"1"]
+
+        def search(self, *_args):
+            return "OK", [b""]  # No unseen messages
 
         def send(self, data):
             pass

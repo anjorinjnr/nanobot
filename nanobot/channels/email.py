@@ -696,6 +696,11 @@ class EmailChannel(BaseChannel):
             if status != "OK":
                 raise RuntimeError(f"IMAP select failed: {status}")
 
+            # Check for mail that arrived between fetch and IDLE setup
+            status, data = client.search(None, "UNSEEN")
+            if status == "OK" and data and data[0]:
+                return True  # New mail waiting — skip IDLE, fetch immediately
+
             # Send IDLE command
             tag = client._new_tag().decode()
             client.send(f"{tag} IDLE\r\n".encode())
