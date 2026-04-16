@@ -201,12 +201,9 @@ class EmailChannel(BaseChannel):
                 await self._fetch_and_dispatch()
                 consecutive_errors = 0
 
-                # Enter IDLE and wait for new mail notification
-                got_mail = await asyncio.to_thread(
-                    self._idle_wait, idle_timeout
-                )
-                if got_mail:
-                    await self._fetch_and_dispatch()
+                # Enter IDLE and wait for new mail notification.
+                # On return (mail or timeout), loop restarts and fetches.
+                await asyncio.to_thread(self._idle_wait, idle_timeout)
 
             except Exception as e:
                 consecutive_errors += 1
@@ -600,9 +597,11 @@ class EmailChannel(BaseChannel):
                 self._known_senders_mtime = mtime
             except Exception as e:
                 logger.warning("Failed to load known_senders_file {}: {}", ks_path, e)
+                self._known_senders_mtime = mtime  # Don't re-read every message
                 return True  # Don't block on bad file
 
-        return sender.strip().lower() in self._known_senders_cache
+        _, addr = parseaddr(sender)
+        return addr.strip().lower() in self._known_senders_cache
 
     def _log_unknown_sender(self, item: dict[str, Any]) -> None:
         """Append an unknown sender's email summary to the log file (JSONL).
@@ -702,11 +701,19 @@ class EmailChannel(BaseChannel):
             if not resp.startswith("+"):
                 raise RuntimeError(f"IDLE not accepted: {resp.strip()}")
 
-            # Wait for EXISTS or RECENT notification (or timeout)
-            client.sock.settimeout(timeout_seconds)
+            # Wait for EXISTS or RECENT notification (or timeout).
+            # Use select() with a short timeout so we wake up periodically
+            # to check self._running, avoiding a 25-min hang on shutdown.
+            import select as _select
             got_mail = False
+            elapsed = 0
+            poll_interval = 5  # seconds
             try:
-                while self._running:
+                while self._running and elapsed < timeout_seconds:
+                    ready, _, _ = _select.select([client.sock], [], [], poll_interval)
+                    if not ready:
+                        elapsed += poll_interval
+                        continue
                     line = client.readline().decode(errors="ignore").strip()
                     if not line:
                         continue
@@ -720,7 +727,7 @@ class EmailChannel(BaseChannel):
                     if line.startswith(tag):
                         break
             except (TimeoutError, OSError):
-                pass  # Timeout — normal, re-enter IDLE
+                pass  # Connection error — caller handles reconnection
 
             # Exit IDLE
             try:
