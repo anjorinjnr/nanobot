@@ -716,14 +716,14 @@ class EmailChannel(BaseChannel):
             # Wait for EXISTS or RECENT notification (or timeout).
             # Socket timeout (not select) is used because imaplib buffers
             # internally — select() would miss data already in the buffer.
+            import time as _time
             got_mail = False
-            elapsed = 0
+            deadline = _time.monotonic() + timeout_seconds
             try:
-                while self._running and elapsed < timeout_seconds:
+                while self._running and _time.monotonic() < deadline:
                     try:
                         raw_line = client.readline()
                     except (TimeoutError, OSError):
-                        elapsed += poll_interval
                         continue
                     if not raw_line:
                         break  # EOF — connection dropped, exit to reconnect
