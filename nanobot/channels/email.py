@@ -149,6 +149,8 @@ class EmailChannel(BaseChannel):
         self._processed_uids: set[str] = set()  # Capped to prevent unbounded growth
         self._MAX_PROCESSED_UIDS = 100000
         self._oauth2_creds: Any = None  # Cached google.oauth2.credentials.Credentials
+        self._known_senders_cache: set[str] | None = None
+        self._known_senders_mtime: float = 0.0
 
     async def start(self) -> None:
         """Start listening for inbound emails (IDLE or polling)."""
@@ -571,9 +573,6 @@ class EmailChannel(BaseChannel):
     # Known-sender pre-filter
     # ------------------------------------------------------------------
 
-    _known_senders_cache: set[str] | None = None
-    _known_senders_mtime: float = 0.0
-
     def _is_known_sender(self, sender: str) -> bool:
         """Check if sender is in the known-senders list.
 
@@ -645,7 +644,7 @@ class EmailChannel(BaseChannel):
             # Persist refreshed token atomically (tmp + rename) to avoid
             # corruption if two nanobot instances refresh concurrently.
             try:
-                tmp_path = self.config.oauth2_credentials_file + ".tmp"
+                tmp_path = f"{self.config.oauth2_credentials_file}.{os.getpid()}.tmp"
                 with open(tmp_path, "wb") as f:
                     pickle.dump(creds, f)
                 os.replace(tmp_path, self.config.oauth2_credentials_file)
@@ -701,6 +700,11 @@ class EmailChannel(BaseChannel):
             if status == "OK" and data and data[0]:
                 return True  # New mail waiting — skip IDLE, fetch immediately
 
+            # Set socket timeout before IDLE so all reads (including the
+            # initial "+ idling" response) are bounded and can't hang.
+            poll_interval = 5  # seconds
+            client.sock.settimeout(poll_interval)
+
             # Send IDLE command
             tag = client._new_tag().decode()
             client.send(f"{tag} IDLE\r\n".encode())
@@ -710,14 +714,10 @@ class EmailChannel(BaseChannel):
                 raise RuntimeError(f"IDLE not accepted: {resp.strip()}")
 
             # Wait for EXISTS or RECENT notification (or timeout).
-            # Use a short socket timeout so we wake up periodically to
-            # check self._running, avoiding a 25-min hang on shutdown.
             # Socket timeout (not select) is used because imaplib buffers
             # internally — select() would miss data already in the buffer.
             got_mail = False
             elapsed = 0
-            poll_interval = 5  # seconds
-            client.sock.settimeout(poll_interval)
             try:
                 while self._running and elapsed < timeout_seconds:
                     try:
