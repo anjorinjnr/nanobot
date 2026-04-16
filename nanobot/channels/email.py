@@ -338,7 +338,10 @@ class EmailChannel(BaseChannel):
         if self.config.auth_method == "oauth2":
             user = self.config.smtp_username or self.config.imap_username
             smtp.ehlo()
-            smtp.docmd("AUTH", "XOAUTH2 " + self._build_xoauth2_string(user))
+            encoded = base64.b64encode(self._build_xoauth2_raw(user)).decode()
+            code, resp = smtp.docmd("AUTH", "XOAUTH2 " + encoded)
+            if code not in (235, 503):
+                raise smtplib.SMTPAuthenticationError(code, resp)
         else:
             smtp.login(self.config.smtp_username, self.config.smtp_password)
 
@@ -557,7 +560,7 @@ class EmailChannel(BaseChannel):
                 self._oauth2_creds = pickle.load(f)
 
         creds = self._oauth2_creds
-        if creds.expired and creds.refresh_token:
+        if not getattr(creds, "valid", not creds.expired) and creds.refresh_token:
             from google.auth.transport.requests import Request
             creds.refresh(Request())
             # Persist refreshed token back to disk
@@ -569,18 +572,22 @@ class EmailChannel(BaseChannel):
 
         return creds.token
 
-    def _build_xoauth2_string(self, user: str) -> str:
-        """Build the XOAUTH2 SASL initial client response (base64-encoded)."""
+    def _build_xoauth2_raw(self, user: str) -> bytes:
+        """Build the raw XOAUTH2 SASL string (not base64-encoded).
+
+        imaplib.authenticate() base64-encodes automatically, so this must
+        return raw bytes.  For SMTP (which does NOT auto-encode), callers
+        must base64-encode the result themselves.
+        """
         access_token = self._get_oauth2_access_token()
-        auth_string = f"user={user}\x01auth=Bearer {access_token}\x01\x01"
-        return base64.b64encode(auth_string.encode()).decode()
+        return f"user={user}\x01auth=Bearer {access_token}\x01\x01".encode()
 
     def _imap_auth(self, client: imaplib.IMAP4 | imaplib.IMAP4_SSL) -> None:
         """Authenticate IMAP connection using password or OAuth2."""
         if self.config.auth_method == "oauth2":
             user = self.config.imap_username
-            auth_string = self._build_xoauth2_string(user)
-            client.authenticate("XOAUTH2", lambda _: auth_string.encode())
+            raw = self._build_xoauth2_raw(user)
+            client.authenticate("XOAUTH2", lambda _: raw)
         else:
             client.login(self.config.imap_username, self.config.imap_password)
 

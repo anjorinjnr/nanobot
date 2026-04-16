@@ -956,10 +956,10 @@ def test_oauth2_imap_auth_uses_xoauth2(tmp_path, monkeypatch) -> None:
     assert len(items) == 1
     assert len(auth_calls) == 1
     assert auth_calls[0]["mechanism"] == "XOAUTH2"
-    # XOAUTH2 response should contain the email and token
-    response = auth_calls[0]["response"].decode()
-    import base64
-    decoded = base64.b64decode(response).decode()
+    # imaplib.authenticate auto-base64-encodes, so callback must return raw bytes
+    raw_response = auth_calls[0]["response"]
+    assert isinstance(raw_response, bytes)
+    decoded = raw_response.decode()
     assert "homer@joybuild.ai" in decoded
     assert "fake-access-token" in decoded
 
@@ -989,7 +989,7 @@ def test_oauth2_smtp_auth_uses_xoauth2(tmp_path, monkeypatch) -> None:
 
         def docmd(self, command, args):
             docmd_calls.append({"command": command, "args": args})
-            return (235, b"Accepted")
+            return (235, b"2.7.0 Accepted")
 
         def send_message(self, msg):
             pass
