@@ -1,8 +1,17 @@
-"""Email channel implementation using IMAP polling + SMTP replies."""
+"""Email channel implementation using IMAP (polling or IDLE) + SMTP replies.
+
+Supports two authentication methods:
+- ``password``: traditional IMAP/SMTP login (default).
+- ``oauth2``:  Google OAuth2 via XOAUTH2 SASL mechanism.  Requires a
+  ``google-auth`` credentials pickle (same format as Homer's
+  ``google_auth.py``).
+"""
 
 import asyncio
+import base64
 import html
 import imaplib
+import pickle
 import re
 import smtplib
 import ssl
@@ -33,6 +42,11 @@ class EmailConfig(Base):
     enabled: bool = False
     consent_granted: bool = False
 
+    # Authentication method: "password" (default) or "oauth2"
+    auth_method: str = "password"
+    # Path to Google OAuth2 credentials pickle (required when auth_method=oauth2)
+    oauth2_credentials_file: str = ""
+
     imap_host: str = ""
     imap_port: int = 993
     imap_username: str = ""
@@ -49,6 +63,8 @@ class EmailConfig(Base):
     from_address: str = ""
 
     auto_reply_enabled: bool = True
+    # Use IMAP IDLE for push notifications (falls back to polling on error)
+    use_idle: bool = False
     poll_interval_seconds: int = 30
     mark_seen: bool = True
     max_body_chars: int = 12000
@@ -122,9 +138,10 @@ class EmailChannel(BaseChannel):
         self._last_message_id_by_chat: dict[str, str] = {}
         self._processed_uids: set[str] = set()  # Capped to prevent unbounded growth
         self._MAX_PROCESSED_UIDS = 100000
+        self._oauth2_creds: Any = None  # Cached google.oauth2.credentials.Credentials
 
     async def start(self) -> None:
-        """Start polling IMAP for inbound emails."""
+        """Start listening for inbound emails (IDLE or polling)."""
         if not self.config.consent_granted:
             logger.warning(
                 "Email channel disabled: consent_granted is false. "
@@ -142,33 +159,75 @@ class EmailChannel(BaseChannel):
                 "Emails with spoofed From headers will be accepted. "
                 "Set verify_dkim=true and verify_spf=true for anti-spoofing protection."
             )
-        logger.info("Starting Email channel (IMAP polling mode)...")
 
+        if self.config.use_idle:
+            logger.info("Starting Email channel (IMAP IDLE mode)...")
+            await self._run_idle_loop()
+        else:
+            logger.info("Starting Email channel (IMAP polling mode)...")
+            await self._run_poll_loop()
+
+    async def _run_poll_loop(self) -> None:
+        """Poll IMAP on an interval."""
         poll_seconds = max(5, int(self.config.poll_interval_seconds))
         while self._running:
             try:
-                inbound_items = await asyncio.to_thread(self._fetch_new_messages)
-                for item in inbound_items:
-                    sender = item["sender"]
-                    subject = item.get("subject", "")
-                    message_id = item.get("message_id", "")
-
-                    if subject:
-                        self._last_subject_by_chat[sender] = subject
-                    if message_id:
-                        self._last_message_id_by_chat[sender] = message_id
-
-                    await self._handle_message(
-                        sender_id=sender,
-                        chat_id=sender,
-                        content=item["content"],
-                        media=item.get("media") or None,
-                        metadata=item.get("metadata", {}),
-                    )
+                await self._fetch_and_dispatch()
             except Exception as e:
                 logger.error("Email polling error: {}", e)
-
             await asyncio.sleep(poll_seconds)
+
+    async def _run_idle_loop(self) -> None:
+        """Use IMAP IDLE for near-real-time push notifications.
+
+        Falls back to polling on persistent errors.
+        """
+        consecutive_errors = 0
+        max_errors_before_fallback = 5
+        idle_timeout = 25 * 60  # 25 min (RFC recommends < 29 min)
+
+        while self._running:
+            try:
+                # Fetch any messages that arrived while we were disconnected
+                await self._fetch_and_dispatch()
+                consecutive_errors = 0
+
+                # Enter IDLE and wait for new mail notification
+                got_mail = await asyncio.to_thread(
+                    self._idle_wait, idle_timeout
+                )
+                if got_mail:
+                    await self._fetch_and_dispatch()
+
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error("Email IDLE error (#{}/{}): {}", consecutive_errors, max_errors_before_fallback, e)
+                if consecutive_errors >= max_errors_before_fallback:
+                    logger.warning("Email IDLE: too many errors, falling back to polling")
+                    await self._run_poll_loop()
+                    return
+                await asyncio.sleep(min(30, 5 * consecutive_errors))
+
+    async def _fetch_and_dispatch(self) -> None:
+        """Fetch new messages and dispatch to the bus."""
+        inbound_items = await asyncio.to_thread(self._fetch_new_messages)
+        for item in inbound_items:
+            sender = item["sender"]
+            subject = item.get("subject", "")
+            message_id = item.get("message_id", "")
+
+            if subject:
+                self._last_subject_by_chat[sender] = subject
+            if message_id:
+                self._last_message_id_by_chat[sender] = message_id
+
+            await self._handle_message(
+                sender_id=sender,
+                chat_id=sender,
+                content=item["content"],
+                media=item.get("media") or None,
+                metadata=item.get("metadata", {}),
+            )
 
     async def stop(self) -> None:
         """Stop polling loop."""
@@ -226,16 +285,30 @@ class EmailChannel(BaseChannel):
         missing = []
         if not self.config.imap_host:
             missing.append("imap_host")
-        if not self.config.imap_username:
-            missing.append("imap_username")
-        if not self.config.imap_password:
-            missing.append("imap_password")
         if not self.config.smtp_host:
             missing.append("smtp_host")
-        if not self.config.smtp_username:
-            missing.append("smtp_username")
-        if not self.config.smtp_password:
-            missing.append("smtp_password")
+
+        if self.config.auth_method == "oauth2":
+            if not self.config.oauth2_credentials_file:
+                missing.append("oauth2_credentials_file")
+            elif not Path(self.config.oauth2_credentials_file).exists():
+                logger.error(
+                    "Email channel: oauth2_credentials_file not found: {}",
+                    self.config.oauth2_credentials_file,
+                )
+                return False
+            # imap_username is needed for XOAUTH2 (the email address)
+            if not self.config.imap_username:
+                missing.append("imap_username (email address for OAuth2)")
+        else:
+            if not self.config.imap_username:
+                missing.append("imap_username")
+            if not self.config.imap_password:
+                missing.append("imap_password")
+            if not self.config.smtp_username:
+                missing.append("smtp_username")
+            if not self.config.smtp_password:
+                missing.append("smtp_password")
 
         if missing:
             logger.error("Email channel not configured, missing: {}", ', '.join(missing))
@@ -250,15 +323,27 @@ class EmailChannel(BaseChannel):
                 self.config.smtp_port,
                 timeout=timeout,
             ) as smtp:
-                smtp.login(self.config.smtp_username, self.config.smtp_password)
+                self._smtp_auth(smtp)
                 smtp.send_message(msg)
             return
 
         with smtplib.SMTP(self.config.smtp_host, self.config.smtp_port, timeout=timeout) as smtp:
             if self.config.smtp_use_tls:
                 smtp.starttls(context=ssl.create_default_context())
-            smtp.login(self.config.smtp_username, self.config.smtp_password)
+            self._smtp_auth(smtp)
             smtp.send_message(msg)
+
+    def _smtp_auth(self, smtp: smtplib.SMTP) -> None:
+        """Authenticate SMTP connection using password or OAuth2."""
+        if self.config.auth_method == "oauth2":
+            access_token = self._get_oauth2_access_token()
+            user = self.config.smtp_username or self.config.imap_username
+            smtp.ehlo()
+            # XOAUTH2 SASL: base64("user=<email>\x01auth=Bearer <token>\x01\x01")
+            auth_string = f"user={user}\x01auth=Bearer {access_token}\x01\x01"
+            smtp.docmd("AUTH", "XOAUTH2 " + base64.b64encode(auth_string.encode()).decode())
+        else:
+            smtp.login(self.config.smtp_username, self.config.smtp_password)
 
     def _fetch_new_messages(self) -> list[dict[str, Any]]:
         """Poll IMAP and return parsed unread messages."""
@@ -341,7 +426,7 @@ class EmailChannel(BaseChannel):
             client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
 
         try:
-            client.login(self.config.imap_username, self.config.imap_password)
+            self._imap_auth(client)
             try:
                 status, _ = client.select(mailbox)
             except Exception as exc:
@@ -457,6 +542,111 @@ class EmailChannel(BaseChannel):
 
                 if mark_seen:
                     client.store(imap_id, "+FLAGS", "\\Seen")
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # OAuth2 helpers
+    # ------------------------------------------------------------------
+
+    def _get_oauth2_access_token(self) -> str:
+        """Load, refresh if needed, and return a valid OAuth2 access token."""
+        if self._oauth2_creds is None:
+            cred_path = Path(self.config.oauth2_credentials_file)
+            with open(cred_path, "rb") as f:
+                self._oauth2_creds = pickle.load(f)
+
+        creds = self._oauth2_creds
+        if creds.expired and creds.refresh_token:
+            from google.auth.transport.requests import Request
+            creds.refresh(Request())
+            # Persist refreshed token back to disk
+            try:
+                with open(self.config.oauth2_credentials_file, "wb") as f:
+                    pickle.dump(creds, f)
+            except Exception as e:
+                logger.warning("Email OAuth2: failed to persist refreshed token: {}", e)
+
+        return creds.token
+
+    def _build_xoauth2_string(self, user: str) -> str:
+        """Build the XOAUTH2 SASL initial client response (base64-encoded)."""
+        access_token = self._get_oauth2_access_token()
+        auth_string = f"user={user}\x01auth=Bearer {access_token}\x01\x01"
+        return base64.b64encode(auth_string.encode()).decode()
+
+    def _imap_auth(self, client: imaplib.IMAP4 | imaplib.IMAP4_SSL) -> None:
+        """Authenticate IMAP connection using password or OAuth2."""
+        if self.config.auth_method == "oauth2":
+            user = self.config.imap_username
+            auth_string = self._build_xoauth2_string(user)
+            client.authenticate("XOAUTH2", lambda _: auth_string.encode())
+        else:
+            client.login(self.config.imap_username, self.config.imap_password)
+
+    # ------------------------------------------------------------------
+    # IMAP IDLE
+    # ------------------------------------------------------------------
+
+    def _idle_wait(self, timeout_seconds: int) -> bool:
+        """Connect to IMAP, enter IDLE, wait for a notification or timeout.
+
+        Returns True if new mail was signalled, False on timeout.
+        Raises on connection error (caller handles reconnection).
+        """
+        mailbox = self.config.imap_mailbox or "INBOX"
+
+        if self.config.imap_use_ssl:
+            client = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
+        else:
+            client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
+
+        try:
+            self._imap_auth(client)
+            status, _ = client.select(mailbox)
+            if status != "OK":
+                raise RuntimeError(f"IMAP select failed: {status}")
+
+            # Send IDLE command
+            tag = client._new_tag().decode()
+            client.send(f"{tag} IDLE\r\n".encode())
+            # Server should respond with "+ idling"
+            resp = client.readline().decode(errors="ignore")
+            if not resp.startswith("+"):
+                raise RuntimeError(f"IDLE not accepted: {resp.strip()}")
+
+            # Wait for EXISTS or RECENT notification (or timeout)
+            client.sock.settimeout(timeout_seconds)
+            got_mail = False
+            try:
+                while self._running:
+                    line = client.readline().decode(errors="ignore").strip()
+                    if not line:
+                        continue
+                    # Untagged responses: "* N EXISTS", "* N RECENT", etc.
+                    if line.startswith("*") and any(
+                        kw in line.upper() for kw in ("EXISTS", "RECENT")
+                    ):
+                        got_mail = True
+                        break
+                    # Tagged response = IDLE ended unexpectedly
+                    if line.startswith(tag):
+                        break
+            except (TimeoutError, OSError):
+                pass  # Timeout — normal, re-enter IDLE
+
+            # Exit IDLE
+            try:
+                client.send(b"DONE\r\n")
+                # Read tagged response
+                client.readline()
+            except Exception:
+                pass
+
+            return got_mail
         finally:
             try:
                 client.logout()
