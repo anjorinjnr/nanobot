@@ -597,7 +597,8 @@ class EmailChannel(BaseChannel):
                 self._known_senders_mtime = mtime
             except Exception as e:
                 logger.warning("Failed to load known_senders_file {}: {}", ks_path, e)
-                self._known_senders_mtime = mtime  # Don't re-read every message
+                self._known_senders_cache = set()  # Cache failure until mtime changes
+                self._known_senders_mtime = mtime
                 return True  # Don't block on bad file
 
         _, addr = parseaddr(sender)
@@ -714,7 +715,10 @@ class EmailChannel(BaseChannel):
                     if not ready:
                         elapsed += poll_interval
                         continue
-                    line = client.readline().decode(errors="ignore").strip()
+                    raw_line = client.readline()
+                    if not raw_line:
+                        break  # EOF — connection dropped, exit to reconnect
+                    line = raw_line.decode(errors="ignore").strip()
                     if not line:
                         continue
                     # Untagged responses: "* N EXISTS", "* N RECENT", etc.
