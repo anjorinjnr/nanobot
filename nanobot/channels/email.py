@@ -23,7 +23,7 @@ from email.parser import BytesParser
 from email.utils import parseaddr
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
 from pydantic import Field
@@ -43,7 +43,7 @@ class EmailConfig(Base):
     consent_granted: bool = False
 
     # Authentication method: "password" (default) or "oauth2"
-    auth_method: str = "password"
+    auth_method: Literal["password", "oauth2"] = "password"
     # Path to Google OAuth2 credentials pickle (required when auth_method=oauth2)
     oauth2_credentials_file: str = ""
 
@@ -336,12 +336,9 @@ class EmailChannel(BaseChannel):
     def _smtp_auth(self, smtp: smtplib.SMTP) -> None:
         """Authenticate SMTP connection using password or OAuth2."""
         if self.config.auth_method == "oauth2":
-            access_token = self._get_oauth2_access_token()
             user = self.config.smtp_username or self.config.imap_username
             smtp.ehlo()
-            # XOAUTH2 SASL: base64("user=<email>\x01auth=Bearer <token>\x01\x01")
-            auth_string = f"user={user}\x01auth=Bearer {access_token}\x01\x01"
-            smtp.docmd("AUTH", "XOAUTH2 " + base64.b64encode(auth_string.encode()).decode())
+            smtp.docmd("AUTH", "XOAUTH2 " + self._build_xoauth2_string(user))
         else:
             smtp.login(self.config.smtp_username, self.config.smtp_password)
 
