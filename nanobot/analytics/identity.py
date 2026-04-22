@@ -24,6 +24,11 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Shared no-op mapping returned on the unconfigured-map path. Reusing one
+# instance avoids a dict allocation on every inbound message when
+# HOMER_IDENTITY_MAP is unset (the common case outside hosted-homer).
+_EMPTY_MAP: dict[str, str] = {}
+
 
 def get_distinct_id(identifier: str, channel: str) -> str:
     """Return a stable SHA-256 hash for a user identity.
@@ -33,8 +38,9 @@ def get_distinct_id(identifier: str, channel: str) -> str:
     channel-scoped hash.
     """
     canonical = _resolve_canonical(channel, identifier)
-    key = canonical if canonical else f"{channel}:{identifier.strip()}"
-    return _hash_identity_key(key)
+    if canonical:
+        return _hash_identity_key(canonical)
+    return _hash_identity_key(f"{channel}:{identifier.strip()}")
 
 
 def get_household_id() -> str:
@@ -73,11 +79,11 @@ def _load_identity_map() -> dict[str, str]:
     """
     path = os.environ.get("HOMER_IDENTITY_MAP", "").strip()
     if not path:
-        return {}
+        return _EMPTY_MAP
     try:
         mtime = Path(path).stat().st_mtime
     except OSError:
-        return {}
+        return _EMPTY_MAP
     return _load_identity_map_cached(path, mtime)
 
 
@@ -98,8 +104,22 @@ def _load_identity_map_cached(path: str, mtime: float) -> dict[str, str]:
         return {}
 
 
-def iter_identity_map() -> list[tuple[str, str]]:
-    """Expose the loaded identity map as a list of (channel_key, person_key)
-    pairs — used by hook.py to migrate existing seen_users entries after
-    the map is first populated."""
-    return list(_load_identity_map().items())
+def migrate_channel_hashes(seen_users: set[str]) -> int:
+    """Add canonical person hashes to `seen_users` for any identity-map
+    entry whose channel-scoped hash is already present. Mutates the set
+    in place; returns the count added.
+
+    Called on first state load after the identity map is rolled out, so
+    that a deploy doesn't re-fire `user_onboarded` for every known user:
+    before the map, seen_users held channel-scoped hashes; after the
+    map, `get_distinct_id` returns canonical hashes, which would look
+    "new" without this migration. Idempotent.
+    """
+    migrated = 0
+    for channel_key, person_key in _load_identity_map().items():
+        channel_hash = _hash_identity_key(channel_key)
+        person_hash = _hash_identity_key(person_key)
+        if channel_hash in seen_users and person_hash not in seen_users:
+            seen_users.add(person_hash)
+            migrated += 1
+    return migrated

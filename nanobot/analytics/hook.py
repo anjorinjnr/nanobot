@@ -22,10 +22,9 @@ from typing import Any
 
 from nanobot.analytics.feedback import detect_feedback
 from nanobot.analytics.identity import (
-    _hash_identity_key,
     get_distinct_id,
     get_household_id,
-    iter_identity_map,
+    migrate_channel_hashes,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,24 +117,10 @@ class AnalyticsHook:
         self._migrate_seen_users_to_canonical()
 
     def _migrate_seen_users_to_canonical(self) -> None:
-        """After identity_map becomes available, collapse channel-scoped
-        distinct_ids to canonical ones in seen_users.
-
-        Without this, a deploy that turns on the identity map re-fires
-        user_onboarded for every known user on their next message, because
-        the canonical hash isn't in seen_users yet even though the
-        channel-scoped hash is. Idempotent: no-op once the migration has
-        already added the canonical hash for a given user.
-        """
-        migrated = 0
-        for channel_key, person_key in iter_identity_map():
-            channel_hash = _hash_identity_key(channel_key)
-            person_hash = _hash_identity_key(person_key)
-            if channel_hash in self._seen_users and person_hash not in self._seen_users:
-                self._seen_users.add(person_hash)
-                migrated += 1
-        if migrated:
-            logger.info("Migrated %d seen_users entries to canonical IDs", migrated)
+        """Apply identity-map canonicalization to any existing seen_users
+        entries, so a deploy that turns on the map doesn't re-fire
+        user_onboarded for every known user."""
+        if migrate_channel_hashes(self._seen_users):
             self._save_state()
 
     def _save_state(self) -> None:

@@ -11,7 +11,7 @@ from nanobot.analytics import identity
 from nanobot.analytics.identity import (
     _hash_identity_key,
     get_distinct_id,
-    iter_identity_map,
+    migrate_channel_hashes,
 )
 
 
@@ -130,14 +130,32 @@ def test_map_rewrite_invalidates_cache(tmp_path, monkeypatch):
     assert before != after
 
 
-def test_iter_identity_map_returns_pairs(tmp_path, monkeypatch):
+def test_migrate_channel_hashes_adds_canonical(tmp_path, monkeypatch):
+    """Channel-scoped hashes in seen_users → canonical hashes added in-place.
+    Returns the count added so callers know whether to persist."""
     path = _write_map(tmp_path, {
         "whatsapp:1": "person:ebby",
         "telegram:2": "person:ebby",
     })
     monkeypatch.setenv("HOMER_IDENTITY_MAP", str(path))
 
-    pairs = iter_identity_map()
-    assert ("whatsapp:1", "person:ebby") in pairs
-    assert ("telegram:2", "person:ebby") in pairs
-    assert len(pairs) == 2
+    seen = {_hash_identity_key("whatsapp:1"), _hash_identity_key("telegram:2")}
+    added = migrate_channel_hashes(seen)
+    assert added == 1
+    assert _hash_identity_key("person:ebby") in seen
+
+
+def test_migrate_channel_hashes_is_idempotent(tmp_path, monkeypatch):
+    path = _write_map(tmp_path, {"whatsapp:1": "person:ebby"})
+    monkeypatch.setenv("HOMER_IDENTITY_MAP", str(path))
+
+    seen = {_hash_identity_key("whatsapp:1"), _hash_identity_key("person:ebby")}
+    assert migrate_channel_hashes(seen) == 0
+
+
+def test_migrate_channel_hashes_noop_when_no_map(tmp_path, monkeypatch):
+    monkeypatch.delenv("HOMER_IDENTITY_MAP", raising=False)
+    seen = {_hash_identity_key("whatsapp:1")}
+    before = set(seen)
+    assert migrate_channel_hashes(seen) == 0
+    assert seen == before
