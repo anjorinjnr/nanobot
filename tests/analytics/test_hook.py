@@ -14,7 +14,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from nanobot.analytics import identity as identity_module
 from nanobot.analytics.hook import AnalyticsHook
+from nanobot.analytics.identity import _hash_identity_key
+
+
+@pytest.fixture(autouse=True)
+def _clear_identity_cache():
+    """Identity map cache is process-global; reset between tests."""
+    identity_module._load_identity_map_cached.cache_clear()
+    yield
+    identity_module._load_identity_map_cached.cache_clear()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -248,6 +258,131 @@ async def test_per_config_state_isolation(tmp_path, monkeypatch):
     finally:
         # Reset module-global config path so later tests aren't polluted.
         config_loader.set_config_path(None)  # type: ignore[arg-type]
+
+
+# ── canonical identity migration ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_no_household_member_added_for_channel_switch(tmp_path, monkeypatch):
+    """Ebby messaging via whatsapp, then telegram, then email must not
+    trigger household_member_added — the identity map collapses them."""
+    monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(tmp_path))
+    map_path = tmp_path / "identity_map.json"
+    map_path.write_text(json.dumps({
+        "whatsapp:14127733949": "person:ebby",
+        "telegram:1973156656": "person:ebby",
+        "email:ebby@joybuild.ai": "person:ebby",
+    }))
+    monkeypatch.setenv("HOMER_IDENTITY_MAP", str(map_path))
+
+    hook = _make_hook(tmp_path)
+    await hook.on_response_sent(
+        _receive(hook, channel="whatsapp", sender_id="14127733949"),
+        response_content="ok", tools_used=set(),
+    )
+    await hook.on_response_sent(
+        _receive(hook, channel="telegram", sender_id="1973156656"),
+        response_content="ok", tools_used=set(),
+    )
+    await hook.on_response_sent(
+        _receive(hook, channel="email", sender_id="ebby@joybuild.ai"),
+        response_content="ok", tools_used=set(),
+    )
+
+    # Exactly one onboarding — not three.
+    assert len(_captured_events(hook._client, "user_onboarded")) == 1
+    # And zero household_member_added — same human, not new members.
+    assert _captured_events(hook._client, "household_member_added") == []
+
+
+@pytest.mark.asyncio
+async def test_household_member_added_for_real_second_human(tmp_path, monkeypatch):
+    """A second *human* (different canonical person) triggers exactly one
+    household_member_added, even if they use multiple channels."""
+    monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(tmp_path))
+    map_path = tmp_path / "identity_map.json"
+    map_path.write_text(json.dumps({
+        "whatsapp:111": "person:ebby",
+        "whatsapp:222": "person:seun",
+        "telegram:333": "person:seun",
+    }))
+    monkeypatch.setenv("HOMER_IDENTITY_MAP", str(map_path))
+
+    hook = _make_hook(tmp_path)
+    await hook.on_response_sent(
+        _receive(hook, channel="whatsapp", sender_id="111"),
+        response_content="ok", tools_used=set(),
+    )
+    await hook.on_response_sent(
+        _receive(hook, channel="whatsapp", sender_id="222"),
+        response_content="ok", tools_used=set(),
+    )
+    await hook.on_response_sent(
+        _receive(hook, channel="telegram", sender_id="333"),
+        response_content="ok", tools_used=set(),
+    )
+
+    assert len(_captured_events(hook._client, "user_onboarded")) == 2
+    added = _captured_events(hook._client, "household_member_added")
+    assert len(added) == 1
+    assert added[0]["member_count_after"] == 2
+
+
+@pytest.mark.asyncio
+async def test_seen_users_migrated_on_identity_map_rollout(tmp_path, monkeypatch):
+    """Pre-existing seen_users entries (channel-scoped hashes, from a
+    deploy before the identity map existed) must be migrated to the
+    canonical hash when the map first loads — otherwise a deploy re-fires
+    user_onboarded for every known user."""
+    monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(tmp_path))
+
+    # Simulate a pre-map deployment: seen_users contains channel-scoped
+    # hashes produced by the *old* get_distinct_id logic (which hashed
+    # "channel:identifier").
+    pre_map_hash_wa = _hash_identity_key("whatsapp:14127733949")
+    pre_map_hash_tg = _hash_identity_key("telegram:1973156656")
+    state_path = tmp_path / "seen_users.json"
+    state_path.write_text(json.dumps({
+        "version": 1,
+        "seen_users": [pre_map_hash_wa, pre_map_hash_tg],
+        "first_user_ts": 1700000000.0,
+    }))
+
+    # Now turn on the identity map and boot the hook.
+    map_path = tmp_path / "identity_map.json"
+    map_path.write_text(json.dumps({
+        "whatsapp:14127733949": "person:ebby",
+        "telegram:1973156656": "person:ebby",
+    }))
+    monkeypatch.setenv("HOMER_IDENTITY_MAP", str(map_path))
+
+    hook = _make_hook(tmp_path)
+
+    # Ebby's canonical hash should now be in seen_users.
+    assert _hash_identity_key("person:ebby") in hook._seen_users
+
+    # And the next message from any channel does NOT fire user_onboarded.
+    await hook.on_response_sent(
+        _receive(hook, channel="whatsapp", sender_id="14127733949"),
+        response_content="ok", tools_used=set(),
+    )
+    assert _captured_events(hook._client, "user_onboarded") == []
+
+
+@pytest.mark.asyncio
+async def test_no_migration_when_identity_map_missing(tmp_path, monkeypatch):
+    """Without HOMER_IDENTITY_MAP, _migrate_seen_users_to_canonical is a no-op."""
+    monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("HOMER_IDENTITY_MAP", raising=False)
+
+    pre_hash = _hash_identity_key("whatsapp:+15551234")
+    (tmp_path / "seen_users.json").write_text(json.dumps({
+        "version": 1, "seen_users": [pre_hash], "first_user_ts": 1700000000.0,
+    }))
+
+    hook = _make_hook(tmp_path)
+    assert hook._seen_users == {pre_hash}
 
 
 # ── turn_id observability ────────────────────────────────────────────────
