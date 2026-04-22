@@ -161,6 +161,7 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
+        scope_context_provider: str = "",
     ):
         from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -193,6 +194,8 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+        self._scope_context_provider = scope_context_provider or ""
+        self._scope_context_fn: Callable[[str], str] | None = None
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
@@ -399,6 +402,51 @@ class AgentLoop:
             return frozenset(json.loads(path.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError, TypeError):
             return frozenset()
+
+    def _get_scope_context(self, sender_id: str) -> str | None:
+        """Resolve per-sender scope context via the configured provider.
+
+        Provider config is ``"module:function"`` (e.g. ``"scope_store:render_scope_context_for_sender"``).
+        The function is called with a single ``sender_id`` string and must return a
+        string. An empty return means "no scope data for this sender" and no injection
+        happens. Any exception is logged and skipped — the agent continues without
+        injection (the workspace's static context still loads via the normal path).
+
+        Returns None when provider is unset, errors, or yields no content.
+        """
+        if not self._scope_context_provider or not sender_id:
+            return None
+        if self._scope_context_fn is None:
+            try:
+                mod_name, fn_name = self._scope_context_provider.split(":", 1)
+            except ValueError:
+                logger.error(
+                    "scope_context_provider {} is not in 'module:function' form",
+                    self._scope_context_provider,
+                )
+                self._scope_context_provider = ""  # disable after bad config to avoid log spam
+                return None
+            try:
+                import importlib
+                module = importlib.import_module(mod_name)
+                self._scope_context_fn = getattr(module, fn_name)
+            except (ImportError, AttributeError) as exc:
+                logger.error(
+                    "scope_context_provider {} not importable: {}",
+                    self._scope_context_provider, exc,
+                )
+                self._scope_context_provider = ""
+                return None
+        try:
+            result = self._scope_context_fn(sender_id)
+        except Exception as exc:  # provider failures must not crash the agent
+            logger.exception(
+                "scope_context_provider raised for sender={}: {}", sender_id, exc,
+            )
+            return None
+        if not isinstance(result, str) or not result.strip():
+            return None
+        return result
 
     @contextmanager
     def _restrict_fs_tools(self, guest_workspace: Path):
@@ -818,6 +866,16 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
+
+        # Guest path: inject per-sender scope context as an ephemeral system
+        # message. Rebuilt every turn from the scope store; never persisted to
+        # session history, so the LLM only sees the current sender's scope(s).
+        if guest and msg.sender_id:
+            scope_ctx = self._get_scope_context(msg.sender_id)
+            if scope_ctx:
+                initial_messages.insert(
+                    1, {"role": "system", "content": scope_ctx}
+                )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})

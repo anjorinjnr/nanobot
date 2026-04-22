@@ -89,6 +89,7 @@ class AgentDefaults(Base):
     guest_workspace: str = ""  # Separate workspace for guest agent (empty = workspace/guest_agent)
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
+    scope_context_provider: str = ""  # "module:function" to inject per-sender scope context into guest turns. Empty = disabled.
     session_ttl_minutes: int = Field(
         default=0,
         ge=0,
