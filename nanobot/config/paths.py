@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from nanobot.config.loader import get_config_path
@@ -11,6 +12,23 @@ from nanobot.utils.helpers import ensure_dir
 def get_data_dir() -> Path:
     """Return the instance-level runtime data directory."""
     return ensure_dir(get_config_path().parent)
+
+
+def get_persistent_data_dir() -> Path:
+    """Return a directory for state that must survive process restarts
+    and container recreation.
+
+    By default this is `get_data_dir()` (same as before), which is fine
+    for bare-metal / systemd deployments where the data dir lives under
+    `~/.nanobot/` on a stable filesystem. In container deployments,
+    `~/.nanobot/` is ephemeral — the host must set
+    `NANOBOT_PERSISTENT_DATA_DIR` to point at a mounted volume so state
+    like `lid_map.json` survives `docker pull && docker run` cycles.
+    """
+    override = os.environ.get("NANOBOT_PERSISTENT_DATA_DIR", "").strip()
+    if override:
+        return ensure_dir(Path(override).expanduser())
+    return get_data_dir()
 
 
 def get_runtime_subdir(name: str) -> Path:
