@@ -726,6 +726,7 @@ def gateway(
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                is_synthetic=True,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
@@ -808,6 +809,7 @@ def gateway(
             chat_id=chat_id,
             on_progress=_silent,
             model_override=model_override,
+            is_synthetic=True,
         )
 
         session = agent.sessions.get_or_create("heartbeat")
