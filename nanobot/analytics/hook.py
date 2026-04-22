@@ -276,7 +276,14 @@ class AnalyticsHook:
     def _maybe_fire_onboarding(
         self, distinct_id: str, channel: str, turn_id: str,
     ) -> None:
-        """Fire user_onboarded on first message from a new distinct_id."""
+        """Fire user_onboarded on first message from a new distinct_id.
+
+        `household_member_added` is intentionally NOT fired here — that
+        event is now owned by homer's explicit add-member flow
+        (tools/manage_users.py) so it reflects real admin actions, not
+        "same human on a new channel got hashed differently." Ditto
+        guest_added, which homer emits from the add-event-guest flow.
+        """
         if distinct_id in self._seen_users:
             return
         is_new_household = len(self._seen_users) == 0
@@ -303,16 +310,6 @@ class AnalyticsHook:
             "is_new_household": is_new_household,
             "signup_source": "friends_launch",
         })
-
-        if not is_new_household:
-            days = 0
-            if self._first_user_ts:
-                days = int((time.time() - self._first_user_ts) / 86400)
-            self._client.capture(distinct_id, "household_member_added", {
-                **self._base_props(turn_id),
-                "member_count_after": len(self._seen_users),
-                "days_since_household_created": days,
-            })
 
         # Group identify on every new user
         if self._household_id:

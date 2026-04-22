@@ -113,9 +113,10 @@ async def test_user_onboarded_fires_once_then_persists(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_second_distinct_id_fires_household_member_added_once(tmp_path, monkeypatch):
-    """Two distinct_ids in the same household → one household_member_added
-    total, even across a simulated restart."""
+async def test_second_distinct_id_fires_user_onboarded_not_member_added(tmp_path, monkeypatch):
+    """Two distinct_ids in the same household → two user_onboarded events,
+    but NO household_member_added — that event is now owned by homer's
+    explicit add-member flow, not inferred from inbound messages."""
     monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(tmp_path))
 
     hook1 = _make_hook(tmp_path)
@@ -123,18 +124,18 @@ async def test_second_distinct_id_fires_household_member_added_once(tmp_path, mo
         _receive(hook1, channel="whatsapp", sender_id="+15551234"),
         response_content="ok", tools_used=set(),
     )
-    # Second user, same process
     await hook1.on_response_sent(
         _receive(hook1, channel="email", sender_id="b@example.com"),
         response_content="ok", tools_used=set(),
     )
 
-    assert len(_captured_events(hook1._client, "user_onboarded")) == 2
-    added = _captured_events(hook1._client, "household_member_added")
-    assert len(added) == 1
-    assert added[0]["member_count_after"] == 2
+    onboarded = _captured_events(hook1._client, "user_onboarded")
+    assert len(onboarded) == 2
+    assert onboarded[0]["is_new_household"] is True
+    assert onboarded[1]["is_new_household"] is False
+    assert _captured_events(hook1._client, "household_member_added") == []
 
-    # Restart: same two distinct_ids should be silent now.
+    # Restart: persistence still works — no re-fire of user_onboarded.
     hook2 = _make_hook(tmp_path)
     await hook2.on_response_sent(
         _receive(hook2, channel="whatsapp", sender_id="+15551234"),
@@ -297,9 +298,10 @@ async def test_no_household_member_added_for_channel_switch(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_household_member_added_for_real_second_human(tmp_path, monkeypatch):
-    """A second *human* (different canonical person) triggers exactly one
-    household_member_added, even if they use multiple channels."""
+async def test_second_human_fires_user_onboarded_not_member_added(tmp_path, monkeypatch):
+    """A second distinct canonical person fires a second user_onboarded
+    but no household_member_added — that event is now fired explicitly
+    from homer's add-member flow, not inferred from inbound traffic."""
     monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(tmp_path))
     map_path = tmp_path / "identity_map.json"
     map_path.write_text(json.dumps({
@@ -324,9 +326,7 @@ async def test_household_member_added_for_real_second_human(tmp_path, monkeypatc
     )
 
     assert len(_captured_events(hook._client, "user_onboarded")) == 2
-    added = _captured_events(hook._client, "household_member_added")
-    assert len(added) == 1
-    assert added[0]["member_count_after"] == 2
+    assert _captured_events(hook._client, "household_member_added") == []
 
 
 @pytest.mark.asyncio
