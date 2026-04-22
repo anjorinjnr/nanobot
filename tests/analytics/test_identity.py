@@ -159,3 +159,51 @@ def test_migrate_channel_hashes_noop_when_no_map(tmp_path, monkeypatch):
     before = set(seen)
     assert migrate_channel_hashes(seen) == 0
     assert seen == before
+
+
+# ── channel-specific lookup normalization ────────────────────────────────
+
+
+def test_telegram_username_suffix_is_stripped(tmp_path, monkeypatch):
+    """python-telegram-bot produces '<id>|<username>' as sender_id when
+    the user has a username set. users.yaml only records the id, so the
+    lookup must strip the suffix."""
+    path = _write_map(tmp_path, {"telegram:1973156656": "person:ebby_anjorin"})
+    monkeypatch.setenv("HOMER_IDENTITY_MAP", str(path))
+
+    with_suffix = get_distinct_id("1973156656|ebbyanj", "telegram")
+    bare = get_distinct_id("1973156656", "telegram")
+    assert with_suffix == bare == _hash_identity_key("person:ebby_anjorin")
+
+
+def test_telegram_suffix_strip_does_not_leak_to_other_channels(tmp_path, monkeypatch):
+    """The '|' strip is telegram-only — whatsapp/email identifiers with '|'
+    (unlikely but not impossible) must hash as-is."""
+    path = _write_map(tmp_path, {"whatsapp:1973156656": "person:e"})
+    monkeypatch.setenv("HOMER_IDENTITY_MAP", str(path))
+
+    wa_weird = get_distinct_id("1973156656|ebbyanj", "whatsapp")
+    # No canonical hit on the pipe form; fall through to channel-scoped.
+    assert wa_weird == _hash_identity_key("whatsapp:1973156656|ebbyanj")
+
+
+def test_telegram_suffix_without_map_entry_falls_through(tmp_path, monkeypatch):
+    """If neither the raw nor the bare form is in the map, fall through
+    to channel-scoped hash of the original input — no silent swap to bare."""
+    path = _write_map(tmp_path, {"telegram:999": "person:other"})
+    monkeypatch.setenv("HOMER_IDENTITY_MAP", str(path))
+
+    result = get_distinct_id("1973156656|ebbyanj", "telegram")
+    assert result == _hash_identity_key("telegram:1973156656|ebbyanj")
+
+
+def test_telegram_empty_id_before_pipe_falls_through(tmp_path, monkeypatch):
+    """Malformed '|username' with no id must not trigger a bogus
+    lookup of `telegram:`."""
+    path = _write_map(tmp_path, {"telegram:": "person:anyone"})
+    monkeypatch.setenv("HOMER_IDENTITY_MAP", str(path))
+
+    result = get_distinct_id("|ghost", "telegram")
+    # Falls through to channel-scoped hash of the raw identifier —
+    # does NOT match the `telegram:` entry.
+    assert result == _hash_identity_key("telegram:|ghost")
