@@ -62,12 +62,28 @@ def _resolve_canonical(channel: str, identifier: str) -> str | None:
 
     Returns the canonical person key (e.g. `"person:ebby"`) on hit,
     None on miss or when no map is configured.
+
+    Tries channel-specific normalizations on miss so live sender_id
+    shapes don't have to match users.yaml byte-for-byte:
+
+    - Telegram: python-telegram-bot hands us "<user_id>|<username>"
+      when a username is set on the account (e.g. "1973156656|ebbyanj").
+      users.yaml only records the numeric id, so retry with the suffix
+      stripped.
     """
     mapping = _load_identity_map()
     if not mapping:
         return None
-    key = f"{channel}:{identifier.strip()}".lower()
-    return mapping.get(key)
+    ident = identifier.strip()
+    primary = f"{channel}:{ident}".lower()
+    hit = mapping.get(primary)
+    if hit is not None:
+        return hit
+    if channel == "telegram" and "|" in ident:
+        bare_id = ident.split("|", 1)[0].strip()
+        if bare_id:
+            return mapping.get(f"telegram:{bare_id}".lower())
+    return None
 
 
 def _load_identity_map() -> dict[str, str]:
