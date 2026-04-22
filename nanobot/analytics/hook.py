@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from nanobot.analytics.feedback import detect_feedback
@@ -25,19 +28,106 @@ logger = logging.getLogger(__name__)
 # How many seconds between messages to count as a followup
 _FOLLOWUP_WINDOW_S = 300  # 5 minutes
 
+# Persisted-state file name under the instance analytics data dir.
+_STATE_FILENAME = "seen_users.json"
+_STATE_VERSION = 1
+
+
+def _resolve_state_path() -> Path | None:
+    """Return the path where onboarding state should live, or None if the
+    runtime config isn't available (unit tests, CLI without a config).
+
+    Main and guest nanobots run in separate processes and each call
+    `set_config_path()` with their own config file. We namespace under the
+    config filename's stem so they don't race on a shared state file —
+    e.g. `~/.nanobot/analytics/config/seen_users.json` for main,
+    `~/.nanobot/analytics/guest_config/seen_users.json` for guest.
+    """
+    override = os.environ.get("HOMER_ANALYTICS_STATE_DIR", "").strip()
+    if override:
+        try:
+            path = Path(override).expanduser()
+            path.mkdir(parents=True, exist_ok=True)
+            return path / _STATE_FILENAME
+        except OSError:
+            logger.debug("HOMER_ANALYTICS_STATE_DIR unwritable: %s", override)
+            return None
+    try:
+        from nanobot.config.loader import get_config_path
+        from nanobot.config.paths import get_runtime_subdir
+        subdir = get_runtime_subdir("analytics") / get_config_path().stem
+        subdir.mkdir(parents=True, exist_ok=True)
+        return subdir / _STATE_FILENAME
+    except (ImportError, RuntimeError, OSError):
+        # No config loaded yet — defer persistence to a later call.
+        return None
+
 
 class AnalyticsHook:
-    """Non-blocking PostHog instrumentation wired into AgentLoop._process_message."""
+    """Non-blocking PostHog instrumentation wired into AgentLoop._process_message.
+
+    State (seen_users, first_user_ts) is persisted per-process: the on-disk
+    path is namespaced by `get_config_path().stem`, so main and guest nanobot
+    processes — which share a parent data dir — don't race on the same file.
+    """
 
     def __init__(self) -> None:
         self._client: Any = None
         self._initialized = False
         # Track last message timestamp per distinct_id for is_followup
         self._last_message: dict[str, float] = {}
-        # Track seen distinct_ids for user_onboarded / household_member_added
+        # Track seen distinct_ids for user_onboarded / household_member_added.
+        # Persisted to disk — see _load_state / _save_state — so a restart
+        # doesn't re-fire user_onboarded for users we've already tracked.
         self._seen_users: set[str] = set()
         self._first_user_ts: float | None = None
         self._household_id = ""
+        self._state_path: Path | None = None
+        self._state_loaded = False
+
+    # ── persistence ──────────────────────────────────────────────────────
+
+    def _load_state(self) -> None:
+        """Load seen_users and first_user_ts from disk. Safe on every call."""
+        if self._state_loaded:
+            return
+        self._state_path = _resolve_state_path()
+        if self._state_path is None:
+            self._state_loaded = True
+            return
+        try:
+            raw = self._state_path.read_text()
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("state file is not an object")
+            users = data.get("seen_users") or []
+            self._seen_users = {str(u) for u in users if isinstance(u, str)}
+            ts = data.get("first_user_ts")
+            self._first_user_ts = float(ts) if isinstance(ts, (int, float)) else None
+            logger.debug("Analytics state loaded (%d users)", len(self._seen_users))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("Analytics state file unreadable (%s) — starting fresh", exc)
+        self._state_loaded = True
+
+    def _save_state(self) -> None:
+        if self._state_path is None:
+            return
+        payload = {
+            "version": _STATE_VERSION,
+            "household_id": self._household_id,
+            "seen_users": sorted(self._seen_users),
+            "first_user_ts": self._first_user_ts,
+        }
+        try:
+            tmp = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload))
+            os.replace(tmp, self._state_path)
+        except OSError as exc:
+            logger.warning("Failed to persist analytics state: %s", exc)
+
+    # ── init ─────────────────────────────────────────────────────────────
 
     def _ensure_init(self) -> bool:
         """Lazy-init PostHog client. Returns True if client is live."""
@@ -47,6 +137,9 @@ class AnalyticsHook:
         api_key = os.environ.get("POSTHOG_API_KEY", "").strip()
         host = os.environ.get("POSTHOG_HOST", "https://us.i.posthog.com").strip()
         self._household_id = get_household_id()
+        # Load persisted onboarding state so restarts don't re-fire
+        # user_onboarded / household_member_added for known distinct_ids.
+        self._load_state()
         if not api_key:
             logger.debug("POSTHOG_API_KEY not set — analytics disabled")
             return False
@@ -60,9 +153,20 @@ class AnalyticsHook:
             logger.warning("posthog package not installed — analytics disabled")
             return False
 
-    def _base_props(self) -> dict:
+    def _base_props(self, turn_id: str | None = None) -> dict:
+        """Base props attached to every event.
+
+        `turn_id` is a per-turn correlation id — all events fired inside a
+        single _process_message call carry the same value so duplicate events
+        (caller re-invocation, multiple processes) are inspectable in PostHog.
+        """
+        props: dict[str, Any] = {}
         hid = self._household_id or get_household_id()
-        return {"household_id": hid} if hid else {}
+        if hid:
+            props["household_id"] = hid
+        if turn_id:
+            props["turn_id"] = turn_id
+        return props
 
     def on_message_received(
         self,
@@ -83,6 +187,7 @@ class AnalyticsHook:
             "timestamp": timestamp,
             "is_guest": is_guest,
             "inbound_time": time.monotonic(),
+            "turn_id": uuid.uuid4().hex[:16],
         }
 
     async def on_response_sent(
@@ -105,13 +210,14 @@ class AnalyticsHook:
         channel = ctx["channel"]
         sender_id = ctx["sender_id"]
         content = ctx["content"]
+        turn_id = ctx.get("turn_id") or uuid.uuid4().hex[:16]
         distinct_id = get_distinct_id(sender_id, channel)
         now = time.monotonic()
         latency_ms = int((now - ctx["inbound_time"]) * 1000)
 
         # ── agent_responded (immediate) ──────────────────────────────────
         self._client.capture(distinct_id, "agent_responded", {
-            **self._base_props(),
+            **self._base_props(turn_id),
             "channel": channel,
             "latency_ms": latency_ms,
             "tool_calls_count": len(tools_used),
@@ -124,13 +230,13 @@ class AnalyticsHook:
         fb = detect_feedback(content)
         if fb:
             self._client.capture(distinct_id, "feedback_submitted", {
-                **self._base_props(),
+                **self._base_props(turn_id),
                 "sentiment": fb.sentiment,
                 "trigger": fb.trigger,
             })
 
         # ── user_onboarded / household_member_added (first-seen check) ───
-        self._maybe_fire_onboarding(distinct_id, channel)
+        self._maybe_fire_onboarding(distinct_id, channel, turn_id)
 
         # ── message_sent (background — waits for classification) ─────────
         is_followup = self._check_followup(distinct_id, now)
@@ -141,6 +247,7 @@ class AnalyticsHook:
             content=content,
             media=ctx["media"],
             is_followup=is_followup,
+            turn_id=turn_id,
         )
         if schedule_background:
             schedule_background(coro)
@@ -154,7 +261,9 @@ class AnalyticsHook:
             return False
         return (now - last) < _FOLLOWUP_WINDOW_S
 
-    def _maybe_fire_onboarding(self, distinct_id: str, channel: str) -> None:
+    def _maybe_fire_onboarding(
+        self, distinct_id: str, channel: str, turn_id: str,
+    ) -> None:
         """Fire user_onboarded on first message from a new distinct_id."""
         if distinct_id in self._seen_users:
             return
@@ -163,6 +272,10 @@ class AnalyticsHook:
 
         if is_new_household:
             self._first_user_ts = time.time()
+
+        # Persist before capturing so a crash mid-turn can't cause a
+        # re-fire on the next boot.
+        self._save_state()
 
         # Identify person + set properties
         self._client.identify(distinct_id, {
@@ -173,7 +286,7 @@ class AnalyticsHook:
         })
 
         self._client.capture(distinct_id, "user_onboarded", {
-            **self._base_props(),
+            **self._base_props(turn_id),
             "channel": channel,
             "is_new_household": is_new_household,
             "signup_source": "friends_launch",
@@ -184,7 +297,7 @@ class AnalyticsHook:
             if self._first_user_ts:
                 days = int((time.time() - self._first_user_ts) / 86400)
             self._client.capture(distinct_id, "household_member_added", {
-                **self._base_props(),
+                **self._base_props(turn_id),
                 "member_count_after": len(self._seen_users),
                 "days_since_household_created": days,
             })
@@ -201,13 +314,14 @@ class AnalyticsHook:
         content: str,
         media: list[str],
         is_followup: bool,
+        turn_id: str,
     ) -> None:
         """Classify, then fire message_sent."""
         from nanobot.analytics.classify import classify_message_async
 
         tag = await classify_message_async(content)
         self._client.capture(distinct_id, "message_sent", {
-            **self._base_props(),
+            **self._base_props(turn_id),
             "channel": channel,
             "message_length": len(content),
             "has_attachment": bool(media),
