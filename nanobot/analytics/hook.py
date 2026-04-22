@@ -21,7 +21,11 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.analytics.feedback import detect_feedback
-from nanobot.analytics.identity import get_distinct_id, get_household_id
+from nanobot.analytics.identity import (
+    get_distinct_id,
+    get_household_id,
+    migrate_channel_hashes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +114,14 @@ class AnalyticsHook:
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             logger.warning("Analytics state file unreadable (%s) — starting fresh", exc)
         self._state_loaded = True
+        self._migrate_seen_users_to_canonical()
+
+    def _migrate_seen_users_to_canonical(self) -> None:
+        """Apply identity-map canonicalization to any existing seen_users
+        entries, so a deploy that turns on the map doesn't re-fire
+        user_onboarded for every known user."""
+        if migrate_channel_hashes(self._seen_users):
+            self._save_state()
 
     def _save_state(self) -> None:
         if self._state_path is None:
