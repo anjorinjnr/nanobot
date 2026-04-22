@@ -407,10 +407,16 @@ class AgentLoop:
         """Resolve per-sender scope context via the configured provider.
 
         Provider config is ``"module:function"`` (e.g. ``"scope_store:render_scope_context_for_sender"``).
-        The function is called with a single ``sender_id`` string and must return a
-        string. An empty return means "no scope data for this sender" and no injection
-        happens. Any exception is logged and skipped — the agent continues without
-        injection (the workspace's static context still loads via the normal path).
+        The function MUST accept a single positional ``sender_id: str`` and
+        return ``str``. An empty return means "no scope data for this sender"
+        and no injection happens. Any exception is logged and skipped — the
+        agent continues without injection (the workspace's static context
+        still loads via the normal path).
+
+        Misconfiguration (malformed format, missing module, missing attribute)
+        auto-disables the provider for this process to avoid per-turn log
+        spam; a restart is required to re-enable after fixing config.
+        Transient provider exceptions do NOT auto-disable (retry next turn).
 
         Returns None when provider is unset, errors, or yields no content.
         """
