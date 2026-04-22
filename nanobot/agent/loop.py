@@ -837,9 +837,12 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        # PostHog analytics — capture inbound context
+        # PostHog analytics — capture inbound context. Skip for synthetic
+        # messages (heartbeat, cron) so we don't record agent-initiated
+        # activity as user-sent messages.
         from nanobot.analytics.hook import get_analytics_hook
         _analytics = get_analytics_hook()
+        _synthetic = bool(msg.metadata.get("synthetic"))
 
         # Resolve guest_agent workspace if sender is in guest agent ACL
         guest = self._resolve_guest_agent_workspace(msg.sender_id) if msg.sender_id else None
@@ -847,7 +850,7 @@ class AgentLoop:
         sessions = guest[1] if guest else self.sessions
         blocked_tools = guest[2] if guest else frozenset()
 
-        _analytics_ctx = _analytics.on_message_received(
+        _analytics_ctx = None if _synthetic else _analytics.on_message_received(
             channel=msg.channel,
             sender_id=msg.sender_id,
             content=msg.content,
@@ -963,18 +966,20 @@ class AgentLoop:
             preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
             logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        # PostHog analytics — fire events after response is built
-        escalation_used = "escalate" in tools_used or "resolve_escalation" in tools_used
-        try:
-            await _analytics.on_response_sent(
-                _analytics_ctx,
-                response_content=final_content,
-                tools_used=tools_used,
-                escalation_triggered=escalation_used,
-                schedule_background=self._schedule_background,
-            )
-        except Exception:
-            logger.debug("Analytics hook error (non-fatal)", exc_info=True)
+        # PostHog analytics — fire events after response is built. Skipped
+        # entirely for synthetic calls (see _analytics_ctx assignment above).
+        if _analytics_ctx is not None:
+            escalation_used = "escalate" in tools_used or "resolve_escalation" in tools_used
+            try:
+                await _analytics.on_response_sent(
+                    _analytics_ctx,
+                    response_content=final_content,
+                    tools_used=tools_used,
+                    escalation_triggered=escalation_used,
+                    schedule_background=self._schedule_background,
+                )
+            except Exception:
+                logger.debug("Analytics hook error (non-fatal)", exc_info=True)
 
         meta = dict(msg.metadata or {})
         if on_stream is not None and stop_reason != STOP_ERROR:
@@ -1167,10 +1172,23 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         model_override: str | None = None,
+        is_synthetic: bool = False,
     ) -> OutboundMessage | None:
-        """Process a message directly and return the outbound payload."""
+        """Process a message directly and return the outbound payload.
+
+        *is_synthetic* flags messages that were not initiated by a user —
+        heartbeat ticks, cron reminders, internal self-sends. These bypass
+        the analytics hook so they don't pollute the `message_sent` funnel
+        with agent-initiated work.
+        """
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id=sender_id, chat_id=chat_id, content=content)
+        msg = InboundMessage(
+            channel=channel,
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=content,
+            metadata={"synthetic": True} if is_synthetic else {},
+        )
         return await self._process_message(
             msg,
             session_key=session_key,
