@@ -54,7 +54,7 @@ class AnalyticsHook:
             from posthog import Posthog
             self._client = Posthog(api_key, host=host)
             atexit.register(self._client.shutdown)
-            logger.info("PostHog analytics initialized (host={})", host)
+            logger.info("PostHog analytics initialized (host=%s)", host)
             return True
         except ImportError:
             logger.warning("posthog package not installed — analytics disabled")
