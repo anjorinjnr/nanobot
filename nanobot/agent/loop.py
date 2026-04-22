@@ -867,9 +867,8 @@ class AgentLoop:
             chat_id=msg.chat_id,
         )
 
-        # Guest path: inject per-sender scope context as an ephemeral system
-        # message. Rebuilt every turn from the scope store; never persisted to
-        # session history, so the LLM only sees the current sender's scope(s).
+        # Ephemeral: inserted into this turn's messages only — never written
+        # to session history, so stale scope data can't accumulate across turns.
         if guest and msg.sender_id:
             scope_ctx = self._get_scope_context(msg.sender_id)
             if scope_ctx:
