@@ -10,6 +10,7 @@ from nanobot.config.paths import (
     is_default_workspace,
     get_logs_dir,
     get_media_dir,
+    get_persistent_data_dir,
     get_runtime_subdir,
     get_workspace_path,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "load_config",
     "get_config_path",
     "get_data_dir",
+    "get_persistent_data_dir",
     "get_runtime_subdir",
     "get_media_dir",
     "get_cron_dir",

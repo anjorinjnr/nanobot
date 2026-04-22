@@ -538,13 +538,16 @@ class WhatsAppChannel(BaseChannel):
         Returns (lid_map, sender_map) — does NOT mutate instance state
         to avoid thread-safety issues.
         """
-        from nanobot.config.paths import get_data_dir
+        from nanobot.config.paths import get_persistent_data_dir
 
         lid_map: dict = {}
         sender_map: dict[str, str] = {}
 
-        # lid_map.json
-        lid_map_path = get_data_dir() / "lid_map.json"
+        # lid_map.json — persistent so bridge-learned LID↔phone mappings
+        # survive container recreation. Without persistence the bridge has
+        # to re-learn every mapping after a deploy, which in turn breaks
+        # homer's identity_map phone-form expansion.
+        lid_map_path = get_persistent_data_dir() / "lid_map.json"
         if lid_map_path.exists():
             try:
                 raw = json.loads(lid_map_path.read_text(encoding="utf-8"))
@@ -602,8 +605,8 @@ class WhatsAppChannel(BaseChannel):
     def _write_lid_map(data: dict) -> None:
         """Synchronous atomic disk write, called via asyncio.to_thread under lock."""
         import tempfile
-        from nanobot.config.paths import get_data_dir
-        map_path = get_data_dir() / "lid_map.json"
+        from nanobot.config.paths import get_persistent_data_dir
+        map_path = get_persistent_data_dir() / "lid_map.json"
         map_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             fd, tmp_path = tempfile.mkstemp(dir=map_path.parent, suffix=".tmp")

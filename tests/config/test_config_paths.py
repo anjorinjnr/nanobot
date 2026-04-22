@@ -8,6 +8,7 @@ from nanobot.config.paths import (
     get_legacy_sessions_dir,
     get_logs_dir,
     get_media_dir,
+    get_persistent_data_dir,
     get_runtime_subdir,
     get_workspace_path,
     is_default_workspace,
@@ -47,3 +48,28 @@ def test_is_default_workspace_distinguishes_default_and_custom_paths() -> None:
     assert is_default_workspace(None) is True
     assert is_default_workspace(Path.home() / ".nanobot" / "workspace") is True
     assert is_default_workspace("~/custom-workspace") is False
+
+
+def test_persistent_data_dir_defaults_to_data_dir(monkeypatch, tmp_path: Path) -> None:
+    """Without the env var, persistent dir == data dir — backward compatible
+    with bare-metal / systemd deployments where data_dir already persists."""
+    monkeypatch.delenv("NANOBOT_PERSISTENT_DATA_DIR", raising=False)
+    config_file = tmp_path / "instance-c" / "config.json"
+    monkeypatch.setattr("nanobot.config.paths.get_config_path", lambda: config_file)
+    assert get_persistent_data_dir() == get_data_dir()
+
+
+def test_persistent_data_dir_honors_env_override(monkeypatch, tmp_path: Path) -> None:
+    """Hosted deployments set NANOBOT_PERSISTENT_DATA_DIR to a mounted
+    volume so state like lid_map.json survives container recreation."""
+    persistent = tmp_path / "persistent"
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", str(persistent))
+    assert get_persistent_data_dir() == persistent
+    # Directory is created on first call (ensure_dir).
+    assert persistent.is_dir()
+
+
+def test_persistent_data_dir_expands_tilde(monkeypatch) -> None:
+    """User-provided paths with ~ should resolve to the home directory."""
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", "~/nanobot-persistent")
+    assert get_persistent_data_dir() == Path.home() / "nanobot-persistent"
