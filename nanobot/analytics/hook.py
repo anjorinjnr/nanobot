@@ -35,7 +35,14 @@ _STATE_VERSION = 1
 
 def _resolve_state_path() -> Path | None:
     """Return the path where onboarding state should live, or None if the
-    runtime config isn't available (unit tests, CLI without a config)."""
+    runtime config isn't available (unit tests, CLI without a config).
+
+    Main and guest nanobots run in separate processes and each call
+    `set_config_path()` with their own config file. We namespace under the
+    config filename's stem so they don't race on a shared state file —
+    e.g. `~/.nanobot/analytics/config/seen_users.json` for main,
+    `~/.nanobot/analytics/guest_config/seen_users.json` for guest.
+    """
     override = os.environ.get("HOMER_ANALYTICS_STATE_DIR", "").strip()
     if override:
         try:
@@ -46,15 +53,23 @@ def _resolve_state_path() -> Path | None:
             logger.debug("HOMER_ANALYTICS_STATE_DIR unwritable: %s", override)
             return None
     try:
+        from nanobot.config.loader import get_config_path
         from nanobot.config.paths import get_runtime_subdir
-        return get_runtime_subdir("analytics") / _STATE_FILENAME
-    except Exception:
+        subdir = get_runtime_subdir("analytics") / get_config_path().stem
+        subdir.mkdir(parents=True, exist_ok=True)
+        return subdir / _STATE_FILENAME
+    except (ImportError, RuntimeError, OSError):
         # No config loaded yet — defer persistence to a later call.
         return None
 
 
 class AnalyticsHook:
-    """Non-blocking PostHog instrumentation wired into AgentLoop._process_message."""
+    """Non-blocking PostHog instrumentation wired into AgentLoop._process_message.
+
+    State (seen_users, first_user_ts) is persisted per-process: the on-disk
+    path is namespaced by `get_config_path().stem`, so main and guest nanobot
+    processes — which share a parent data dir — don't race on the same file.
+    """
 
     def __init__(self) -> None:
         self._client: Any = None

@@ -20,6 +20,12 @@ from nanobot.analytics.hook import AnalyticsHook
 # ── helpers ──────────────────────────────────────────────────────────────
 
 
+class _AsyncReturn:
+    """An awaitable factory: calling returns a coroutine that yields `value`."""
+    def __init__(self, value): self.value = value
+    async def __call__(self, *a, **kw): return self.value
+
+
 def _make_hook(state_dir: Path, household_id: str = "hh-1") -> AnalyticsHook:
     """Return an AnalyticsHook whose state persists under `state_dir`,
     with a mocked PostHog client so captures are inspectable.
@@ -153,7 +159,7 @@ async def test_state_file_shape(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_corrupt_state_file_recovers(tmp_path, monkeypatch, caplog):
+async def test_corrupt_state_file_recovers(tmp_path, monkeypatch):
     """A garbled state file must not crash — hook starts with empty seen_users."""
     monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(tmp_path))
     (tmp_path / "seen_users.json").write_text("not valid json {")
@@ -183,6 +189,65 @@ def test_no_state_path_when_env_missing_and_no_config(monkeypatch):
 
     assert hook._state_path is None
     assert hook._seen_users == set()
+
+
+# ── main/guest isolation ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_per_config_state_isolation(tmp_path, monkeypatch):
+    """Two processes with different `get_config_path()` values must not
+    clobber each other's state. Simulates main + guest nanobot sharing a
+    parent data dir but each calling set_config_path() separately."""
+    from nanobot.config import loader as config_loader
+
+    data_dir = tmp_path / "nanobot_data"
+    data_dir.mkdir()
+    main_config = data_dir / "config.json"
+    guest_config = data_dir / "guest_config.json"
+    main_config.write_text("{}")
+    guest_config.write_text("{}")
+
+    # Ensure HOMER_ANALYTICS_STATE_DIR does NOT override — we want to
+    # exercise the config-stem-based path resolution.
+    monkeypatch.delenv("HOMER_ANALYTICS_STATE_DIR", raising=False)
+
+    def _make_process_hook(config_path: Path) -> AnalyticsHook:
+        config_loader.set_config_path(config_path)
+        hook = AnalyticsHook()
+        hook._initialized = True
+        hook._client = MagicMock()
+        hook._household_id = "hh-1"
+        hook._load_state()
+        return hook
+
+    try:
+        # Main records its user.
+        main_hook = _make_process_hook(main_config)
+        await main_hook.on_response_sent(
+            _receive(main_hook, channel="whatsapp", sender_id="+15551234"),
+            response_content="ok", tools_used=set(),
+        )
+        # Guest records its user in a *separate* process's view.
+        guest_hook = _make_process_hook(guest_config)
+        await guest_hook.on_response_sent(
+            _receive(guest_hook, channel="telegram", sender_id="guest-telegram-id"),
+            response_content="ok", tools_used=set(),
+        )
+
+        # Each should have written to a different state file.
+        main_state = main_hook._state_path
+        guest_state = guest_hook._state_path
+        assert main_state != guest_state
+        assert main_state.exists() and guest_state.exists()
+
+        # Reload main's state — must still contain only main's user,
+        # untouched by guest's write.
+        reloaded_main = _make_process_hook(main_config)
+        assert len(reloaded_main._seen_users) == 1
+    finally:
+        # Reset module-global config path so later tests aren't polluted.
+        config_loader.set_config_path(None)  # type: ignore[arg-type]
 
 
 # ── turn_id observability ────────────────────────────────────────────────
@@ -245,12 +310,3 @@ async def test_turn_id_differs_across_turns(tmp_path, monkeypatch):
     responded = _captured_events(hook._client, "agent_responded")
     assert len(responded) == 2
     assert responded[0]["turn_id"] != responded[1]["turn_id"]
-
-
-# ── misc helpers ─────────────────────────────────────────────────────────
-
-
-class _AsyncReturn:
-    """An awaitable factory: calling returns a coroutine that yields `value`."""
-    def __init__(self, value): self.value = value
-    async def __call__(self, *a, **kw): return self.value
