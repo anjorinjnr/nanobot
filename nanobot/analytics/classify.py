@@ -1,25 +1,58 @@
-"""Use-case classifier — Gemini Flash with LRU cache."""
+"""Use-case classifier — Gemini Flash with LRU cache.
+
+Produces a snake_case tag per message. The LLM picks from a preferred set
+when a message fits, and otherwise generates its own descriptive tag.
+"other" is not a valid output — if classification fails for a technical
+reason (no API key, network error, malformed response) we return
+"unclassified" so dashboard filters can distinguish "model couldn't decide"
+from "pipeline broke".
+"""
 
 from __future__ import annotations
 
 import hashlib
 import logging
 import os
+import re
 from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
 
-VALID_TAGS = frozenset({
-    "meal_planning", "calendar", "home_maintenance", "learning_tola",
-    "medical", "inventory", "general_qa", "admin", "other",
-})
-
-_PROMPT = (
-    "You are classifying a message sent to a household AI assistant. "
-    "Return exactly one token from this list, no punctuation, no explanation:\n\n"
-    "meal_planning calendar home_maintenance learning_tola medical inventory general_qa admin other\n\n"
-    'Message: "{message_text}"'
+# Tags the LLM is nudged toward. Not a whitelist — the LLM may return a
+# different snake_case tag when none of these fit. Add here when a newly
+# generated tag becomes common enough to stabilize.
+PREFERRED_TAGS: tuple[str, ...] = (
+    "calendar",
+    "events",
+    "meal_planning",
+    "maintenance",
+    "health",
+    "finance",
+    "email",
+    "tasks_reminders",
+    "research",
+    "travel",
+    "people",
+    "admin",
+    "chitchat",
 )
+
+_PROMPT_TEMPLATE = (
+    "Classify this message to a household AI assistant. Return EXACTLY ONE "
+    "lowercase snake_case tag. No punctuation, no quotes, no explanation.\n\n"
+    "Prefer these tags when they fit:\n"
+    "{preferred}\n\n"
+    "If none fit, generate your own descriptive snake_case tag "
+    "(1-3 words joined by _). Do NOT return 'other' — pick something "
+    "specific instead.\n\n"
+    'Message: "{text}"'
+)
+
+# Accept any snake_case token starting with a letter. Upper bound keeps
+# pathological LLM output (prompt injections, run-on sentences) out of the
+# analytics stream.
+_TAG_RE = re.compile(r"^[a-z][a-z0-9_]{1,29}$")
+_FALLBACK = "unclassified"
 
 
 class _LRUCache:
@@ -51,10 +84,23 @@ def _message_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-async def classify_message_async(text: str) -> str:
-    """Classify *text* into a use-case tag. Async version for nanobot's event loop.
+def _validate(raw: str) -> str:
+    """Return a valid snake_case tag, or _FALLBACK if the input is malformed
+    or is literally "other" (which we actively reject)."""
+    tag = raw.strip().strip('"').strip("'").strip().lower()
+    if tag == "other":
+        return _FALLBACK
+    if _TAG_RE.fullmatch(tag):
+        return tag
+    return _FALLBACK
 
-    Uses Gemini Flash via OpenAI-compat API. Results cached by SHA-256 of text.
+
+async def classify_message_async(text: str) -> str:
+    """Classify *text* into a snake_case use-case tag. Async version.
+
+    Returns a preferred tag, a model-generated snake_case tag, or
+    "unclassified" on technical failure. Results are cached by SHA-256 of
+    the input text.
     """
     key = _message_hash(text)
     cached = _cache.get(key)
@@ -64,8 +110,8 @@ async def classify_message_async(text: str) -> str:
     try:
         tag = await _call_gemini_async(text)
     except Exception:
-        logger.debug("Classification failed, defaulting to 'other'", exc_info=True)
-        tag = "other"
+        logger.debug("Classification failed", exc_info=True)
+        tag = _FALLBACK
     _cache.put(key, tag)
     return tag
 
@@ -74,26 +120,29 @@ async def _call_gemini_async(text: str) -> str:
     """Call Gemini Flash and return a validated tag."""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        return "other"
+        return _FALLBACK
     try:
         import httpx
 
+        prompt = _PROMPT_TEMPLATE.format(
+            preferred=", ".join(PREFERRED_TAGS),
+            text=text[:500],
+        )
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={
                     "model": "gemini-2.5-flash",
-                    "messages": [{"role": "user", "content": _PROMPT.format(message_text=text[:500])}],
-                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 15,
                     "temperature": 0,
                 },
                 timeout=5.0,
             )
             resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"].strip().lower()
-            tag = raw.replace('"', "").replace("'", "").strip()
-            return tag if tag in VALID_TAGS else "other"
+            raw = resp.json()["choices"][0]["message"]["content"]
+            return _validate(raw)
     except Exception:
         logger.debug("Gemini classification request failed", exc_info=True)
-        return "other"
+        return _FALLBACK
