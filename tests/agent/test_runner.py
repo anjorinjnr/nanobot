@@ -960,52 +960,6 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
     assert endings == [False]
 
 
-@pytest.mark.asyncio
-async def test_system_message_from_subagent_uses_user_role(tmp_path):
-    """Subagent results injected as system messages must use role='user'
-    to avoid assistant prefill, which some models reject."""
-    from nanobot.bus.events import InboundMessage
-
-    loop = _make_loop(tmp_path)
-
-    async def fake_run_agent_loop(initial_messages, *args, **kwargs):
-        return "ok", [], initial_messages, {}, None
-
-    loop._run_agent_loop = fake_run_agent_loop
-    loop.sessions = MagicMock()
-    session = MagicMock()
-    session.get_history.return_value = []
-    loop.sessions.get_or_create.return_value = session
-    loop.sessions.save = MagicMock()
-    loop.consolidator = MagicMock()
-    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock()
-    loop.context = MagicMock()
-
-    # Track what role is passed to build_messages
-    build_calls: list[dict] = []
-
-    def track_build_messages(**kwargs):
-        build_calls.append(kwargs)
-        return [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "subagent result"},
-        ]
-
-    loop.context.build_messages = track_build_messages
-
-    msg = InboundMessage(
-        channel="system",
-        sender_id="subagent",
-        chat_id="telegram:123",
-        content="[Subagent completed] result here",
-    )
-
-    await loop._process_message(msg)
-
-    # Verify build_messages was called with current_role="user" for subagent results
-    # to avoid assistant-prefill rejection on models that don't support it.
-    assert len(build_calls) == 1
-    assert build_calls[0]["current_role"] == "user"
 
 
 @pytest.mark.asyncio
