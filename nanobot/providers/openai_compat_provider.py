@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import hashlib
 import importlib.util
 import os
 import secrets
 import string
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 import json_repair
+from loguru import logger
 
 if os.environ.get("LANGFUSE_SECRET_KEY") and importlib.util.find_spec("langfuse"):
     from langfuse.openai import AsyncOpenAI
@@ -49,6 +52,39 @@ _DEFAULT_OPENROUTER_HEADERS = {
     "X-OpenRouter-Title": "nanobot",
     "X-OpenRouter-Categories": "cli-agent,personal-agent",
 }
+_KIMI_THINKING_MODELS: frozenset[str] = frozenset({
+    "kimi-k2.5",
+    "kimi-k2.6",
+    "k2.6-code-preview",
+})
+
+# Maps ProviderSpec.thinking_style → extra_body builder.
+# Each builder takes a bool (thinking_enabled) and returns the dict to
+# merge into extra_body, keeping the style→wire-format mapping in one place.
+_THINKING_STYLE_MAP: dict[str, Any] = {
+    "thinking_type": lambda on: {"thinking": {"type": "enabled" if on else "disabled"}},
+    "enable_thinking": lambda on: {"enable_thinking": on},
+    "reasoning_split": lambda on: {"reasoning_split": on},
+}
+
+
+def _is_kimi_thinking_model(model_name: str) -> bool:
+    """Return True if model_name refers to a Kimi thinking-capable model.
+
+    Supports two forms:
+    - Exact match: e.g. kimi-k2.5 / kimi-k2.6 in _KIMI_THINKING_MODELS
+    - Slug match:  moonshotai/kimi-k2.5 -> the part after the last "/"
+                   is checked against _KIMI_THINKING_MODELS
+
+    This covers both the native Moonshot provider (bare slug) and
+    OpenRouter-style names (``"publisher/slug"``).
+    """
+    name = model_name.lower()
+    if name in _KIMI_THINKING_MODELS:
+        return True
+    if "/" in name and name.rsplit("/", 1)[1] in _KIMI_THINKING_MODELS:
+        return True
+    return False
 
 
 def _short_tool_id() -> str:
@@ -119,12 +155,26 @@ def _uses_openrouter_attribution(spec: "ProviderSpec | None", api_base: str | No
     return bool(api_base and "openrouter" in api_base.lower())
 
 
+_RESPONSES_FAILURE_THRESHOLD = 3
+_RESPONSES_PROBE_INTERVAL_S = 300  # 5 minutes
+
+
 def _is_direct_openai_base(api_base: str | None) -> bool:
     """Return True for direct OpenAI endpoints, not generic OpenAI-compatible gateways."""
     if not api_base:
         return True
     normalized = api_base.strip().lower().rstrip("/")
     return "api.openai.com" in normalized and "openrouter" not in normalized
+
+
+def _responses_circuit_key(
+    model: str | None,
+    default_model: str,
+    reasoning_effort: str | None,
+) -> str:
+    model_name = (model or default_model).lower()
+    effort = reasoning_effort.lower() if isinstance(reasoning_effort, str) else ""
+    return f"{model_name}:{effort}"
 
 
 class OpenAICompatProvider(LLMProvider):
@@ -164,6 +214,11 @@ class OpenAICompatProvider(LLMProvider):
             default_headers=default_headers,
             max_retries=0,
         )
+
+        # Responses API circuit breaker: skip after repeated failures,
+        # probe again after _RESPONSES_PROBE_INTERVAL_S seconds.
+        self._responses_failures: dict[str, int] = {}
+        self._responses_tripped_at: dict[str, float] = {}
 
     def _setup_env(self, api_key: str, api_base: str | None) -> None:
         """Set environment variables based on provider spec."""
@@ -222,6 +277,24 @@ class OpenAICompatProvider(LLMProvider):
             return tool_call_id
         return hashlib.sha1(tool_call_id.encode()).hexdigest()[:9]
 
+    @staticmethod
+    def _normalize_tool_call_arguments(arguments: Any) -> str:
+        """Force function.arguments into a valid JSON object string."""
+        if isinstance(arguments, str):
+            stripped = arguments.strip()
+            if not stripped:
+                return "{}"
+            try:
+                parsed = json_repair.loads(stripped)
+            except Exception:
+                return "{}"
+            if isinstance(parsed, dict):
+                return json.dumps(parsed, ensure_ascii=False)
+            return "{}"
+        if isinstance(arguments, dict):
+            return json.dumps(arguments, ensure_ascii=False)
+        return "{}"
+
     def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Strip non-standard keys, normalize tool_call IDs."""
         sanitized = LLMProvider._sanitize_request_messages(messages, _ALLOWED_MSG_KEYS)
@@ -241,6 +314,16 @@ class OpenAICompatProvider(LLMProvider):
                         continue
                     tc_clean = dict(tc)
                     tc_clean["id"] = map_id(tc_clean.get("id"))
+                    function = tc_clean.get("function")
+                    if isinstance(function, dict):
+                        function_clean = dict(function)
+                        if "arguments" in function_clean:
+                            function_clean["arguments"] = self._normalize_tool_call_arguments(
+                                function_clean.get("arguments")
+                            )
+                        else:
+                            function_clean["arguments"] = "{}"
+                        tc_clean["function"] = function_clean
                     normalized.append(tc_clean)
                 clean["tool_calls"] = normalized
                 if clean.get("role") == "assistant":
@@ -313,30 +396,67 @@ class OpenAICompatProvider(LLMProvider):
                     kwargs.update(overrides)
                     break
 
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
+        # Normalize reasoning_effort into a semantic form (OpenAI vocab)
+        # used for internal decisions, and a wire form actually sent out.
+        # "minimum" is accepted as a DashScope-native alias for "minimal".
+        semantic_effort: str | None = None
+        if isinstance(reasoning_effort, str):
+            semantic_effort = reasoning_effort.lower()
+            if semantic_effort == "minimum":
+                semantic_effort = "minimal"
+
+        wire_effort = reasoning_effort
+        if spec and spec.name == "dashscope" and semantic_effort == "minimal":
+            # DashScope accepts none/minimum/low/medium/high/xhigh; "minimal" 400s.
+            wire_effort = "minimum"
+
+        if wire_effort:
+            kwargs["reasoning_effort"] = wire_effort
 
         # Provider-specific thinking parameters.
         # Only sent when reasoning_effort is explicitly configured so that
         # the provider default is preserved otherwise.
-        if spec and reasoning_effort is not None:
-            thinking_enabled = reasoning_effort.lower() != "minimal"
-            extra: dict[str, Any] | None = None
-            if spec.name == "dashscope":
-                extra = {"enable_thinking": thinking_enabled}
-            elif spec.name in (
-                "volcengine", "volcengine_coding_plan",
-                "byteplus", "byteplus_coding_plan",
-            ):
-                extra = {
-                    "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
-                }
+        # The mapping is driven by ProviderSpec.thinking_style so that adding
+        # a new provider never requires touching this function.
+        if spec and spec.thinking_style and reasoning_effort is not None:
+            thinking_enabled = semantic_effort != "minimal"
+            extra = _THINKING_STYLE_MAP.get(spec.thinking_style, lambda _: None)(thinking_enabled)
             if extra:
                 kwargs.setdefault("extra_body", {}).update(extra)
+
+        # Model-level thinking injection for Kimi thinking-capable models.
+        # Strip any provider prefix (e.g. "moonshotai/") before the set lookup
+        # so that OpenRouter-style names like "moonshotai/kimi-k2.5" are handled
+        # identically to bare names like "kimi-k2.5".
+        if reasoning_effort is not None and _is_kimi_thinking_model(model_name):
+            thinking_enabled = semantic_effort != "minimal"
+            kwargs.setdefault("extra_body", {}).update(
+                {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
+            )
 
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
+
+        # Backfill reasoning_content on legacy assistant messages.
+        # DeepSeek V4 (and potentially others) rejects thinking-mode
+        # requests that contain assistant messages without reasoning_content
+        # — even on turns that had no tool calls. This happens when a
+        # session was started with a non-thinking model or without
+        # reasoning_effort, then the user switches thinking mode on
+        # mid-session. Injecting an empty string satisfies the API
+        # without altering semantics (the model treats it as "no
+        # thinking happened on that turn").
+        thinking_active = (
+            (spec and spec.thinking_style and reasoning_effort is not None
+             and semantic_effort != "minimal")
+            or (reasoning_effort is not None and _is_kimi_thinking_model(model_name)
+                and semantic_effort != "minimal")
+        )
+        if thinking_active:
+            for msg in kwargs["messages"]:
+                if msg.get("role") == "assistant" and "reasoning_content" not in msg:
+                    msg["reasoning_content"] = ""
 
         return kwargs
 
@@ -346,15 +466,46 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None,
     ) -> bool:
         """Use Responses API only for direct OpenAI requests that benefit from it."""
-        if self._spec and self._spec.name != "openai":
+        if self._spec and self._spec.name not in ("openai", "github_copilot"):
             return False
-        if not _is_direct_openai_base(self._effective_base):
-            return False
+        if self._spec is None or self._spec.name != "github_copilot":
+            if not _is_direct_openai_base(self._effective_base):
+                return False
 
         model_name = (model or self.default_model).lower()
+        wants = False
         if reasoning_effort and reasoning_effort.lower() != "none":
-            return True
-        return any(token in model_name for token in ("gpt-5", "o1", "o3", "o4"))
+            wants = True
+        elif any(token in model_name for token in ("gpt-5", "o1", "o3", "o4")):
+            wants = True
+        if not wants:
+            return False
+
+        # Circuit breaker: skip after repeated failures, probe periodically.
+        key = _responses_circuit_key(model, self.default_model, reasoning_effort)
+        failures = self._responses_failures.get(key, 0)
+        if failures >= _RESPONSES_FAILURE_THRESHOLD:
+            tripped = self._responses_tripped_at.get(key, 0.0)
+            if (time.monotonic() - tripped) < _RESPONSES_PROBE_INTERVAL_S:
+                return False
+            # Half-open: allow one probe attempt
+        return True
+
+    def _record_responses_failure(self, model: str | None, reasoning_effort: str | None) -> None:
+        key = _responses_circuit_key(model, self.default_model, reasoning_effort)
+        count = self._responses_failures.get(key, 0) + 1
+        self._responses_failures[key] = count
+        if count >= _RESPONSES_FAILURE_THRESHOLD:
+            self._responses_tripped_at[key] = time.monotonic()
+            logger.warning(
+                "Responses API circuit open for {} — falling back to Chat Completions",
+                key,
+            )
+
+    def _record_responses_success(self, model: str | None, reasoning_effort: str | None) -> None:
+        key = _responses_circuit_key(model, self.default_model, reasoning_effort)
+        self._responses_failures.pop(key, None)
+        self._responses_tripped_at.pop(key, None)
 
     @staticmethod
     def _should_fallback_from_responses_error(e: Exception) -> bool:
@@ -397,6 +548,8 @@ class OpenAICompatProvider(LLMProvider):
     ) -> dict[str, Any]:
         """Build a Responses API body for direct OpenAI requests."""
         model_name = model or self.default_model
+        if self._spec and self._spec.strip_model_prefix:
+            model_name = model_name.split("/")[-1]
         sanitized_messages = self._sanitize_messages(self._sanitize_empty_content(messages))
         instructions, input_items = convert_messages(sanitized_messages)
 
@@ -799,7 +952,12 @@ class OpenAICompatProvider(LLMProvider):
         }
 
     @staticmethod
-    def _handle_error(e: Exception) -> LLMResponse:
+    def _handle_error(
+        e: Exception,
+        *,
+        spec: ProviderSpec | None = None,
+        api_base: str | None = None,
+    ) -> LLMResponse:
         body = (
             getattr(e, "doc", None)
             or getattr(e, "body", None)
@@ -807,6 +965,15 @@ class OpenAICompatProvider(LLMProvider):
         )
         body_text = body if isinstance(body, str) else str(body) if body is not None else ""
         msg = f"Error: {body_text.strip()[:500]}" if body_text.strip() else f"Error calling LLM: {e}"
+
+        text = f"{body_text} {e}".lower()
+        if spec and spec.is_local and ("502" in text or "connection" in text or "refused" in text):
+            msg += (
+                "\nHint: this is a local model endpoint. Check that the local server is reachable at "
+                f"{api_base or spec.default_api_base}, and if you are using a proxy/tunnel, make sure it "
+                "can reach your local Ollama/vLLM service instead of routing localhost through the remote host."
+            )
+
         response = getattr(e, "response", None)
         retry_after = LLMProvider._extract_retry_after_from_headers(getattr(response, "headers", None))
         if retry_after is None:
@@ -839,10 +1006,18 @@ class OpenAICompatProvider(LLMProvider):
                         messages, tools, model, max_tokens, temperature,
                         reasoning_effort, tool_choice,
                     )
-                    return parse_response_output(await self._client.responses.create(**body))
+                    result = parse_response_output(await self._client.responses.create(**body))
+                    self._record_responses_success(model, reasoning_effort)
+                    return result
                 except Exception as responses_error:
+                    if self._spec and self._spec.name == "github_copilot":
+                        # Copilot gateway exposes GPT-5/o-series only via /responses;
+                        # falling back to /chat/completions cannot succeed and would
+                        # hide the real error.
+                        raise
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise
+                    self._record_responses_failure(model, reasoning_effort)
 
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature,
@@ -850,7 +1025,7 @@ class OpenAICompatProvider(LLMProvider):
             )
             return self._parse(await self._client.chat.completions.create(**kwargs))
         except Exception as e:
-            return self._handle_error(e)
+            return self._handle_error(e, spec=self._spec, api_base=self.api_base)
 
     async def chat_stream(
         self,
@@ -889,6 +1064,7 @@ class OpenAICompatProvider(LLMProvider):
                         _timed_stream(),
                         on_content_delta,
                     )
+                    self._record_responses_success(model, reasoning_effort)
                     return LLMResponse(
                         content=content or None,
                         tool_calls=tool_calls,
@@ -897,8 +1073,14 @@ class OpenAICompatProvider(LLMProvider):
                         reasoning_content=reasoning_content,
                     )
                 except Exception as responses_error:
+                    if self._spec and self._spec.name == "github_copilot":
+                        # Copilot gateway exposes GPT-5/o-series only via /responses;
+                        # falling back to /chat/completions cannot succeed and would
+                        # hide the real error.
+                        raise
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise
+                    self._record_responses_failure(model, reasoning_effort)
 
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature,
@@ -933,7 +1115,7 @@ class OpenAICompatProvider(LLMProvider):
                 error_kind="timeout",
             )
         except Exception as e:
-            return self._handle_error(e)
+            return self._handle_error(e, spec=self._spec, api_base=self.api_base)
 
     def get_default_model(self) -> str:
         return self.default_model
