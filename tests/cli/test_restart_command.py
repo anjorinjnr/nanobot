@@ -166,7 +166,7 @@ class TestRestartCommand:
         loop.consolidator.estimate_session_prompt_tokens = MagicMock(
             return_value=(20500, "tiktoken")
         )
-        loop.subagents.get_running_count_by_session.return_value = 0
+        loop.subagents.get_running_count_by_session = MagicMock(return_value=0)
 
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/status")
 
@@ -186,6 +186,7 @@ class TestRestartCommand:
         loop, _bus = _make_loop()
         session = MagicMock()
         session.get_history.return_value = [{"role": "user"}]
+        loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
         loop.consolidator.estimate_session_prompt_tokens = MagicMock(
             return_value=(1000, "tiktoken")
@@ -198,7 +199,7 @@ class TestRestartCommand:
 
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/status")
         loop._active_tasks[msg.session_key] = [running_task, finished_task]
-        loop.subagents.get_running_count_by_session.return_value = 2
+        loop.subagents.get_running_count_by_session = MagicMock(return_value=2)
 
         response = await loop._process_message(msg)
 
@@ -232,7 +233,7 @@ class TestRestartCommand:
         loop.consolidator.estimate_session_prompt_tokens = MagicMock(
             return_value=(0, "none")
         )
-        loop.subagents.get_running_count_by_session.return_value = 0
+        loop.subagents.get_running_count_by_session = MagicMock(return_value=0)
 
         response = await loop._process_message(
             InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/status")

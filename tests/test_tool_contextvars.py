@@ -10,6 +10,15 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.cron.service import CronService
 
 
+def _confirm_delivery(msg) -> None:
+    """Test helper: Homer's MessageTool awaits ``msg._delivery_future``
+    (set by ChannelManager in prod) to distinguish real sends from bridge
+    errors.  Tests that bypass ChannelManager must resolve it themselves.
+    """
+    if msg._delivery_future is not None and not msg._delivery_future.done():
+        msg._delivery_future.set_result(None)
+
+
 @pytest.mark.asyncio
 async def test_message_tool_keeps_task_local_context() -> None:
     seen: list[tuple[str, str, str]] = []
@@ -18,6 +27,7 @@ async def test_message_tool_keeps_task_local_context() -> None:
 
     async def send_callback(msg):
         seen.append((msg.channel, msg.chat_id, msg.content))
+        _confirm_delivery(msg)
         return None
 
     tool = MessageTool(send_callback=send_callback)
@@ -113,6 +123,7 @@ async def test_message_tool_basic_set_context_and_execute() -> None:
 
     async def send_callback(msg):
         seen.append((msg.channel, msg.chat_id, msg.content))
+        _confirm_delivery(msg)
 
     tool = MessageTool(send_callback=send_callback)
     tool.set_context("telegram", "chat-123", "msg-456")
@@ -129,6 +140,7 @@ async def test_message_tool_default_values_without_set_context() -> None:
 
     async def send_callback(msg):
         seen.append((msg.channel, msg.chat_id, msg.content))
+        _confirm_delivery(msg)
 
     tool = MessageTool(
         send_callback=send_callback,

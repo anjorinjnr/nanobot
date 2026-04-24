@@ -992,10 +992,11 @@ class AgentLoop:
                 model_override=model_override,
                 pending_queue=pending_queue,
             )
-            # For subagent announcements, skip the ephemeral user message (+1)
-            # so only the assistant's summary is persisted in session history.
-            extra_skip = 1 if msg.sender_id == "subagent" else 0
-            self._save_turn(session, all_msgs, 1 + len(history) + extra_skip, usage=self._last_usage)
+            # With current_role="assistant" for subagent, ContextBuilder merges
+            # the Current-Time prefix into the last history assistant message
+            # rather than injecting a separate user message — so skip is just
+            # system + history.
+            self._save_turn(session, all_msgs, 1 + len(history), usage=self._last_usage)
             self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
             self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
@@ -1198,12 +1199,13 @@ class AgentLoop:
         # PostHog analytics — fire events after response is built. Skipped
         # entirely for synthetic calls (see _analytics_ctx assignment above).
         if _analytics_ctx is not None:
-            escalation_used = "escalate" in tools_used or "resolve_escalation" in tools_used
+            _tools = tools_used or []
+            escalation_used = "escalate" in _tools or "resolve_escalation" in _tools
             try:
                 await _analytics.on_response_sent(
                     _analytics_ctx,
                     response_content=final_content,
-                    tools_used=tools_used,
+                    tools_used=_tools,
                     escalation_triggered=escalation_used,
                     schedule_background=self._schedule_background,
                 )
