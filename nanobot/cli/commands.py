@@ -593,6 +593,7 @@ def serve(
         disabled_skills=runtime_config.agents.defaults.disabled_skills,
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
         scope_context_provider=runtime_config.agents.defaults.scope_context_provider,
+        disable_memory_writes=runtime_config.agents.defaults.disable_memory_writes,
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -690,6 +691,7 @@ def gateway(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         scope_context_provider=config.agents.defaults.scope_context_provider,
+        disable_memory_writes=config.agents.defaults.disable_memory_writes,
     )
 
     hb_cfg = config.gateway.heartbeat
@@ -965,6 +967,7 @@ def agent(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         scope_context_provider=config.agents.defaults.scope_context_provider,
+        disable_memory_writes=config.agents.defaults.disable_memory_writes,
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):

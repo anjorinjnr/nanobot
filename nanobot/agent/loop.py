@@ -163,6 +163,7 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         scope_context_provider: str = "",
+        disable_memory_writes: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -197,6 +198,7 @@ class AgentLoop:
         self._extra_hooks: list[AgentHook] = hooks or []
         self._scope_context_provider = scope_context_provider or ""
         self._scope_context_fn: Callable[[str], str] | None = None
+        self._disable_memory_writes = bool(disable_memory_writes)
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
@@ -241,6 +243,7 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
+            archive_disabled=self._disable_memory_writes,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
@@ -892,12 +895,14 @@ class AgentLoop:
 
         # Ephemeral: inserted into this turn's messages only — never written
         # to session history, so stale scope data can't accumulate across turns.
+        scope_ctx_injected = False
         if guest and msg.sender_id:
             scope_ctx = self._get_scope_context(msg.sender_id)
             if scope_ctx:
                 initial_messages.insert(
                     1, {"role": "system", "content": scope_ctx}
                 )
+                scope_ctx_injected = True
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
@@ -933,7 +938,11 @@ class AgentLoop:
             final_content = EMPTY_FINAL_RESPONSE_MESSAGE
             stop_reason = STOP_EMPTY_FINAL
 
-        self._save_turn(session, all_msgs, 1 + len(history), usage=self._last_usage)
+        # Skip past: system prompt (1) + optional ephemeral scope_ctx + prior
+        # session history. Everything beyond that is the current turn's new
+        # messages that must be persisted.
+        skip = 1 + (1 if scope_ctx_injected else 0) + len(history)
+        self._save_turn(session, all_msgs, skip, usage=self._last_usage)
         self._clear_runtime_checkpoint(session)
         sessions.save(session)
         self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))

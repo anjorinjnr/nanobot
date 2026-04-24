@@ -361,6 +361,7 @@ class Consolidator:
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
+        archive_disabled: bool = False,
     ):
         self.store = store
         self.provider = provider
@@ -370,6 +371,12 @@ class Consolidator:
         self.max_completion_tokens = max_completion_tokens
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
+        # archive_disabled suppresses long-term memory writes (MEMORY.md /
+        # history.jsonl / session _last_summary). Set for guest agents where
+        # session content crosses scope boundaries and must NOT leak into a
+        # single shared memory file. See Homer's Tola/Adam incident
+        # (2026-04-23) for the regression this prevents.
+        self._archive_disabled = bool(archive_disabled)
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
@@ -437,8 +444,15 @@ class Consolidator:
         """Summarize messages via LLM and append to history.jsonl.
 
         Returns the summary text on success, None if nothing to archive.
+
+        When ``archive_disabled=True`` (guest agents), this is a no-op: no
+        LLM call, no write to ``memory/history.jsonl`` / ``MEMORY.md``, and
+        callers that stash the result into ``session.metadata._last_summary``
+        see a falsy return so they skip that write too.
         """
         if not messages:
+            return None
+        if self._archive_disabled:
             return None
         try:
             formatted = MemoryStore._format_messages(messages)
@@ -470,7 +484,13 @@ class Consolidator:
 
         The budget reserves space for completion tokens and a safety buffer
         so the LLM request never exceeds the context window.
+
+        When ``archive_disabled=True`` this returns immediately — for guest
+        agents, long-term consolidation is off entirely; oversized sessions
+        rely on their own trimming/TTL instead of memory writes.
         """
+        if self._archive_disabled:
+            return
         if not session.messages or self.context_window_tokens <= 0:
             return
 
