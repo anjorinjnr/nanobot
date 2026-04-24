@@ -154,6 +154,7 @@ ignore = [
     "I001",    # import sorting — too noisy to enforce now
     "N803",    # argument name casing — upstream convention
     "N806",    # variable name casing — upstream convention
+    "N818",    # error-suffix on exception name — upstream naming
     "W291",    # trailing whitespace
     "W293",    # blank line whitespace
     "ASYNC109",  # timeout in async — false positives
