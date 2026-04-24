@@ -938,9 +938,8 @@ class AgentLoop:
             final_content = EMPTY_FINAL_RESPONSE_MESSAGE
             stop_reason = STOP_EMPTY_FINAL
 
-        # Skip past: system prompt (1) + optional ephemeral scope_ctx + prior
-        # session history. Everything beyond that is the current turn's new
-        # messages that must be persisted.
+        # Skip system prompt + ephemeral scope_ctx (if any) + prior history;
+        # what's left is the current turn's new messages.
         skip = 1 + (1 if scope_ctx_injected else 0) + len(history)
         self._save_turn(session, all_msgs, skip, usage=self._last_usage)
         self._clear_runtime_checkpoint(session)
