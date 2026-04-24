@@ -90,6 +90,7 @@ class AgentDefaults(Base):
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
     scope_context_provider: str = ""  # "module:function" to inject per-sender scope context into guest turns. Empty = disabled.
+    disable_memory_writes: bool = False  # Suppress Consolidator/AutoCompact writes to memory/*.md and session _last_summary. Set for guest agents whose sessions cross scope/sender boundaries.
     session_ttl_minutes: int = Field(
         default=0,
         ge=0,
