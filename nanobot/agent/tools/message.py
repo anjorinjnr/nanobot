@@ -1,12 +1,13 @@
 """Message tool for sending messages to users."""
 
 import asyncio
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable, Iterator
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import TASK_TAG_META_KEY, OutboundMessage
 
 
 @tool_parameters(
@@ -43,10 +44,6 @@ class MessageTool(Tool):
             default=default_message_id,
         )
         self._sent_in_turn_var: ContextVar[bool] = ContextVar("message_sent_in_turn", default=False)
-        # Heartbeat path sets these per-tick so the model can't message channels
-        # outside the task's Recipients (the LLM has been observed rotating
-        # whatsapp/email/telegram while Recipients only listed whatsapp), and so
-        # the spam guard can dedup per-task instead of per-content-hash.
         self._allowed_channels: ContextVar[frozenset[str] | None] = ContextVar(
             "message_allowed_channels", default=None
         )
@@ -60,25 +57,35 @@ class MessageTool(Tool):
         self._default_chat_id.set(chat_id)
         self._default_message_id.set(message_id)
 
-    def set_allowed_channels(self, channels: set[str] | frozenset[str] | None):
-        """Restrict this tool to a fixed set of channels for the current ContextVar scope.
+    @contextmanager
+    def scoped(
+        self,
+        *,
+        allowed_channels: Iterable[str] | None = None,
+        task_tag: str | None = None,
+    ) -> Iterator[None]:
+        """Scope routing constraints to a single ``with`` block.
 
-        ``None`` (default) means no restriction. Pass an empty set to block all
-        sends. Returns the token from ContextVar.set so the caller can ``reset``.
+        ``allowed_channels`` (when not ``None``) refuses ``message`` calls to
+        any channel outside the set — used by the heartbeat path to honor a
+        task's Recipients field. ``task_tag`` propagates into outbound
+        metadata so ChannelManager's spam guard can dedup per (recipient,
+        task) instead of per content hash. Both are ContextVar-scoped, so
+        nested or concurrent scopes don't leak.
         """
-        return self._allowed_channels.set(
-            frozenset(c.lower() for c in channels) if channels is not None else None
+        channel_token = (
+            self._allowed_channels.set(frozenset(c.lower() for c in allowed_channels))
+            if allowed_channels is not None
+            else None
         )
-
-    def reset_allowed_channels(self, token) -> None:
-        self._allowed_channels.reset(token)
-
-    def set_task_tag(self, tag: str | None):
-        """Tag outgoing messages with a stable task identifier for spam-guard keying."""
-        return self._task_tag.set(tag)
-
-    def reset_task_tag(self, token) -> None:
-        self._task_tag.reset(token)
+        tag_token = self._task_tag.set(task_tag) if task_tag else None
+        try:
+            yield
+        finally:
+            if channel_token is not None:
+                self._allowed_channels.reset(channel_token)
+            if tag_token is not None:
+                self._task_tag.reset(tag_token)
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -163,7 +170,7 @@ class MessageTool(Tool):
         if message_id:
             metadata["message_id"] = message_id
         if (tag := self._task_tag.get()):
-            metadata["_task_tag"] = tag
+            metadata[TASK_TAG_META_KEY] = tag
 
         msg = OutboundMessage(
             channel=channel,

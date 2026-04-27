@@ -25,6 +25,41 @@ _SCHED_PAT = re.compile(r"Schedule:\s*(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)")
 _RECUR_PAT = re.compile(r"Recur:\s*every\s+(\d+)\s+(minute|hour|day|week)s?", re.IGNORECASE)
 _UNTIL_PAT = re.compile(r"Until:\s*(\d{4}-\d{2}-\d{2})")
 _LASTRUN_PAT = re.compile(r"Last-run:[^\n]*")
+_LASTRUN_VALUE_PAT = re.compile(r"Last-run:\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)")
+_RECIPIENTS_PAT = re.compile(r"^Recipients:\s*(.+)", re.MULTILINE)
+
+
+def _effective_due(
+    block: str, schedule_dt: datetime, schedule_str: str
+) -> tuple[datetime, str]:
+    """Resolve when a recurring task is next allowed to fire.
+
+    Schedule is the floor: Last-run + Recur cannot push the due time
+    earlier than it (that's the regression — a future Schedule from a
+    --tick or pause must not be undermined by stale Last-run math).
+    Returns the effective datetime and a display string for prompts.
+    """
+    lr_match = _LASTRUN_VALUE_PAT.search(block)
+    recur_match = _RECUR_PAT.search(block)
+    if not (lr_match and recur_match):
+        return schedule_dt, schedule_str
+    try:
+        lr_str = lr_match.group(1).strip()
+        last_run_dt = datetime.strptime(
+            lr_str, "%Y-%m-%d %H:%M" if " " in lr_str else "%Y-%m-%d"
+        )
+        amount = int(recur_match.group(1))
+        unit = recur_match.group(2).lower()
+        delta = {
+            "minute": timedelta(minutes=amount),
+            "hour": timedelta(hours=amount),
+            "day": timedelta(days=amount),
+            "week": timedelta(weeks=amount),
+        }.get(unit, timedelta())
+    except (ValueError, KeyError):
+        return schedule_dt, schedule_str
+    effective = max(schedule_dt, last_run_dt + delta)
+    return effective, effective.strftime("%Y-%m-%d %H:%M")
 
 def filter_heartbeat_response(
     resp: OutboundMessage | None,
@@ -154,10 +189,6 @@ class HeartbeatService:
         self.model = model
         self.on_execute = on_execute
         self.on_notify = on_notify
-        # Optional setup/teardown hook that runs around each on_execute call.
-        # Returns a context manager so the caller can install per-group state
-        # (e.g. constrain MessageTool to the tasks' Recipients channels) and
-        # tear it down regardless of how on_execute returns.
         self.on_execute_context = on_execute_context
         self.interval_s = interval_s
         self.enabled = enabled
@@ -257,39 +288,10 @@ class HeartbeatService:
             pre_check_match = re.search(r"^Pre-check:\s*(\S+)", block, re.MULTILINE)
             pre_check = pre_check_match.group(1).strip() if pre_check_match else None
 
-            recipients_match = re.search(r"^Recipients:\s*(.+)", block, re.MULTILINE)
+            recipients_match = _RECIPIENTS_PAT.search(block)
             recipients = recipients_match.group(1).strip() if recipients_match else None
 
-            # Effective due is whichever is later: the explicit Schedule
-            # (which may have been pushed to the future via tasks_update --tick
-            # or a manual pause) and Last-run + Recur (the natural cadence).
-            # Taking the max means a future Schedule acts as a floor — the
-            # task can't be due before the scheduled date — while the cadence
-            # check still suppresses repeat firings between heartbeat ticks.
-            effective_due = schedule_dt
-            last_run_match = re.search(
-                r"Last-run:\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)", block
-            )
-            recur_match = _RECUR_PAT.search(block)
-            if last_run_match and recur_match:
-                try:
-                    lr_str = last_run_match.group(1).strip()
-                    if " " in lr_str:
-                        last_run_dt = datetime.strptime(lr_str, "%Y-%m-%d %H:%M")
-                    else:
-                        last_run_dt = datetime.strptime(lr_str, "%Y-%m-%d")
-                    amount = int(recur_match.group(1))
-                    unit = recur_match.group(2).lower()
-                    delta = {
-                        "minute": timedelta(minutes=amount),
-                        "hour": timedelta(hours=amount),
-                        "day": timedelta(days=amount),
-                        "week": timedelta(weeks=amount),
-                    }.get(unit, timedelta())
-                    effective_due = max(schedule_dt, last_run_dt + delta)
-                except (ValueError, KeyError):
-                    pass  # fall back to schedule_dt
-
+            effective_due, _ = _effective_due(block, schedule_dt, schedule_str)
             if now >= effective_due:
                 due.append(DueTask(
                     name=task_name, task_type=task_type, schedule=schedule_str,
@@ -359,33 +361,7 @@ class HeartbeatService:
                 except ValueError:
                     pass
 
-            # See _compute_due_tasks for the rationale: take whichever is later
-            # so a future Schedule isn't bypassed by Last-run + Recur math.
-            effective_due = schedule_dt
-            effective_due_str = schedule_str
-            last_run_match = re.search(
-                r"Last-run:\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)", block
-            )
-            recur_match = _RECUR_PAT.search(block)
-            if last_run_match and recur_match:
-                try:
-                    lr_str = last_run_match.group(1).strip()
-                    if " " in lr_str:
-                        last_run_dt = datetime.strptime(lr_str, "%Y-%m-%d %H:%M")
-                    else:
-                        last_run_dt = datetime.strptime(lr_str, "%Y-%m-%d")
-                    amount = int(recur_match.group(1))
-                    unit = recur_match.group(2).lower()
-                    delta = {
-                        "minute": timedelta(minutes=amount),
-                        "hour": timedelta(hours=amount),
-                        "day": timedelta(days=amount),
-                        "week": timedelta(weeks=amount),
-                    }.get(unit, timedelta())
-                    effective_due = max(schedule_dt, last_run_dt + delta)
-                    effective_due_str = effective_due.strftime("%Y-%m-%d %H:%M")
-                except (ValueError, KeyError):
-                    pass
+            effective_due, effective_due_str = _effective_due(block, schedule_dt, schedule_str)
 
             now_str = now.strftime("%Y-%m-%d %H:%M")
             if now >= effective_due:
@@ -611,12 +587,9 @@ class HeartbeatService:
             except ValueError:
                 continue
 
-            # If the LLM already called --tick during execution, the schedule
-            # will already be in the future — skip the Schedule advance to
-            # avoid double-advancing, but still bump Last-run to now so a
-            # subsequent _compute_due_tasks tick (which uses
-            # max(Schedule, Last-run + Recur)) doesn't immediately re-fire
-            # the same task on the next heartbeat.
+            # Already-future Schedule: skip the bump, but still write
+            # Last-run so the cadence check doesn't immediately re-fire
+            # this task on the next tick.
             if current_dt > now_naive:
                 logger.info("Heartbeat: '{}' schedule already advanced, bumping Last-run", task.name)
                 if _LASTRUN_PAT.search(block):

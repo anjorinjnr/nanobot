@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import TASK_TAG_META_KEY, OutboundMessage
 from nanobot.channels.manager import ChannelManager
 from nanobot.config.schema import SpamGuardConfig
 
@@ -144,14 +144,14 @@ class TestSpamGuard:
         # is per (recipient, task) — wording can vary arbitrarily and we
         # still suppress repeats from the same task to the same chat.
         mgr = _make_manager()
-        meta = {"_task_tag": "Balance check"}
+        meta = {TASK_TAG_META_KEY: "Balance check"}
         assert mgr._is_spam(_msg(content="apple", metadata=meta)) is False
         assert mgr._is_spam(_msg(content="banana", metadata=meta)) is False
         assert mgr._is_spam(_msg(content="cherry", metadata=meta)) is True
 
     def test_task_tag_isolated_per_recipient(self):
         mgr = _make_manager()
-        meta = {"_task_tag": "Balance check"}
+        meta = {TASK_TAG_META_KEY: "Balance check"}
         for _ in range(3):
             mgr._is_spam(_msg(chat_id="user1", metadata=meta))
         # Other recipient unaffected

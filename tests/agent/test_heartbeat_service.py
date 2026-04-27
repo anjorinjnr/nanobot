@@ -506,10 +506,8 @@ def test_compute_due_tasks_system_task_not_due() -> None:
 
 
 def test_compute_due_tasks_future_schedule_overrides_stale_last_run() -> None:
-    # Repro of the prod Balance-check spam: Schedule pushed weeks ahead (e.g.
-    # by --tick or a manual pause) plus a stale Last-run + Recur combination
-    # that, alone, would mark the task due. effective_due must respect the
-    # later of Schedule and Last-run + Recur — Schedule is the floor.
+    # Regression: future Schedule (--tick or pause) must not be undermined
+    # by a stale Last-run + Recur that points to the past.
     now = datetime(2026, 4, 27, 19, 30)
     content = _make_heartbeat(
         "\n### Balance check\n"
@@ -547,10 +545,8 @@ def test_due_task_recipient_channels_handles_mixed_and_missing() -> None:
 
 @pytest.mark.asyncio
 async def test_on_execute_context_wraps_execution(tmp_path) -> None:
-    # The CLI uses on_execute_context to clamp MessageTool to the task's
-    # Recipients channels and tag outgoing sends. Verify the hook fires
-    # around on_execute with the right tasks list and is torn down even if
-    # on_execute raises.
+    # Hook must run around on_execute with the group's tasks and tear down
+    # even when on_execute raises.
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     heartbeat = _make_heartbeat(
         f"\n### Balance check\nType: system\nSchedule: {past}\nRecur: every 1 day\n"
@@ -594,9 +590,7 @@ async def test_on_execute_context_wraps_execution(tmp_path) -> None:
 
 
 def test_compute_task_statuses_future_schedule_overrides_stale_last_run() -> None:
-    # The LLM-facing status string must agree with _compute_due_tasks so the
-    # heartbeat doesn't tell the model "DUE NOW" while the deterministic
-    # decider says skip.
+    # Status string must agree with _compute_due_tasks (no "DUE NOW" / skip drift).
     now = datetime(2026, 4, 27, 19, 30)
     content = _make_heartbeat(
         "\n### Balance check\n"

@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import TASK_TAG_META_KEY, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
 from nanobot.utils.restart import consume_restart_notice_from_env, format_restart_completed_message
+
+_DIGIT_PAT = re.compile(r"\d+")
+_NONALPHA_PAT = re.compile(r"[^a-z]+")
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
@@ -280,16 +284,13 @@ class ChannelManager:
 
     @staticmethod
     def _spam_dedup_key_part(content: str) -> str:
-        """Stable normalized fingerprint used when no per-task tag is available.
+        """Normalized fingerprint that collapses date-style drift.
 
-        Lower-cases, drops digits, collapses non-word characters into single
-        spaces and trims, then hashes. This catches LLM wording drift like
-        "scheduled for May 18" vs "scheduled for Monday, May 18, 2026" that
-        otherwise produce different hashes for the same intent.
+        Pre-fix the exact-content hash treated "May 18" and "May 19" as
+        distinct, so the same templated heartbeat message could spam every
+        tick as its embedded date crept forward.
         """
-        import re as _re
-        normalized = _re.sub(r"\d+", "", content.lower())
-        normalized = _re.sub(r"[^a-z]+", " ", normalized).strip()
+        normalized = _NONALPHA_PAT.sub(" ", _DIGIT_PAT.sub("", content.lower())).strip()
         if not normalized:
             normalized = content.strip().lower()
         return hashlib.sha256(
@@ -308,15 +309,8 @@ class ChannelManager:
             return False
 
         sg = self.config.channels.spam_guard
-        # When the heartbeat path tags a message with a task identifier, key
-        # the dedup window on (recipient, task) rather than content. That
-        # way wording drift between heartbeat ticks (May 18 vs Monday May 18)
-        # can't slip past the guard the way pure content hashing does.
-        tag = meta.get("_task_tag")
-        if tag:
-            key_part = f"task:{tag}"
-        else:
-            key_part = self._spam_dedup_key_part(msg.content)
+        tag = meta.get(TASK_TAG_META_KEY)
+        key_part = f"task:{tag}" if tag else self._spam_dedup_key_part(msg.content)
         key = (msg.channel, msg.chat_id or "", key_part)
         now = time.monotonic()
 

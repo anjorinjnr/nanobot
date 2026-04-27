@@ -855,28 +855,21 @@ def _run_gateway(
 
     @contextmanager
     def heartbeat_execute_context(group_tasks: list[DueTask]):
-        """Per-group setup: clamp MessageTool to Recipients channels and tag
-        outgoing sends with a task-level identifier so the spam guard can dedup
-        across LLM wording drift instead of only on identical content."""
+        """Clamp MessageTool to the group's Recipients channels and tag
+        outgoing sends so the spam guard can dedup per task."""
         message_tool = agent.tools.get("message")
-        channel_token = tag_token = None
-        if isinstance(message_tool, MessageTool):
-            allowed: set[str] = set()
-            for t in group_tasks:
-                allowed |= t.recipient_channels()
-            if allowed:
-                channel_token = message_tool.set_allowed_channels(allowed)
-            tag = ",".join(sorted({t.name for t in group_tasks if t.task_type != "announcement"}))
-            if tag:
-                tag_token = message_tool.set_task_tag(tag)
-        try:
+        if not isinstance(message_tool, MessageTool):
             yield
-        finally:
-            if isinstance(message_tool, MessageTool):
-                if channel_token is not None:
-                    message_tool.reset_allowed_channels(channel_token)
-                if tag_token is not None:
-                    message_tool.reset_task_tag(tag_token)
+            return
+        allowed: set[str] = set()
+        for t in group_tasks:
+            allowed |= t.recipient_channels()
+        tag = ",".join(sorted({t.name for t in group_tasks if t.task_type != "announcement"}))
+        with message_tool.scoped(
+            allowed_channels=allowed or None,
+            task_tag=tag or None,
+        ):
+            yield
 
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(

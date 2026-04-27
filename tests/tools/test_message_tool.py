@@ -3,7 +3,7 @@ from typing import Any
 import pytest
 
 from nanobot.agent.tools.message import MessageTool
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import TASK_TAG_META_KEY, OutboundMessage
 
 
 @pytest.mark.asyncio
@@ -25,50 +25,50 @@ def _capture_send_callback() -> tuple[Any, list[OutboundMessage]]:
 
 
 @pytest.mark.asyncio
-async def test_allowed_channels_blocks_disallowed_channel() -> None:
-    # The heartbeat path clamps MessageTool to the channels listed in a task's
-    # Recipients field so the LLM can't fan out to email/telegram when a task
-    # asked for whatsapp only — the prod Balance-check failure mode.
+async def test_scoped_blocks_disallowed_channel() -> None:
+    # Heartbeat clamps MessageTool to the task's Recipients channels so the
+    # LLM can't fan out to email/telegram when a task asked for whatsapp.
     send, sent = _capture_send_callback()
     tool = MessageTool(send_callback=send)
-    token = tool.set_allowed_channels({"whatsapp"})
-    try:
+    with tool.scoped(allowed_channels={"whatsapp"}):
         result = await tool.execute(content="hi", channel="email", chat_id="x@y")
-    finally:
-        tool.reset_allowed_channels(token)
     assert "not permitted" in result
     assert sent == []
 
 
 @pytest.mark.asyncio
-async def test_allowed_channels_permits_listed_channel() -> None:
+async def test_scoped_permits_listed_channel_case_insensitive() -> None:
     send, sent = _capture_send_callback()
     tool = MessageTool(send_callback=send)
-    token = tool.set_allowed_channels({"whatsapp"})
-    try:
+    with tool.scoped(allowed_channels={"whatsapp"}):
         result = await tool.execute(content="hi", channel="WhatsApp", chat_id="123")
-    finally:
-        tool.reset_allowed_channels(token)
     assert result.startswith("Message sent")
     assert len(sent) == 1
 
 
 @pytest.mark.asyncio
-async def test_task_tag_propagates_to_outbound_metadata() -> None:
-    # Spam guard relies on the _task_tag metadata to dedup heartbeat repeats
-    # per (recipient, task) instead of per content hash.
+async def test_scoped_task_tag_propagates_to_outbound_metadata() -> None:
     send, sent = _capture_send_callback()
     tool = MessageTool(send_callback=send)
-    token = tool.set_task_tag("Balance check")
-    try:
+    with tool.scoped(task_tag="Balance check"):
         await tool.execute(content="hi", channel="whatsapp", chat_id="123")
-    finally:
-        tool.reset_task_tag(token)
-    assert sent[0].metadata.get("_task_tag") == "Balance check"
+    assert sent[0].metadata.get(TASK_TAG_META_KEY) == "Balance check"
 
 
 @pytest.mark.asyncio
-async def test_no_allow_list_means_no_restriction() -> None:
+async def test_scoped_releases_on_exit() -> None:
+    # Exit unblocks the channel and clears the tag — verifies finally runs.
+    send, sent = _capture_send_callback()
+    tool = MessageTool(send_callback=send)
+    with tool.scoped(allowed_channels={"whatsapp"}, task_tag="X"):
+        pass
+    result = await tool.execute(content="hi", channel="email", chat_id="x@y")
+    assert result.startswith("Message sent")
+    assert TASK_TAG_META_KEY not in sent[0].metadata
+
+
+@pytest.mark.asyncio
+async def test_no_scope_means_no_restriction() -> None:
     send, sent = _capture_send_callback()
     tool = MessageTool(send_callback=send)
     result = await tool.execute(content="hi", channel="email", chat_id="x@y")

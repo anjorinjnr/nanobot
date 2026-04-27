@@ -5,6 +5,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+# Metadata key for tagging outbound messages with the heartbeat task they
+# originated from. ChannelManager's spam guard uses it to dedup heartbeat
+# repeats per (recipient, task) instead of per content hash.
+TASK_TAG_META_KEY = "_task_tag"
+
 
 @dataclass
 class InboundMessage:
