@@ -505,6 +505,116 @@ def test_compute_due_tasks_system_task_not_due() -> None:
     assert due == []
 
 
+def test_compute_due_tasks_future_schedule_overrides_stale_last_run() -> None:
+    # Regression: future Schedule (--tick or pause) must not be undermined
+    # by a stale Last-run + Recur that points to the past.
+    now = datetime(2026, 4, 27, 19, 30)
+    content = _make_heartbeat(
+        "\n### Balance check\n"
+        "Type: system\n"
+        "Schedule: 2026-05-18 09:00\n"
+        "Last-run: 2026-04-26 13:41\n"
+        "Recur: every 1 day\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now)
+    assert due == []
+
+
+def test_compute_due_tasks_extracts_recipients() -> None:
+    now = datetime(2026, 3, 12, 10, 0)
+    past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+    content = _make_heartbeat(
+        f"\n### Balance check\nType: system\nSchedule: {past}\nRecur: every 1 hour\n"
+        "Recipients: primary:whatsapp,seun:whatsapp\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now)
+    assert len(due) == 1
+    assert due[0].recipients == "primary:whatsapp,seun:whatsapp"
+    assert due[0].recipient_channels() == {"whatsapp"}
+
+
+def test_due_task_recipient_channels_handles_mixed_and_missing() -> None:
+    assert DueTask(name="x", task_type="system", schedule=None).recipient_channels() == set()
+    multi = DueTask(
+        name="x", task_type="system", schedule=None,
+        recipients="primary:whatsapp, alex:Telegram , junk-no-colon, ops:email",
+    )
+    assert multi.recipient_channels() == {"whatsapp", "telegram", "email"}
+
+
+def test_due_task_recipient_channels_email_id_keeps_only_trailing_channel() -> None:
+    # IDs may contain colons (e.g. user@host:whatsapp). rsplit splits on the
+    # last colon so the channel is correctly extracted.
+    task = DueTask(
+        name="x", task_type="system", schedule=None,
+        recipients="ops@example.com:whatsapp, host:port:telegram",
+    )
+    assert task.recipient_channels() == {"whatsapp", "telegram"}
+
+
+@pytest.mark.asyncio
+async def test_on_execute_context_wraps_execution(tmp_path) -> None:
+    # Hook must run around on_execute with the group's tasks and tear down
+    # even when on_execute raises.
+    past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+    heartbeat = _make_heartbeat(
+        f"\n### Balance check\nType: system\nSchedule: {past}\nRecur: every 1 day\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    (tmp_path / "HEARTBEAT.md").write_text(heartbeat, encoding="utf-8")
+
+    enter_calls: list[list[DueTask]] = []
+    exit_calls: list[bool] = []
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def hook(group_tasks):
+        enter_calls.append(list(group_tasks))
+        try:
+            yield
+        finally:
+            exit_calls.append(True)
+
+    async def boom(_summary, _model):
+        raise RuntimeError("nope")
+
+    async def mock_eval(*a, **kw):
+        return False
+
+    service = HeartbeatService(
+        workspace=tmp_path, provider=DummyProvider([]), model="test",
+        on_execute=boom,
+        on_execute_context=hook,
+        last_run_tracking=True,
+    )
+
+    with patch("nanobot.utils.evaluator.evaluate_response", mock_eval):
+        await service._tick()
+
+    assert len(enter_calls) == 1
+    assert enter_calls[0][0].name == "Balance check"
+    assert enter_calls[0][0].recipients == "primary:whatsapp"
+    assert exit_calls == [True]
+
+
+def test_compute_task_statuses_future_schedule_overrides_stale_last_run() -> None:
+    # Status string must agree with _compute_due_tasks (no "DUE NOW" / skip drift).
+    now = datetime(2026, 4, 27, 19, 30)
+    content = _make_heartbeat(
+        "\n### Balance check\n"
+        "Type: system\n"
+        "Schedule: 2026-05-18 09:00\n"
+        "Last-run: 2026-04-26 13:41\n"
+        "Recur: every 1 day\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    status = HeartbeatService._compute_task_statuses(content, now)
+    assert "IS DUE NOW" not in status
+    assert "is NOT due until 2026-05-18" in status
+
+
 # ---------------------------------------------------------------------------
 # _compute_due_tasks — Until / expiry
 # ---------------------------------------------------------------------------
@@ -1485,6 +1595,27 @@ def test_advance_schedules_skips_already_advanced(advance_service) -> None:
     updated = service.heartbeat_file.read_text()
     # Should stay at 11:00, NOT advance to 12:00
     assert "Schedule: 2026-03-12 11:00" in updated
+    # But Last-run must still be bumped, so a stale Last-run + Recur can't
+    # mark the same task due again on the very next tick (regression: this
+    # gap is what caused the prod Balance-check spam loop).
+    assert "Last-run: 2026-03-12 10:30" in updated
+
+
+def test_advance_schedules_future_schedule_creates_last_run(advance_service) -> None:
+    """When Schedule is already future and no Last-run exists, write one."""
+    now = datetime(2026, 3, 12, 10, 30)
+    heartbeat = _make_heartbeat(
+        "\n### Balance check\nType: system\nSchedule: 2026-04-01 09:00\nRecur: every 1 day\n"
+    )
+    service = advance_service(heartbeat)
+    tasks = [DueTask(name="Balance check", task_type="system", schedule="2026-04-01 09:00")]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    assert "Schedule: 2026-04-01 09:00" in updated
+    assert "Last-run: 2026-03-12 10:30" in updated
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,13 @@
 """Message tool for sending messages to users."""
 
 import asyncio
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable, Iterator
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import TASK_TAG_META_KEY, OutboundMessage
 
 
 @tool_parameters(
@@ -43,12 +44,48 @@ class MessageTool(Tool):
             default=default_message_id,
         )
         self._sent_in_turn_var: ContextVar[bool] = ContextVar("message_sent_in_turn", default=False)
+        self._allowed_channels: ContextVar[frozenset[str] | None] = ContextVar(
+            "message_allowed_channels", default=None
+        )
+        self._task_tag: ContextVar[str | None] = ContextVar(
+            "message_task_tag", default=None
+        )
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Set the current message context."""
         self._default_channel.set(channel)
         self._default_chat_id.set(chat_id)
         self._default_message_id.set(message_id)
+
+    @contextmanager
+    def scoped(
+        self,
+        *,
+        allowed_channels: Iterable[str] | None = None,
+        task_tag: str | None = None,
+    ) -> Iterator[None]:
+        """Scope routing constraints to a single ``with`` block.
+
+        ``allowed_channels`` (when not ``None``) refuses ``message`` calls to
+        any channel outside the set — used by the heartbeat path to honor a
+        task's Recipients field. ``task_tag`` propagates into outbound
+        metadata so ChannelManager's spam guard can dedup per (recipient,
+        task) instead of per content hash. Both are ContextVar-scoped, so
+        nested or concurrent scopes don't leak.
+        """
+        channel_token = (
+            self._allowed_channels.set(frozenset(c.lower() for c in allowed_channels))
+            if allowed_channels is not None
+            else None
+        )
+        tag_token = self._task_tag.set(task_tag) if task_tag else None
+        try:
+            yield
+        finally:
+            if channel_token is not None:
+                self._allowed_channels.reset(channel_token)
+            if tag_token is not None:
+                self._task_tag.reset(tag_token)
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -115,11 +152,25 @@ class MessageTool(Tool):
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
 
+        allowed = self._allowed_channels.get()
+        if allowed is not None and channel.lower() not in allowed:
+            allowed_list = ", ".join(sorted(allowed)) or "none"
+            return (
+                f"Error: channel {channel!r} is not permitted in this context. "
+                f"Allowed channels: {allowed_list}."
+            )
+
         if not self._send_callback:
             return "Error: Message sending not configured"
 
         loop = asyncio.get_running_loop()
         delivery_future: asyncio.Future[None] = loop.create_future()
+
+        metadata: dict[str, Any] = {}
+        if message_id:
+            metadata["message_id"] = message_id
+        if (tag := self._task_tag.get()):
+            metadata[TASK_TAG_META_KEY] = tag
 
         msg = OutboundMessage(
             channel=channel,
@@ -127,9 +178,7 @@ class MessageTool(Tool):
             content=content,
             media=media or [],
             buttons=buttons or [],
-            metadata={
-                "message_id": message_id,
-            } if message_id else {},
+            metadata=metadata,
             _delivery_future=delivery_future,
         )
 

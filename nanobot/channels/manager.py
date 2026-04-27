@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import TASK_TAG_META_KEY, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
 from nanobot.utils.restart import consume_restart_notice_from_env, format_restart_completed_message
+
+_DIGIT_PAT = re.compile(r"\d+")
+_NONALNUM_PAT = re.compile(r"[^a-z0-9]+")
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
@@ -278,6 +282,25 @@ class ChannelManager:
             except asyncio.CancelledError:
                 break
 
+    @staticmethod
+    def _spam_dedup_key_part(content: str) -> str:
+        """Normalized fingerprint that collapses numeric drift.
+
+        Pre-fix the exact-content hash treated "May 18" and "May 19" as
+        distinct, so a templated heartbeat message could spam every tick
+        as its embedded date crept forward. Digits collapse to a single
+        ``0`` so dates and amounts of the same template still alias, but
+        non-numeric tokens around them remain distinct (so "$50 to Mom"
+        and "$50 to Dad" do not collide).
+        """
+        digit_collapsed = _DIGIT_PAT.sub("0", content.lower())
+        normalized = _NONALNUM_PAT.sub(" ", digit_collapsed).strip()
+        if not normalized:
+            normalized = content.strip().lower()
+        return hashlib.sha256(
+            normalized.encode("utf-8", errors="replace")
+        ).hexdigest()[:12]
+
     def _is_spam(self, msg: OutboundMessage) -> bool:
         """Check if a message is a near-duplicate sent too many times recently.
 
@@ -290,10 +313,9 @@ class ChannelManager:
             return False
 
         sg = self.config.channels.spam_guard
-        content_hash = hashlib.sha256(
-            msg.content.strip().encode("utf-8", errors="replace")
-        ).hexdigest()[:12]
-        key = (msg.channel, msg.chat_id or "", content_hash)
+        tag = meta.get(TASK_TAG_META_KEY)
+        key_part = f"task:{tag}" if tag else self._spam_dedup_key_part(msg.content)
+        key = (msg.channel, msg.chat_id or "", key_part)
         now = time.monotonic()
 
         # Prune expired entries for this key

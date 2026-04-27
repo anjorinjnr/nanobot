@@ -8,6 +8,7 @@ import shlex
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Literal
 
 from loguru import logger
@@ -24,6 +25,43 @@ _SCHED_PAT = re.compile(r"Schedule:\s*(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)")
 _RECUR_PAT = re.compile(r"Recur:\s*every\s+(\d+)\s+(minute|hour|day|week)s?", re.IGNORECASE)
 _UNTIL_PAT = re.compile(r"Until:\s*(\d{4}-\d{2}-\d{2})")
 _LASTRUN_PAT = re.compile(r"Last-run:[^\n]*")
+_LASTRUN_VALUE_PAT = re.compile(
+    r"^Last-run:\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)", re.MULTILINE
+)
+_RECIPIENTS_PAT = re.compile(r"^Recipients:\s*(.+)", re.MULTILINE)
+
+
+def _effective_due(
+    block: str, schedule_dt: datetime, schedule_str: str
+) -> tuple[datetime, str]:
+    """Resolve when a recurring task is next allowed to fire.
+
+    Schedule is the floor: Last-run + Recur cannot push the due time
+    earlier than it (that's the regression — a future Schedule from a
+    --tick or pause must not be undermined by stale Last-run math).
+    Returns the effective datetime and a display string for prompts.
+    """
+    lr_match = _LASTRUN_VALUE_PAT.search(block)
+    recur_match = _RECUR_PAT.search(block)
+    if not (lr_match and recur_match):
+        return schedule_dt, schedule_str
+    try:
+        lr_str = lr_match.group(1).strip()
+        last_run_dt = datetime.strptime(
+            lr_str, "%Y-%m-%d %H:%M" if " " in lr_str else "%Y-%m-%d"
+        )
+        amount = int(recur_match.group(1))
+        unit = recur_match.group(2).lower()
+        delta = {
+            "minute": timedelta(minutes=amount),
+            "hour": timedelta(hours=amount),
+            "day": timedelta(days=amount),
+            "week": timedelta(weeks=amount),
+        }.get(unit, timedelta())
+    except (ValueError, KeyError):
+        return schedule_dt, schedule_str
+    effective = max(schedule_dt, last_run_dt + delta)
+    return effective, effective.strftime("%Y-%m-%d %H:%M")
 
 def filter_heartbeat_response(
     resp: OutboundMessage | None,
@@ -91,6 +129,32 @@ class DueTask:
     schedule: str | None  # None for announcements
     model: str | None = None  # Optional per-task model override
     pre_check: str | None = None  # Optional command to run before LLM dispatch
+    recipients: str | None = None  # Raw Recipients line, e.g. "primary:whatsapp,seun:whatsapp"
+
+    def recipient_channels(self) -> set[str]:
+        """Channel suffixes parsed from Recipients (e.g. {"whatsapp"}).
+
+        Empty set means no Recipients field (fall through to caller defaults).
+        Each entry is `<id>:<channel>`; we keep just the trailing channel.
+        Splits on the LAST colon so id can contain ones (e.g. email-like ids).
+        """
+        if not self.recipients:
+            return set()
+        out: set[str] = set()
+        for entry in self.recipients.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if ":" not in entry:
+                logger.warning(
+                    "DueTask {!r}: skipping malformed recipient {!r} (no channel suffix)",
+                    self.name, entry,
+                )
+                continue
+            channel = entry.rsplit(":", 1)[-1].strip().lower()
+            if channel:
+                out.add(channel)
+        return out
 
 
 MODEL_PRESETS: dict[str, str] = {
@@ -121,6 +185,9 @@ class HeartbeatService:
         model: str,
         on_execute: Callable[[str, str | None], Coroutine[Any, Any, str]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        on_execute_context: (
+            Callable[[list["DueTask"]], AbstractContextManager[None]] | None
+        ) = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
         last_run_tracking: bool = False,
@@ -133,6 +200,7 @@ class HeartbeatService:
         self.model = model
         self.on_execute = on_execute
         self.on_notify = on_notify
+        self.on_execute_context = on_execute_context
         self.interval_s = interval_s
         self.enabled = enabled
         self.last_run_tracking = last_run_tracking
@@ -231,35 +299,14 @@ class HeartbeatService:
             pre_check_match = re.search(r"^Pre-check:\s*(\S+)", block, re.MULTILINE)
             pre_check = pre_check_match.group(1).strip() if pre_check_match else None
 
-            # Determine effective due time considering Last-run + Recur
-            effective_due = schedule_dt
-            last_run_match = re.search(
-                r"Last-run:\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)", block
-            )
-            recur_match = _RECUR_PAT.search(block)
-            if last_run_match and recur_match:
-                try:
-                    lr_str = last_run_match.group(1).strip()
-                    if " " in lr_str:
-                        last_run_dt = datetime.strptime(lr_str, "%Y-%m-%d %H:%M")
-                    else:
-                        last_run_dt = datetime.strptime(lr_str, "%Y-%m-%d")
-                    amount = int(recur_match.group(1))
-                    unit = recur_match.group(2).lower()
-                    delta = {
-                        "minute": timedelta(minutes=amount),
-                        "hour": timedelta(hours=amount),
-                        "day": timedelta(days=amount),
-                        "week": timedelta(weeks=amount),
-                    }.get(unit, timedelta())
-                    effective_due = last_run_dt + delta
-                except (ValueError, KeyError):
-                    pass  # fall back to schedule_dt
+            recipients_match = _RECIPIENTS_PAT.search(block)
+            recipients = recipients_match.group(1).strip() if recipients_match else None
 
+            effective_due, _ = _effective_due(block, schedule_dt, schedule_str)
             if now >= effective_due:
                 due.append(DueTask(
                     name=task_name, task_type=task_type, schedule=schedule_str,
-                    model=model, pre_check=pre_check,
+                    model=model, pre_check=pre_check, recipients=recipients,
                 ))
 
         return due
@@ -325,32 +372,7 @@ class HeartbeatService:
                 except ValueError:
                     pass
 
-            # Determine effective due time considering Last-run + Recur
-            effective_due = schedule_dt
-            effective_due_str = schedule_str
-            last_run_match = re.search(
-                r"Last-run:\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)", block
-            )
-            recur_match = _RECUR_PAT.search(block)
-            if last_run_match and recur_match:
-                try:
-                    lr_str = last_run_match.group(1).strip()
-                    if " " in lr_str:
-                        last_run_dt = datetime.strptime(lr_str, "%Y-%m-%d %H:%M")
-                    else:
-                        last_run_dt = datetime.strptime(lr_str, "%Y-%m-%d")
-                    amount = int(recur_match.group(1))
-                    unit = recur_match.group(2).lower()
-                    delta = {
-                        "minute": timedelta(minutes=amount),
-                        "hour": timedelta(hours=amount),
-                        "day": timedelta(days=amount),
-                        "week": timedelta(weeks=amount),
-                    }.get(unit, timedelta())
-                    effective_due = last_run_dt + delta
-                    effective_due_str = effective_due.strftime("%Y-%m-%d %H:%M")
-                except (ValueError, KeyError):
-                    pass
+            effective_due, effective_due_str = _effective_due(block, schedule_dt, schedule_str)
 
             now_str = now.strftime("%Y-%m-%d %H:%M")
             if now >= effective_due:
@@ -523,9 +545,11 @@ class HeartbeatService:
         """Deterministically advance Schedule for executed recurring tasks.
 
         After a task executes, advance its Schedule past now by its Recur
-        interval and write Last-run.  This prevents the task from being
-        considered due again on the next heartbeat tick, regardless of
-        whether the LLM also calls tasks_update.py --tick.
+        interval and write Last-run.  When the LLM has already pushed
+        Schedule into the future (via --tick), the Schedule advance is
+        skipped but Last-run is still bumped — without that, a stale
+        Last-run would let the cadence check re-fire the task on the
+        very next tick.
 
         Re-reads HEARTBEAT.md fresh to avoid overwriting changes made
         during task execution (which can take 10-30s).
@@ -576,10 +600,23 @@ class HeartbeatService:
             except ValueError:
                 continue
 
-            # If the LLM already called --tick during execution, the schedule
-            # will already be in the future — skip to avoid double-advancing.
+            # Already-future Schedule: skip the bump, but still write
+            # Last-run so the cadence check doesn't immediately re-fire
+            # this task on the next tick.
             if current_dt > now_naive:
-                logger.info("Heartbeat: '{}' schedule already advanced, skipping", task.name)
+                logger.info("Heartbeat: '{}' schedule already advanced, bumping Last-run", task.name)
+                if _LASTRUN_PAT.search(block):
+                    updated_block = _LASTRUN_PAT.sub(f"Last-run: {now_str}", block, count=1)
+                else:
+                    updated_block = re.sub(
+                        r"(Schedule:[^\n]+)(\n|$)",
+                        rf"\1\nLast-run: {now_str}\2",
+                        block,
+                        count=1,
+                    )
+                if updated_block != block:
+                    content = content[:m.start()] + updated_block + content[m.end():]
+                    changed = True
                 continue
 
             if recur_unit == "minute":
@@ -679,8 +716,14 @@ class HeartbeatService:
 
                     for model_override, group_tasks in groups.items():
                         summary = ", ".join(f"{t.name} ({t.task_type})" for t in group_tasks)
+                        ctx = (
+                            self.on_execute_context(group_tasks)
+                            if self.on_execute_context
+                            else nullcontext()
+                        )
                         try:
-                            response = await self.on_execute(summary, model_override)
+                            with ctx:
+                                response = await self.on_execute(summary, model_override)
                             if response:
                                 should_notify = await evaluate_response(
                                     response, summary, self.provider, self.model,
