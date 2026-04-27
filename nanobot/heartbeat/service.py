@@ -558,6 +558,9 @@ class HeartbeatService:
         read-modify-write window runs under ``heartbeat_lock`` so
         concurrent ``tasks_update.py --tick`` invocations from the LLM
         can't race the advance.
+
+        Do not call while already holding ``heartbeat_lock`` — flock is
+        non-reentrant and would deadlock.
         """
         with heartbeat_lock(self.workspace):
             self._advance_schedules_locked(tasks)

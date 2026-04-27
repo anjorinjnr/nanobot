@@ -93,6 +93,9 @@ tmp/
 temp/
 *.tmp
 
+# Heartbeat-lock sibling file (created on first tick or mutation).
+.heartbeat.lock
+
 # Bridge build artifacts (Homer fork)
 bridge/node_modules/
 bridge/package-lock.json
