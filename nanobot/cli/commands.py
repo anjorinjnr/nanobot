@@ -864,7 +864,8 @@ def _run_gateway(
         allowed: set[str] = set()
         for t in group_tasks:
             allowed |= t.recipient_channels()
-        tag = ",".join(sorted({t.name for t in group_tasks if t.task_type != "announcement"}))
+        # Use "|" so task names that legitimately contain "," can't alias.
+        tag = "|".join(sorted({t.name for t in group_tasks if t.task_type != "announcement"}))
         with message_tool.scoped(
             allowed_channels=allowed or None,
             task_tag=tag or None,

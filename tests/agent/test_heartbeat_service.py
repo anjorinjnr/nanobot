@@ -543,6 +543,16 @@ def test_due_task_recipient_channels_handles_mixed_and_missing() -> None:
     assert multi.recipient_channels() == {"whatsapp", "telegram", "email"}
 
 
+def test_due_task_recipient_channels_email_id_keeps_only_trailing_channel() -> None:
+    # IDs may contain colons (e.g. user@host:whatsapp). rsplit splits on the
+    # last colon so the channel is correctly extracted.
+    task = DueTask(
+        name="x", task_type="system", schedule=None,
+        recipients="ops@example.com:whatsapp, host:port:telegram",
+    )
+    assert task.recipient_channels() == {"whatsapp", "telegram"}
+
+
 @pytest.mark.asyncio
 async def test_on_execute_context_wraps_execution(tmp_path) -> None:
     # Hook must run around on_execute with the group's tasks and tear down

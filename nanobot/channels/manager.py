@@ -18,7 +18,7 @@ from nanobot.config.schema import Config
 from nanobot.utils.restart import consume_restart_notice_from_env, format_restart_completed_message
 
 _DIGIT_PAT = re.compile(r"\d+")
-_NONALPHA_PAT = re.compile(r"[^a-z]+")
+_NONALNUM_PAT = re.compile(r"[^a-z0-9]+")
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
@@ -284,13 +284,17 @@ class ChannelManager:
 
     @staticmethod
     def _spam_dedup_key_part(content: str) -> str:
-        """Normalized fingerprint that collapses date-style drift.
+        """Normalized fingerprint that collapses numeric drift.
 
         Pre-fix the exact-content hash treated "May 18" and "May 19" as
-        distinct, so the same templated heartbeat message could spam every
-        tick as its embedded date crept forward.
+        distinct, so a templated heartbeat message could spam every tick
+        as its embedded date crept forward. Digits collapse to a single
+        ``0`` so dates and amounts of the same template still alias, but
+        non-numeric tokens around them remain distinct (so "$50 to Mom"
+        and "$50 to Dad" do not collide).
         """
-        normalized = _NONALPHA_PAT.sub(" ", _DIGIT_PAT.sub("", content.lower())).strip()
+        digit_collapsed = _DIGIT_PAT.sub("0", content.lower())
+        normalized = _NONALNUM_PAT.sub(" ", digit_collapsed).strip()
         if not normalized:
             normalized = content.strip().lower()
         return hashlib.sha256(

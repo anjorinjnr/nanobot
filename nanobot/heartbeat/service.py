@@ -25,7 +25,9 @@ _SCHED_PAT = re.compile(r"Schedule:\s*(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)")
 _RECUR_PAT = re.compile(r"Recur:\s*every\s+(\d+)\s+(minute|hour|day|week)s?", re.IGNORECASE)
 _UNTIL_PAT = re.compile(r"Until:\s*(\d{4}-\d{2}-\d{2})")
 _LASTRUN_PAT = re.compile(r"Last-run:[^\n]*")
-_LASTRUN_VALUE_PAT = re.compile(r"Last-run:\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)")
+_LASTRUN_VALUE_PAT = re.compile(
+    r"^Last-run:\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)", re.MULTILINE
+)
 _RECIPIENTS_PAT = re.compile(r"^Recipients:\s*(.+)", re.MULTILINE)
 
 
@@ -134,16 +136,25 @@ class DueTask:
 
         Empty set means no Recipients field (fall through to caller defaults).
         Each entry is `<id>:<channel>`; we keep just the trailing channel.
+        Splits on the LAST colon so id can contain ones (e.g. email-like ids).
         """
         if not self.recipients:
             return set()
         out: set[str] = set()
         for entry in self.recipients.split(","):
             entry = entry.strip()
-            if not entry or ":" not in entry:
+            if not entry:
                 continue
-            out.add(entry.rsplit(":", 1)[-1].strip().lower())
-        return {c for c in out if c}
+            if ":" not in entry:
+                logger.warning(
+                    "DueTask {!r}: skipping malformed recipient {!r} (no channel suffix)",
+                    self.name, entry,
+                )
+                continue
+            channel = entry.rsplit(":", 1)[-1].strip().lower()
+            if channel:
+                out.add(channel)
+        return out
 
 
 MODEL_PRESETS: dict[str, str] = {
@@ -534,9 +545,11 @@ class HeartbeatService:
         """Deterministically advance Schedule for executed recurring tasks.
 
         After a task executes, advance its Schedule past now by its Recur
-        interval and write Last-run.  This prevents the task from being
-        considered due again on the next heartbeat tick, regardless of
-        whether the LLM also calls tasks_update.py --tick.
+        interval and write Last-run.  When the LLM has already pushed
+        Schedule into the future (via --tick), the Schedule advance is
+        skipped but Last-run is still bumped — without that, a stale
+        Last-run would let the cadence check re-fire the task on the
+        very next tick.
 
         Re-reads HEARTBEAT.md fresh to avoid overwriting changes made
         during task execution (which can take 10-30s).

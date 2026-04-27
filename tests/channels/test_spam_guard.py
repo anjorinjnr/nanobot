@@ -124,6 +124,17 @@ class TestSpamGuard:
         mgr._is_spam(_msg(content="hello world"))
         assert mgr._is_spam(_msg(content="  hello world\n")) is True
 
+    def test_distinct_letter_tokens_not_collapsed(self):
+        # Numeric-token collapse must not over-blur: same template, different
+        # narrative tokens around the number should remain distinct so we
+        # don't suppress legitimately-different alerts.
+        mgr = _make_manager()
+        a = "Send $50 to Mom"
+        b = "Send $5000 to Dad"
+        c = "Send $99 to Sister"
+        for content in (a, b, c, a, b, c):
+            assert mgr._is_spam(_msg(content=content)) is False
+
     def test_digit_drift_caught_by_normalized_fingerprint(self):
         # Pre-fix the exact-content hash treated "May 18, 2026" and
         # "May 19, 2026" as distinct, so the same templated heartbeat output
