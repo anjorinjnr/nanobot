@@ -523,6 +523,76 @@ def test_compute_due_tasks_future_schedule_overrides_stale_last_run() -> None:
     assert due == []
 
 
+def test_compute_due_tasks_extracts_recipients() -> None:
+    now = datetime(2026, 3, 12, 10, 0)
+    past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+    content = _make_heartbeat(
+        f"\n### Balance check\nType: system\nSchedule: {past}\nRecur: every 1 hour\n"
+        "Recipients: primary:whatsapp,seun:whatsapp\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now)
+    assert len(due) == 1
+    assert due[0].recipients == "primary:whatsapp,seun:whatsapp"
+    assert due[0].recipient_channels() == {"whatsapp"}
+
+
+def test_due_task_recipient_channels_handles_mixed_and_missing() -> None:
+    assert DueTask(name="x", task_type="system", schedule=None).recipient_channels() == set()
+    multi = DueTask(
+        name="x", task_type="system", schedule=None,
+        recipients="primary:whatsapp, alex:Telegram , junk-no-colon, ops:email",
+    )
+    assert multi.recipient_channels() == {"whatsapp", "telegram", "email"}
+
+
+@pytest.mark.asyncio
+async def test_on_execute_context_wraps_execution(tmp_path) -> None:
+    # The CLI uses on_execute_context to clamp MessageTool to the task's
+    # Recipients channels and tag outgoing sends. Verify the hook fires
+    # around on_execute with the right tasks list and is torn down even if
+    # on_execute raises.
+    past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+    heartbeat = _make_heartbeat(
+        f"\n### Balance check\nType: system\nSchedule: {past}\nRecur: every 1 day\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    (tmp_path / "HEARTBEAT.md").write_text(heartbeat, encoding="utf-8")
+
+    enter_calls: list[list[DueTask]] = []
+    exit_calls: list[bool] = []
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def hook(group_tasks):
+        enter_calls.append(list(group_tasks))
+        try:
+            yield
+        finally:
+            exit_calls.append(True)
+
+    async def boom(_summary, _model):
+        raise RuntimeError("nope")
+
+    async def mock_eval(*a, **kw):
+        return False
+
+    service = HeartbeatService(
+        workspace=tmp_path, provider=DummyProvider([]), model="test",
+        on_execute=boom,
+        on_execute_context=hook,
+        last_run_tracking=True,
+    )
+
+    with patch("nanobot.utils.evaluator.evaluate_response", mock_eval):
+        await service._tick()
+
+    assert len(enter_calls) == 1
+    assert enter_calls[0][0].name == "Balance check"
+    assert enter_calls[0][0].recipients == "primary:whatsapp"
+    assert exit_calls == [True]
+
+
 def test_compute_task_statuses_future_schedule_overrides_stale_last_run() -> None:
     # The LLM-facing status string must agree with _compute_due_tasks so the
     # heartbeat doesn't tell the model "DUE NOW" while the deterministic

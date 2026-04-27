@@ -43,12 +43,42 @@ class MessageTool(Tool):
             default=default_message_id,
         )
         self._sent_in_turn_var: ContextVar[bool] = ContextVar("message_sent_in_turn", default=False)
+        # Heartbeat path sets these per-tick so the model can't message channels
+        # outside the task's Recipients (the LLM has been observed rotating
+        # whatsapp/email/telegram while Recipients only listed whatsapp), and so
+        # the spam guard can dedup per-task instead of per-content-hash.
+        self._allowed_channels: ContextVar[frozenset[str] | None] = ContextVar(
+            "message_allowed_channels", default=None
+        )
+        self._task_tag: ContextVar[str | None] = ContextVar(
+            "message_task_tag", default=None
+        )
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Set the current message context."""
         self._default_channel.set(channel)
         self._default_chat_id.set(chat_id)
         self._default_message_id.set(message_id)
+
+    def set_allowed_channels(self, channels: set[str] | frozenset[str] | None):
+        """Restrict this tool to a fixed set of channels for the current ContextVar scope.
+
+        ``None`` (default) means no restriction. Pass an empty set to block all
+        sends. Returns the token from ContextVar.set so the caller can ``reset``.
+        """
+        return self._allowed_channels.set(
+            frozenset(c.lower() for c in channels) if channels is not None else None
+        )
+
+    def reset_allowed_channels(self, token) -> None:
+        self._allowed_channels.reset(token)
+
+    def set_task_tag(self, tag: str | None):
+        """Tag outgoing messages with a stable task identifier for spam-guard keying."""
+        return self._task_tag.set(tag)
+
+    def reset_task_tag(self, token) -> None:
+        self._task_tag.reset(token)
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -115,11 +145,25 @@ class MessageTool(Tool):
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
 
+        allowed = self._allowed_channels.get()
+        if allowed is not None and channel.lower() not in allowed:
+            allowed_list = ", ".join(sorted(allowed)) or "none"
+            return (
+                f"Error: channel {channel!r} is not permitted in this context. "
+                f"Allowed channels: {allowed_list}."
+            )
+
         if not self._send_callback:
             return "Error: Message sending not configured"
 
         loop = asyncio.get_running_loop()
         delivery_future: asyncio.Future[None] = loop.create_future()
+
+        metadata: dict[str, Any] = {}
+        if message_id:
+            metadata["message_id"] = message_id
+        if (tag := self._task_tag.get()):
+            metadata["_task_tag"] = tag
 
         msg = OutboundMessage(
             channel=channel,
@@ -127,9 +171,7 @@ class MessageTool(Tool):
             content=content,
             media=media or [],
             buttons=buttons or [],
-            metadata={
-                "message_id": message_id,
-            } if message_id else {},
+            metadata=metadata,
             _delivery_future=delivery_future,
         )
 

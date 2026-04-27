@@ -8,6 +8,7 @@ import shlex
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Literal
 
 from loguru import logger
@@ -91,6 +92,23 @@ class DueTask:
     schedule: str | None  # None for announcements
     model: str | None = None  # Optional per-task model override
     pre_check: str | None = None  # Optional command to run before LLM dispatch
+    recipients: str | None = None  # Raw Recipients line, e.g. "primary:whatsapp,seun:whatsapp"
+
+    def recipient_channels(self) -> set[str]:
+        """Channel suffixes parsed from Recipients (e.g. {"whatsapp"}).
+
+        Empty set means no Recipients field (fall through to caller defaults).
+        Each entry is `<id>:<channel>`; we keep just the trailing channel.
+        """
+        if not self.recipients:
+            return set()
+        out: set[str] = set()
+        for entry in self.recipients.split(","):
+            entry = entry.strip()
+            if not entry or ":" not in entry:
+                continue
+            out.add(entry.rsplit(":", 1)[-1].strip().lower())
+        return {c for c in out if c}
 
 
 MODEL_PRESETS: dict[str, str] = {
@@ -121,6 +139,9 @@ class HeartbeatService:
         model: str,
         on_execute: Callable[[str, str | None], Coroutine[Any, Any, str]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        on_execute_context: (
+            Callable[[list["DueTask"]], AbstractContextManager[None]] | None
+        ) = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
         last_run_tracking: bool = False,
@@ -133,6 +154,11 @@ class HeartbeatService:
         self.model = model
         self.on_execute = on_execute
         self.on_notify = on_notify
+        # Optional setup/teardown hook that runs around each on_execute call.
+        # Returns a context manager so the caller can install per-group state
+        # (e.g. constrain MessageTool to the tasks' Recipients channels) and
+        # tear it down regardless of how on_execute returns.
+        self.on_execute_context = on_execute_context
         self.interval_s = interval_s
         self.enabled = enabled
         self.last_run_tracking = last_run_tracking
@@ -231,6 +257,9 @@ class HeartbeatService:
             pre_check_match = re.search(r"^Pre-check:\s*(\S+)", block, re.MULTILINE)
             pre_check = pre_check_match.group(1).strip() if pre_check_match else None
 
+            recipients_match = re.search(r"^Recipients:\s*(.+)", block, re.MULTILINE)
+            recipients = recipients_match.group(1).strip() if recipients_match else None
+
             # Effective due is whichever is later: the explicit Schedule
             # (which may have been pushed to the future via tasks_update --tick
             # or a manual pause) and Last-run + Recur (the natural cadence).
@@ -264,7 +293,7 @@ class HeartbeatService:
             if now >= effective_due:
                 due.append(DueTask(
                     name=task_name, task_type=task_type, schedule=schedule_str,
-                    model=model, pre_check=pre_check,
+                    model=model, pre_check=pre_check, recipients=recipients,
                 ))
 
         return due
@@ -701,8 +730,14 @@ class HeartbeatService:
 
                     for model_override, group_tasks in groups.items():
                         summary = ", ".join(f"{t.name} ({t.task_type})" for t in group_tasks)
+                        ctx = (
+                            self.on_execute_context(group_tasks)
+                            if self.on_execute_context
+                            else nullcontext()
+                        )
                         try:
-                            response = await self.on_execute(summary, model_override)
+                            with ctx:
+                                response = await self.on_execute(summary, model_override)
                             if response:
                                 should_notify = await evaluate_response(
                                     response, summary, self.provider, self.model,

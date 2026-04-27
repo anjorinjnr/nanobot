@@ -124,6 +124,39 @@ class TestSpamGuard:
         mgr._is_spam(_msg(content="hello world"))
         assert mgr._is_spam(_msg(content="  hello world\n")) is True
 
+    def test_digit_drift_caught_by_normalized_fingerprint(self):
+        # Pre-fix the exact-content hash treated "May 18, 2026" and
+        # "May 19, 2026" as distinct, so the same templated heartbeat output
+        # could spam every minute as the date crept forward. Stripping digits
+        # before hashing collapses these into one fingerprint. Wider wording
+        # drift (filler words, reordering) is still caught by the heartbeat
+        # task-tag path — see test_task_tag_supersedes_content_hash.
+        mgr = _make_manager()
+        a = "The Balance check task is scheduled for May 18, 2026."
+        b = "The Balance check task is scheduled for May 19, 2026."
+        c = "The Balance check task is scheduled for May 20, 2026."
+        assert mgr._is_spam(_msg(content=a)) is False
+        assert mgr._is_spam(_msg(content=b)) is False
+        assert mgr._is_spam(_msg(content=c)) is True
+
+    def test_task_tag_supersedes_content_hash(self):
+        # When the heartbeat path tags messages with a task identifier, dedup
+        # is per (recipient, task) — wording can vary arbitrarily and we
+        # still suppress repeats from the same task to the same chat.
+        mgr = _make_manager()
+        meta = {"_task_tag": "Balance check"}
+        assert mgr._is_spam(_msg(content="apple", metadata=meta)) is False
+        assert mgr._is_spam(_msg(content="banana", metadata=meta)) is False
+        assert mgr._is_spam(_msg(content="cherry", metadata=meta)) is True
+
+    def test_task_tag_isolated_per_recipient(self):
+        mgr = _make_manager()
+        meta = {"_task_tag": "Balance check"}
+        for _ in range(3):
+            mgr._is_spam(_msg(chat_id="user1", metadata=meta))
+        # Other recipient unaffected
+        assert mgr._is_spam(_msg(chat_id="user2", metadata=meta)) is False
+
     def test_disabled_by_default(self):
         """When disabled, _is_spam should still work but dispatch won't call it."""
         mgr = _make_manager(enabled=False)

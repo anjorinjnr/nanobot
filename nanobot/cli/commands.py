@@ -6,7 +6,7 @@ import os
 import select
 import signal
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -657,7 +657,8 @@ def _run_gateway(
     from nanobot.channels.manager import ChannelManager
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
-    from nanobot.heartbeat.service import HeartbeatService, filter_heartbeat_response
+    from nanobot.agent.tools.message import MessageTool
+    from nanobot.heartbeat.service import DueTask, HeartbeatService, filter_heartbeat_response
     from nanobot.session.manager import Session, SessionManager
 
     port = port if port is not None else config.gateway.port
@@ -852,12 +853,38 @@ def _run_gateway(
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
+    @contextmanager
+    def heartbeat_execute_context(group_tasks: list[DueTask]):
+        """Per-group setup: clamp MessageTool to Recipients channels and tag
+        outgoing sends with a task-level identifier so the spam guard can dedup
+        across LLM wording drift instead of only on identical content."""
+        message_tool = agent.tools.get("message")
+        channel_token = tag_token = None
+        if isinstance(message_tool, MessageTool):
+            allowed: set[str] = set()
+            for t in group_tasks:
+                allowed |= t.recipient_channels()
+            if allowed:
+                channel_token = message_tool.set_allowed_channels(allowed)
+            tag = ",".join(sorted({t.name for t in group_tasks if t.task_type != "announcement"}))
+            if tag:
+                tag_token = message_tool.set_task_tag(tag)
+        try:
+            yield
+        finally:
+            if isinstance(message_tool, MessageTool):
+                if channel_token is not None:
+                    message_tool.reset_allowed_channels(channel_token)
+                if tag_token is not None:
+                    message_tool.reset_task_tag(tag_token)
+
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
         provider=provider,
         model=agent.model,
         on_execute=on_heartbeat_execute,
+        on_execute_context=heartbeat_execute_context,
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
