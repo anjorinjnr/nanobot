@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 from nanobot.agent.runner import STOP_EMPTY_FINAL, STOP_ERROR, STOP_INTENTIONAL_SILENCE
 from nanobot.bus.events import OutboundMessage
+from nanobot.utils.heartbeat_lock import heartbeat_lock
+from nanobot.utils.helpers import write_text_atomic
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 if TYPE_CHECKING:
@@ -552,8 +554,18 @@ class HeartbeatService:
         very next tick.
 
         Re-reads HEARTBEAT.md fresh to avoid overwriting changes made
-        during task execution (which can take 10-30s).
+        during task execution (which can take 10-30s). The whole
+        read-modify-write window runs under ``heartbeat_lock`` so
+        concurrent ``tasks_update.py --tick`` invocations from the LLM
+        can't race the advance.
+
+        Do not call while already holding ``heartbeat_lock`` — flock is
+        non-reentrant and would deadlock.
         """
+        with heartbeat_lock(self.workspace):
+            self._advance_schedules_locked(tasks)
+
+    def _advance_schedules_locked(self, tasks: list[DueTask]) -> None:
         content = self._read_heartbeat_file()
         if not content:
             return
@@ -663,7 +675,7 @@ class HeartbeatService:
             logger.info("Heartbeat: advanced '{}' schedule to {}", task.name, next_str)
 
         if changed:
-            self.heartbeat_file.write_text(content, encoding="utf-8")
+            write_text_atomic(self.heartbeat_file, content)
 
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
