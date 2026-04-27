@@ -231,7 +231,12 @@ class HeartbeatService:
             pre_check_match = re.search(r"^Pre-check:\s*(\S+)", block, re.MULTILINE)
             pre_check = pre_check_match.group(1).strip() if pre_check_match else None
 
-            # Determine effective due time considering Last-run + Recur
+            # Effective due is whichever is later: the explicit Schedule
+            # (which may have been pushed to the future via tasks_update --tick
+            # or a manual pause) and Last-run + Recur (the natural cadence).
+            # Taking the max means a future Schedule acts as a floor — the
+            # task can't be due before the scheduled date — while the cadence
+            # check still suppresses repeat firings between heartbeat ticks.
             effective_due = schedule_dt
             last_run_match = re.search(
                 r"Last-run:\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)", block
@@ -252,7 +257,7 @@ class HeartbeatService:
                         "day": timedelta(days=amount),
                         "week": timedelta(weeks=amount),
                     }.get(unit, timedelta())
-                    effective_due = last_run_dt + delta
+                    effective_due = max(schedule_dt, last_run_dt + delta)
                 except (ValueError, KeyError):
                     pass  # fall back to schedule_dt
 
@@ -325,7 +330,8 @@ class HeartbeatService:
                 except ValueError:
                     pass
 
-            # Determine effective due time considering Last-run + Recur
+            # See _compute_due_tasks for the rationale: take whichever is later
+            # so a future Schedule isn't bypassed by Last-run + Recur math.
             effective_due = schedule_dt
             effective_due_str = schedule_str
             last_run_match = re.search(
@@ -347,7 +353,7 @@ class HeartbeatService:
                         "day": timedelta(days=amount),
                         "week": timedelta(weeks=amount),
                     }.get(unit, timedelta())
-                    effective_due = last_run_dt + delta
+                    effective_due = max(schedule_dt, last_run_dt + delta)
                     effective_due_str = effective_due.strftime("%Y-%m-%d %H:%M")
                 except (ValueError, KeyError):
                     pass
@@ -577,9 +583,25 @@ class HeartbeatService:
                 continue
 
             # If the LLM already called --tick during execution, the schedule
-            # will already be in the future — skip to avoid double-advancing.
+            # will already be in the future — skip the Schedule advance to
+            # avoid double-advancing, but still bump Last-run to now so a
+            # subsequent _compute_due_tasks tick (which uses
+            # max(Schedule, Last-run + Recur)) doesn't immediately re-fire
+            # the same task on the next heartbeat.
             if current_dt > now_naive:
-                logger.info("Heartbeat: '{}' schedule already advanced, skipping", task.name)
+                logger.info("Heartbeat: '{}' schedule already advanced, bumping Last-run", task.name)
+                if _LASTRUN_PAT.search(block):
+                    updated_block = _LASTRUN_PAT.sub(f"Last-run: {now_str}", block, count=1)
+                else:
+                    updated_block = re.sub(
+                        r"(Schedule:[^\n]+)(\n|$)",
+                        rf"\1\nLast-run: {now_str}\2",
+                        block,
+                        count=1,
+                    )
+                if updated_block != block:
+                    content = content[:m.start()] + updated_block + content[m.end():]
+                    changed = True
                 continue
 
             if recur_unit == "minute":

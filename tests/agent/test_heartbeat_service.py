@@ -505,6 +505,42 @@ def test_compute_due_tasks_system_task_not_due() -> None:
     assert due == []
 
 
+def test_compute_due_tasks_future_schedule_overrides_stale_last_run() -> None:
+    # Repro of the prod Balance-check spam: Schedule pushed weeks ahead (e.g.
+    # by --tick or a manual pause) plus a stale Last-run + Recur combination
+    # that, alone, would mark the task due. effective_due must respect the
+    # later of Schedule and Last-run + Recur — Schedule is the floor.
+    now = datetime(2026, 4, 27, 19, 30)
+    content = _make_heartbeat(
+        "\n### Balance check\n"
+        "Type: system\n"
+        "Schedule: 2026-05-18 09:00\n"
+        "Last-run: 2026-04-26 13:41\n"
+        "Recur: every 1 day\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now)
+    assert due == []
+
+
+def test_compute_task_statuses_future_schedule_overrides_stale_last_run() -> None:
+    # The LLM-facing status string must agree with _compute_due_tasks so the
+    # heartbeat doesn't tell the model "DUE NOW" while the deterministic
+    # decider says skip.
+    now = datetime(2026, 4, 27, 19, 30)
+    content = _make_heartbeat(
+        "\n### Balance check\n"
+        "Type: system\n"
+        "Schedule: 2026-05-18 09:00\n"
+        "Last-run: 2026-04-26 13:41\n"
+        "Recur: every 1 day\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    status = HeartbeatService._compute_task_statuses(content, now)
+    assert "IS DUE NOW" not in status
+    assert "is NOT due until 2026-05-18" in status
+
+
 # ---------------------------------------------------------------------------
 # _compute_due_tasks — Until / expiry
 # ---------------------------------------------------------------------------
@@ -1485,6 +1521,27 @@ def test_advance_schedules_skips_already_advanced(advance_service) -> None:
     updated = service.heartbeat_file.read_text()
     # Should stay at 11:00, NOT advance to 12:00
     assert "Schedule: 2026-03-12 11:00" in updated
+    # But Last-run must still be bumped, so a stale Last-run + Recur can't
+    # mark the same task due again on the very next tick (regression: this
+    # gap is what caused the prod Balance-check spam loop).
+    assert "Last-run: 2026-03-12 10:30" in updated
+
+
+def test_advance_schedules_future_schedule_creates_last_run(advance_service) -> None:
+    """When Schedule is already future and no Last-run exists, write one."""
+    now = datetime(2026, 3, 12, 10, 30)
+    heartbeat = _make_heartbeat(
+        "\n### Balance check\nType: system\nSchedule: 2026-04-01 09:00\nRecur: every 1 day\n"
+    )
+    service = advance_service(heartbeat)
+    tasks = [DueTask(name="Balance check", task_type="system", schedule="2026-04-01 09:00")]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    assert "Schedule: 2026-04-01 09:00" in updated
+    assert "Last-run: 2026-03-12 10:30" in updated
 
 
 @pytest.mark.asyncio
