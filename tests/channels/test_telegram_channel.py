@@ -1,4 +1,5 @@
 import asyncio
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -1250,6 +1251,30 @@ async def test_forward_command_normalizes_telegram_safe_dream_aliases() -> None:
 
     assert len(handled) == 1
     assert handled[0]["content"] == "/dream-restore deadbeef"
+
+
+def test_start_command_has_no_handler() -> None:
+    """Telegram auto-sends /start the first time a user opens a bot, but
+    Homer deployments deliver their own welcome out-of-band, so any reply
+    here would either leak the upstream 'I'm nanobot' template or
+    duplicate the deployment's welcome. /start must remain unregistered
+    so the regular message handler's `~filters.COMMAND` drops it."""
+    import inspect
+    from nanobot.channels import telegram as telegram_module
+
+    # Strip comments so the rationale block doesn't false-match.
+    src_no_comments = "\n".join(
+        line.split("#", 1)[0]
+        for line in inspect.getsource(telegram_module.TelegramChannel.start).splitlines()
+    )
+    assert "/start" not in src_no_comments
+    assert "_on_start" not in src_no_comments
+    # The slash-command alternation must not include `start` as a branch.
+    forward_re = re.search(r'r"\^/\(([^)]+)\)\(\?:@\\w\+\)\?', src_no_comments)
+    assert forward_re is not None, "expected forwarded-command regex in start()"
+    assert "start" not in forward_re.group(1).split("|")
+    # And no `_on_start` method on the class either.
+    assert not hasattr(telegram_module.TelegramChannel, "_on_start")
 
 
 @pytest.mark.asyncio

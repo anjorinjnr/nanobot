@@ -341,8 +341,14 @@ class TelegramChannel(BaseChannel):
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
-        # Add command handlers (using Regex to support @username suffixes before bot initialization)
-        self._app.add_handler(MessageHandler(filters.Regex(r"^/start(?:@\w+)?$"), self._on_start))
+        # Add command handlers (using Regex to support @username suffixes before bot initialization).
+        # /start is intentionally NOT registered — Telegram auto-sends it the
+        # first time a user opens a bot, but deployments that send their own
+        # welcome out-of-band don't want a reply here. The previous default
+        # ("Hi {first_name}! I'm nanobot.") leaked the Telegram first_name
+        # and a brand identity the deployment may not have. With no handler
+        # the regular message handler's `~filters.COMMAND` skips it, so
+        # /start is silently dropped.
         self._app.add_handler(
             MessageHandler(
                 filters.Regex(r"^/(new|stop|restart|status|dream)(?:@\w+)?(?:\s+.*)?$"),
@@ -759,18 +765,6 @@ class TelegramChannel(BaseChannel):
         )
         buf.message_id = sent.message_id
         buf.text = tail
-
-    async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /start command."""
-        if not update.message or not update.effective_user:
-            return
-
-        user = update.effective_user
-        await update.message.reply_text(
-            f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
-            "Send me a message and I'll respond!\n"
-            "Type /help to see available commands."
-        )
 
     async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /help command, bypassing ACL so all users can access it."""
