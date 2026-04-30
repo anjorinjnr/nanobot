@@ -342,14 +342,16 @@ class TelegramChannel(BaseChannel):
         self._app.add_error_handler(self._on_error)
 
         # Add command handlers (using Regex to support @username suffixes before bot initialization).
-        # /start is forwarded to the agent so the LLM responds in the deployment's
-        # configured persona — the previous default ("Hi {first_name}! I'm nanobot.")
-        # leaked the Telegram first_name and a brand identity the deployment may not
-        # have. ACL is enforced on the forwarded path, so unauthorized senders get
-        # silently dropped instead of receiving a confirmation that the bot exists.
+        # /start is intentionally NOT registered — Telegram auto-sends it the
+        # first time a user opens a bot, but deployments that send their own
+        # welcome out-of-band don't want a reply here. The previous default
+        # ("Hi {first_name}! I'm nanobot.") leaked the Telegram first_name
+        # and a brand identity the deployment may not have. With no handler
+        # the regular message handler's `~filters.COMMAND` skips it, so
+        # /start is silently dropped.
         self._app.add_handler(
             MessageHandler(
-                filters.Regex(r"^/(start|new|stop|restart|status|dream)(?:@\w+)?(?:\s+.*)?$"),
+                filters.Regex(r"^/(new|stop|restart|status|dream)(?:@\w+)?(?:\s+.*)?$"),
                 self._forward_command,
             )
         )

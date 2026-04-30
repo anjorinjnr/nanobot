@@ -1,4 +1,5 @@
 import asyncio
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -1252,31 +1253,28 @@ async def test_forward_command_normalizes_telegram_safe_dream_aliases() -> None:
     assert handled[0]["content"] == "/dream-restore deadbeef"
 
 
-@pytest.mark.asyncio
-async def test_start_command_forwards_to_agent_without_default_reply() -> None:
-    """`/start` must reach the agent like any other slash command — never
-    reply with the upstream-default 'Hi {first_name}! I'm nanobot.'
-    template, which leaks the user's Telegram first_name and a brand
-    identity the deployment may not have."""
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
-        MessageBus(),
+def test_start_command_has_no_handler() -> None:
+    """Telegram auto-sends /start the first time a user opens a bot, but
+    Homer deployments deliver their own welcome out-of-band, so any reply
+    here would either leak the upstream 'I'm nanobot' template or
+    duplicate the deployment's welcome. /start must remain unregistered
+    so the regular message handler's `~filters.COMMAND` drops it."""
+    import inspect
+    from nanobot.channels import telegram as telegram_module
+
+    # Strip comments so the rationale block doesn't false-match.
+    src_no_comments = "\n".join(
+        line.split("#", 1)[0]
+        for line in inspect.getsource(telegram_module.TelegramChannel.start).splitlines()
     )
-    channel._app = _FakeApp(lambda: None)
-    handled = []
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
-    update = _make_telegram_update(text="/start", chat_type="private")
-    update.message.reply_text = AsyncMock()
-
-    await channel._forward_command(update, None)
-
-    assert len(handled) == 1
-    assert handled[0]["content"] == "/start"
-    update.message.reply_text.assert_not_awaited()
+    assert "/start" not in src_no_comments
+    assert "_on_start" not in src_no_comments
+    # The slash-command alternation must not include `start` as a branch.
+    forward_re = re.search(r'r"\^/\(([^)]+)\)\(\?:@\\w\+\)\?', src_no_comments)
+    assert forward_re is not None, "expected forwarded-command regex in start()"
+    assert "start" not in forward_re.group(1).split("|")
+    # And no `_on_start` method on the class either.
+    assert not hasattr(telegram_module.TelegramChannel, "_on_start")
 
 
 @pytest.mark.asyncio
