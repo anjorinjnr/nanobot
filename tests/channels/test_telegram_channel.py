@@ -1253,6 +1253,33 @@ async def test_forward_command_normalizes_telegram_safe_dream_aliases() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_command_forwards_to_agent_without_default_reply() -> None:
+    """`/start` must reach the agent like any other slash command — never
+    reply with the upstream-default 'Hi {first_name}! I'm nanobot.'
+    template, which leaks the user's Telegram first_name and a brand
+    identity the deployment may not have."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    update = _make_telegram_update(text="/start", chat_type="private")
+    update.message.reply_text = AsyncMock()
+
+    await channel._forward_command(update, None)
+
+    assert len(handled) == 1
+    assert handled[0]["content"] == "/start"
+    update.message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_on_help_includes_restart_command() -> None:
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),

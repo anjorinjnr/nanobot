@@ -341,11 +341,15 @@ class TelegramChannel(BaseChannel):
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
-        # Add command handlers (using Regex to support @username suffixes before bot initialization)
-        self._app.add_handler(MessageHandler(filters.Regex(r"^/start(?:@\w+)?$"), self._on_start))
+        # Add command handlers (using Regex to support @username suffixes before bot initialization).
+        # /start is forwarded to the agent so the LLM responds in the deployment's
+        # configured persona — the previous default ("Hi {first_name}! I'm nanobot.")
+        # leaked the Telegram first_name and a brand identity the deployment may not
+        # have. ACL is enforced on the forwarded path, so unauthorized senders get
+        # silently dropped instead of receiving a confirmation that the bot exists.
         self._app.add_handler(
             MessageHandler(
-                filters.Regex(r"^/(new|stop|restart|status|dream)(?:@\w+)?(?:\s+.*)?$"),
+                filters.Regex(r"^/(start|new|stop|restart|status|dream)(?:@\w+)?(?:\s+.*)?$"),
                 self._forward_command,
             )
         )
@@ -759,18 +763,6 @@ class TelegramChannel(BaseChannel):
         )
         buf.message_id = sent.message_id
         buf.text = tail
-
-    async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /start command."""
-        if not update.message or not update.effective_user:
-            return
-
-        user = update.effective_user
-        await update.message.reply_text(
-            f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
-            "Send me a message and I'll respond!\n"
-            "Type /help to see available commands."
-        )
 
     async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /help command, bypassing ACL so all users can access it."""
