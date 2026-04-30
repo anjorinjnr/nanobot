@@ -74,6 +74,27 @@ class ExecTool(Tool):
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
         self.allowed_env_keys = allowed_env_keys or []
+        # Per-turn sender identity, set by the runtime before each tool call
+        # via set_context(). Injected into the subprocess env as
+        # NANOBOT_SENDER_ID / NANOBOT_SENDER_CHANNEL so trusted tools can
+        # authenticate the requester instead of trusting LLM-supplied args.
+        self._sender_id: str | None = None
+        self._sender_channel: str | None = None
+
+    def set_context(
+        self,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        sender_id: str | None = None,
+    ) -> None:
+        """Update per-turn identity that gets injected into subprocess env.
+
+        Called by the agent loop before each turn. The runtime is the only
+        source for these values — they are never read from os.environ — so
+        prompt injection cannot spoof them.
+        """
+        self._sender_channel = channel
+        self._sender_id = sender_id
 
     @property
     def name(self) -> str:
@@ -259,6 +280,7 @@ class ExecTool(Tool):
                 val = os.environ.get(key)
                 if val is not None:
                     env[key] = val
+            self._apply_sender_env(env)
             return env
         home = os.environ.get("HOME", "/tmp")
         env = {
@@ -270,7 +292,22 @@ class ExecTool(Tool):
             val = os.environ.get(key)
             if val is not None:
                 env[key] = val
+        self._apply_sender_env(env)
         return env
+
+    def _apply_sender_env(self, env: dict[str, str]) -> None:
+        # Sourced from runtime state only — never from os.environ — so a
+        # stale parent-process value cannot leak into the subprocess and the
+        # LLM cannot spoof identity by listing these in allowed_env_keys.
+        # Applied after the allowlist loop so they always win.
+        if self._sender_id:
+            env["NANOBOT_SENDER_ID"] = self._sender_id
+        else:
+            env.pop("NANOBOT_SENDER_ID", None)
+        if self._sender_channel:
+            env["NANOBOT_SENDER_CHANNEL"] = self._sender_channel
+        else:
+            env.pop("NANOBOT_SENDER_CHANNEL", None)
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
