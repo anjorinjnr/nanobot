@@ -1128,6 +1128,25 @@ class AgentLoop:
         _analytics = get_analytics_hook()
         _synthetic = bool(msg.metadata.get("synthetic"))
 
+        # Pre-turn quota gate (default-tier weekly token budget). Bails fast
+        # for synthetic / byok / managed turns; on a hard cap-hit we send
+        # the upgrade reply and return WITHOUT entering the agent loop or
+        # firing agent_responded — the gate is not the agent.
+        from nanobot.analytics.quota_gate import check_token_budget_before_turn
+        _turn_ctx: dict[str, Any] = {"is_synthetic": _synthetic}
+        try:
+            _cap_hit_reply = check_token_budget_before_turn(_turn_ctx)
+        except Exception:
+            logger.debug("quota_gate hook error (non-fatal)", exc_info=True)
+            _cap_hit_reply = None
+        if _cap_hit_reply is not None:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=_cap_hit_reply,
+                metadata=dict(msg.metadata or {}),
+            )
+
         # Resolve guest_agent workspace if sender is in guest agent ACL
         guest = self._resolve_guest_agent_workspace(msg.sender_id) if msg.sender_id else None
         context = guest[0] if guest else self.context
@@ -1324,6 +1343,15 @@ class AgentLoop:
         meta = dict(msg.metadata or {})
         if on_stream is not None and stop_reason != STOP_ERROR:
             meta["_streamed"] = True
+
+        # Post-turn quota warn — append a single-message nudge to the agent's
+        # reply when the household crossed the warn threshold this turn.
+        try:
+            from nanobot.analytics.quota_gate import maybe_append_quota_warn
+            final_content = maybe_append_quota_warn(_turn_ctx, final_content) or final_content
+        except Exception:
+            logger.debug("quota_gate warn appendix error (non-fatal)", exc_info=True)
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
