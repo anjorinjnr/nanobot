@@ -39,6 +39,7 @@ import hmac
 import logging
 import os
 import time
+from datetime import date, datetime, timezone
 from typing import Any, MutableMapping
 
 import httpx
@@ -48,15 +49,87 @@ logger = logging.getLogger(__name__)
 
 # ── Copy (module constants for easy editing) ──────────────────────────────
 
-CAP_HIT_REPLY = (
-    "You've used this week's free Homer budget 🏠 To keep going, add your "
-    "own AI provider key — settings: https://homer.joybuild.ai/settings/ai-provider"
+# Template used by :func:`format_cap_hit_reply`. The ``{friendly_reset}`` slot
+# is filled with a phrase like ``"tomorrow"`` / ``"on Monday"`` / ``"next week"``.
+_CAP_HIT_TEMPLATE = (
+    "You've used this week's free Homer budget 🏠 It resets {friendly_reset}.\n"
+    "To keep going now, add your own AI provider key — settings:\n"
+    "https://homer.joybuild.ai/settings/ai-provider"
 )
 
 WARN_APPENDIX = (
     "\n\nFYI — you're at {pct}% of this week's free Homer budget. "
     "Settings → AI Provider to add your own key any time."
 )
+
+
+def _friendly_reset(reset_at: str | None) -> str:
+    """Translate a ``reset_at`` ISO string into human-friendly cap-hit copy.
+
+    Rules:
+    * missing / empty → ``"next week"`` (preserves pre-follow-up tone)
+    * unparseable → ``"soon"``
+    * in the past → ``"soon"``
+    * exactly 1 day away → ``"tomorrow"``
+    * 2-6 days away → ``"on <weekday>"``
+    * 7+ days away → ``"in N days"`` (defensive — shouldn't happen)
+
+    Distance is computed in UTC against ``datetime.now(timezone.utc)``.
+    Date-only strings (``"2026-05-11"``) are treated as midnight UTC.
+    """
+    if reset_at is None or reset_at == "":
+        return "next week"
+
+    parsed: datetime | None = None
+    s = reset_at.strip()
+    # Tolerate trailing 'Z' (Python 3.11+ fromisoformat handles it, but be defensive).
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(s)
+    except ValueError:
+        # Try date-only.
+        try:
+            d = date.fromisoformat(s)
+            parsed = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+        except ValueError:
+            return "soon"
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    delta_days = (parsed - now).total_seconds() / 86400.0
+
+    # Past or essentially now → "soon".
+    if delta_days < 0:
+        return "soon"
+
+    # Round to nearest whole day for friendlier copy. We bias slightly upward:
+    # a reset 23h59m away should still read as "tomorrow".
+    days = int(round(delta_days))
+    if days <= 0:
+        # Future but within ~12h — still "soon".
+        return "soon"
+    if days == 1:
+        return "tomorrow"
+    if 2 <= days <= 6:
+        return f"on {parsed.strftime('%A')}"
+    return f"in {days} days"
+
+
+def format_cap_hit_reply(reset_at: str | None) -> str:
+    """Build the user-facing cap-hit reply string.
+
+    See :func:`_friendly_reset` for the reset-phrase rules.
+    """
+    return _CAP_HIT_TEMPLATE.format(friendly_reset=_friendly_reset(reset_at))
+
+
+# Back-compat: some call-sites / tests still import ``CAP_HIT_REPLY`` as a
+# constant. Keep it available as the "no reset_at info" rendering — same
+# behavior as before this follow-up.
+CAP_HIT_REPLY = format_cap_hit_reply(None)
 
 
 # ── Config ────────────────────────────────────────────────────────────────
@@ -190,19 +263,24 @@ def check_token_budget_before_turn(
 
     ok = data.get("ok")
     if ok is False:
-        # Hard cap-hit. The portal may also include used/budget for logging.
+        # Hard cap-hit. The portal may also include used/budget for logging
+        # and reset_at (ISO string) for the user-facing copy.
         used = data.get("used")
         budget = data.get("budget")
+        reset_at = data.get("reset_at")
+        if reset_at is not None and not isinstance(reset_at, str):
+            # Defence-in-depth: anything non-string falls back to "next week".
+            reset_at = None
         logger.info(
-            "quota_gate: cap-hit for household=%s used=%s budget=%s",
-            hid, used, budget,
+            "quota_gate: cap-hit for household=%s used=%s budget=%s reset_at=%s",
+            hid, used, budget, reset_at,
         )
         # Best-effort PostHog beacon — never let it block the reply.
         try:
             _emit_blocked_event(hid=hid, used=used, budget=budget)
         except Exception:
             logger.debug("quota_gate: blocked-event emit failed", exc_info=True)
-        return CAP_HIT_REPLY
+        return format_cap_hit_reply(reset_at)
 
     if ok is not True:
         # Schema drift — treat as fail-open.
@@ -290,5 +368,6 @@ __all__ = [
     "CAP_HIT_REPLY",
     "WARN_APPENDIX",
     "check_token_budget_before_turn",
+    "format_cap_hit_reply",
     "maybe_append_quota_warn",
 ]

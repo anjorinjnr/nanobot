@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -14,6 +15,7 @@ from nanobot.analytics.quota_gate import (
     CAP_HIT_REPLY,
     WARN_APPENDIX,
     check_token_budget_before_turn,
+    format_cap_hit_reply,
     maybe_append_quota_warn,
 )
 
@@ -330,3 +332,123 @@ def test_warn_appendix_format_matches_template():
     ctx = {"quota_warn": True, "quota_warn_pct": 80}
     out = maybe_append_quota_warn(ctx, "x")
     assert out == "x" + WARN_APPENDIX.format(pct=80)
+
+
+# ── format_cap_hit_reply: friendly reset phrase ───────────────────────────
+
+
+def _iso_in_days(days: float, *, date_only: bool = False) -> str:
+    """Build an ISO string `days` from now (UTC)."""
+    when = datetime.now(timezone.utc) + timedelta(days=days)
+    if date_only:
+        return when.date().isoformat()
+    return when.isoformat()
+
+
+def test_format_cap_hit_reply_one_day_says_tomorrow():
+    out = format_cap_hit_reply(_iso_in_days(1.0))
+    assert "tomorrow" in out
+    assert "free Homer budget" in out
+    assert "https://homer.joybuild.ai/settings/ai-provider" in out
+
+
+def test_format_cap_hit_reply_three_days_says_on_weekday():
+    target = datetime.now(timezone.utc) + timedelta(days=3)
+    out = format_cap_hit_reply(target.isoformat())
+    weekday = target.strftime("%A")
+    assert f"on {weekday}" in out
+
+
+def test_format_cap_hit_reply_eight_days_says_in_n_days():
+    out = format_cap_hit_reply(_iso_in_days(8.0))
+    assert "in 8 days" in out
+
+
+def test_format_cap_hit_reply_past_says_soon():
+    out = format_cap_hit_reply(_iso_in_days(-2.0))
+    assert "soon" in out
+
+
+@pytest.mark.parametrize("bad", ["", None])
+def test_format_cap_hit_reply_missing_says_next_week(bad):
+    out = format_cap_hit_reply(bad)
+    assert "next week" in out
+
+
+def test_format_cap_hit_reply_malformed_says_soon():
+    out = format_cap_hit_reply("not-a-date")
+    assert "soon" in out
+
+
+def test_format_cap_hit_reply_date_only_string():
+    """Date-only ISO (e.g. '2026-05-11') is treated as midnight UTC."""
+    out = format_cap_hit_reply(_iso_in_days(1.0, date_only=True))
+    # Could be "tomorrow" or "in <N> days" depending on current UTC time-of-day
+    # relative to midnight; either way the reply must render and reference the
+    # budget.
+    assert "free Homer budget" in out
+    assert ("tomorrow" in out) or ("on " in out) or ("soon" in out)
+
+
+def test_format_cap_hit_reply_handles_trailing_z():
+    """ISO with trailing 'Z' (Zulu) parses cleanly."""
+    when = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+    iso_z = when.isoformat().replace("+00:00", "Z")
+    out = format_cap_hit_reply(iso_z)
+    assert "tomorrow" in out
+
+
+# ── End-to-end: portal payload → cap-hit reply ─────────────────────────────
+
+
+def test_e2e_cap_hit_reply_uses_reset_at_from_portal(default_env):
+    payload = {
+        "ok": False,
+        "used": 1_500_000,
+        "budget": 1_000_000,
+        "reset_at": _iso_in_days(1.0),
+    }
+    resp = _mk_resp(200, payload)
+    with patch.object(quota_gate.httpx, "get", return_value=resp):
+        out = check_token_budget_before_turn({})
+    assert out is not None
+    assert "tomorrow" in out
+    assert "free Homer budget" in out
+
+
+def test_e2e_cap_hit_reply_missing_reset_at_says_next_week(default_env):
+    payload = {"ok": False, "used": 2_000_000, "budget": 1_000_000}
+    resp = _mk_resp(200, payload)
+    with patch.object(quota_gate.httpx, "get", return_value=resp):
+        out = check_token_budget_before_turn({})
+    assert out is not None
+    assert "next week" in out
+
+
+def test_e2e_cap_hit_reply_null_reset_at_says_next_week(default_env):
+    payload = {
+        "ok": False,
+        "used": 2_000_000,
+        "budget": 1_000_000,
+        "reset_at": None,
+    }
+    resp = _mk_resp(200, payload)
+    with patch.object(quota_gate.httpx, "get", return_value=resp):
+        out = check_token_budget_before_turn({})
+    assert out is not None
+    assert "next week" in out
+
+
+def test_e2e_cap_hit_reply_non_string_reset_at_falls_back(default_env):
+    """A non-string reset_at (schema drift) must not crash; falls back to next week."""
+    payload = {
+        "ok": False,
+        "used": 2_000_000,
+        "budget": 1_000_000,
+        "reset_at": 12345,  # numeric, not ISO string
+    }
+    resp = _mk_resp(200, payload)
+    with patch.object(quota_gate.httpx, "get", return_value=resp):
+        out = check_token_budget_before_turn({})
+    assert out is not None
+    assert "next week" in out
