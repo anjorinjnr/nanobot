@@ -171,6 +171,13 @@ def _make_provider(config: Any) -> Any:
             spec=spec,
         )
 
+    # Tag the resolved provider name so $ai_generation telemetry can split
+    # spend by upstream (anthropic / gemini / openrouter / ...).
+    if spec is not None:
+        provider.provider_name = spec.name
+    elif backend == "anthropic":
+        provider.provider_name = "anthropic"
+
     defaults = config.agents.defaults
     provider.generation = GenerationSettings(
         temperature=defaults.temperature,

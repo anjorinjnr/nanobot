@@ -468,6 +468,13 @@ def _make_provider(config: Config):
             spec=spec,
         )
 
+    # Tag the resolved provider name so $ai_generation telemetry can split
+    # spend by upstream (anthropic / gemini / openrouter / ...).
+    if spec is not None:
+        provider.provider_name = spec.name
+    elif backend == "anthropic":
+        provider.provider_name = "anthropic"
+
     defaults = config.agents.defaults
     provider.generation = GenerationSettings(
         temperature=defaults.temperature,
@@ -738,15 +745,20 @@ def _run_gateway(
         async def _silent(*_args, **_kwargs):
             pass
 
+        from nanobot.analytics.llm_telemetry import llm_telemetry_context
+
         try:
-            resp = await agent.process_direct(
-                reminder_note,
-                session_key=f"cron:{job.id}",
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to or "direct",
-                is_synthetic=True,
-                on_progress=_silent,
-            )
+            with llm_telemetry_context(
+                task_kind="heartbeat_user", is_synthetic=True,
+            ):
+                resp = await agent.process_direct(
+                    reminder_note,
+                    session_key=f"cron:{job.id}",
+                    channel=job.payload.channel or "cli",
+                    chat_id=job.payload.to or "direct",
+                    is_synthetic=True,
+                    on_progress=_silent,
+                )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
@@ -855,22 +867,39 @@ def _run_gateway(
 
     @contextmanager
     def heartbeat_execute_context(group_tasks: list[DueTask]):
-        """Clamp MessageTool to the group's Recipients channels and tag
-        outgoing sends so the spam guard can dedup per task."""
+        """Clamp MessageTool to the group's Recipients channels, tag outgoing
+        sends so the spam guard can dedup per task, and set the
+        ``$ai_generation`` task_kind so per-call telemetry knows this run is
+        heartbeat-driven (system vs user-defined)."""
+        from nanobot.analytics.llm_telemetry import llm_telemetry_context
+
+        # ``system`` Type tasks are Homer's built-in maintenance (gmail
+        # scan, morning briefing, etc.); anything else is a user-defined
+        # task and we want to bill it differently in dashboards.
+        kind = (
+            "heartbeat_system"
+            if all(t.task_type == "system" for t in group_tasks)
+            else "heartbeat_user"
+        )
+
         message_tool = agent.tools.get("message")
-        if not isinstance(message_tool, MessageTool):
-            yield
-            return
         allowed: set[str] = set()
-        for t in group_tasks:
-            allowed |= t.recipient_channels()
-        # Use "|" so task names that legitimately contain "," can't alias.
-        tag = "|".join(sorted({t.name for t in group_tasks if t.task_type != "announcement"}))
-        with message_tool.scoped(
-            allowed_channels=allowed or None,
-            task_tag=tag or None,
-        ):
-            yield
+        tag = ""
+        if isinstance(message_tool, MessageTool):
+            for t in group_tasks:
+                allowed |= t.recipient_channels()
+            # Use "|" so task names that legitimately contain "," can't alias.
+            tag = "|".join(sorted({t.name for t in group_tasks if t.task_type != "announcement"}))
+
+        with llm_telemetry_context(task_kind=kind, is_synthetic=True):
+            if isinstance(message_tool, MessageTool):
+                with message_tool.scoped(
+                    allowed_channels=allowed or None,
+                    task_tag=tag or None,
+                ):
+                    yield
+            else:
+                yield
 
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(

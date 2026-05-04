@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -159,6 +160,13 @@ class LLMProvider(ABC):
     )
 
     _SENTINEL = object()
+
+    # Set by construction-site code in nanobot.py / cli/commands.py from the
+    # ProviderSpec.name (e.g. "anthropic", "gemini", "openrouter"). Used by
+    # the $ai_generation telemetry to tag the resolved post-fallback provider
+    # so PostHog dashboards can split spend by upstream. Empty when nothing
+    # set it (e.g. unit-test providers); telemetry tolerates that.
+    provider_name: str = ""
 
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key
@@ -479,12 +487,7 @@ class LLMProvider(ABC):
 
     async def _safe_chat(self, **kwargs: Any) -> LLMResponse:
         """Call chat() and convert unexpected exceptions to error responses."""
-        try:
-            return await self.chat(**kwargs)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+        return await self._run_with_telemetry(self.chat, kwargs)
 
     async def chat_stream(
         self,
@@ -515,12 +518,62 @@ class LLMProvider(ABC):
 
     async def _safe_chat_stream(self, **kwargs: Any) -> LLMResponse:
         """Call chat_stream() and convert unexpected exceptions to error responses."""
+        return await self._run_with_telemetry(self.chat_stream, kwargs)
+
+    # ── $ai_generation telemetry ─────────────────────────────────────────
+
+    async def _run_with_telemetry(
+        self,
+        call: Callable[..., Awaitable[LLMResponse]],
+        kwargs: dict[str, Any],
+    ) -> LLMResponse:
+        """Invoke an LLM call, convert exceptions to error responses, and
+        emit one ``$ai_generation`` event. Shared body of ``_safe_chat`` and
+        ``_safe_chat_stream`` — keep them in lock-step on retries, latency
+        accounting, and event emission."""
+        start = time.monotonic()
         try:
-            return await self.chat_stream(**kwargs)
+            response = await call(**kwargs)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+            response = LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+        self._emit_ai_generation_event(
+            kwargs.get("model"), response, time.monotonic() - start,
+        )
+        return response
+
+    def _emit_ai_generation_event(
+        self,
+        requested_model: str | None,
+        response: LLMResponse,
+        latency_s: float,
+    ) -> None:
+        """Fire one PostHog ``$ai_generation`` event for this LLM call.
+
+        Wraps the privacy-preserving emit in :mod:`nanobot.analytics.llm_telemetry`.
+        Fire-and-forget: any exception is swallowed inside the helper.
+
+        Token counts come from ``response.usage`` (already normalized across
+        providers — Anthropic and OpenAI-compat both populate
+        ``prompt_tokens`` / ``completion_tokens`` / ``cached_tokens``).
+        """
+        try:
+            from nanobot.analytics.llm_telemetry import track_llm_generation
+
+            usage = response.usage or {}
+            track_llm_generation(
+                model=str(requested_model or getattr(self, "default_model", "") or ""),
+                provider=str(self.provider_name or ""),
+                input_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                output_tokens=int(usage.get("completion_tokens", 0) or 0),
+                cache_read_tokens=int(usage.get("cached_tokens", 0) or 0),
+                latency_s=latency_s,
+                is_error=response.finish_reason == "error",
+                http_status=response.error_status_code,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must never crash the loop.
+            logger.opt(exception=True).debug("ai_generation telemetry emit failed")
 
     async def chat_stream_with_retry(
         self,
