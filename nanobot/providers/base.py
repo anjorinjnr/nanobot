@@ -487,17 +487,7 @@ class LLMProvider(ABC):
 
     async def _safe_chat(self, **kwargs: Any) -> LLMResponse:
         """Call chat() and convert unexpected exceptions to error responses."""
-        start = time.monotonic()
-        try:
-            response = await self.chat(**kwargs)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            response = LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
-        self._emit_ai_generation_event(
-            kwargs.get("model"), response, time.monotonic() - start,
-        )
-        return response
+        return await self._run_with_telemetry(self.chat, kwargs)
 
     async def chat_stream(
         self,
@@ -528,9 +518,22 @@ class LLMProvider(ABC):
 
     async def _safe_chat_stream(self, **kwargs: Any) -> LLMResponse:
         """Call chat_stream() and convert unexpected exceptions to error responses."""
+        return await self._run_with_telemetry(self.chat_stream, kwargs)
+
+    # ── $ai_generation telemetry ─────────────────────────────────────────
+
+    async def _run_with_telemetry(
+        self,
+        call: Callable[..., Awaitable[LLMResponse]],
+        kwargs: dict[str, Any],
+    ) -> LLMResponse:
+        """Invoke an LLM call, convert exceptions to error responses, and
+        emit one ``$ai_generation`` event. Shared body of ``_safe_chat`` and
+        ``_safe_chat_stream`` — keep them in lock-step on retries, latency
+        accounting, and event emission."""
         start = time.monotonic()
         try:
-            response = await self.chat_stream(**kwargs)
+            response = await call(**kwargs)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -539,8 +542,6 @@ class LLMProvider(ABC):
             kwargs.get("model"), response, time.monotonic() - start,
         )
         return response
-
-    # ── $ai_generation telemetry ─────────────────────────────────────────
 
     def _emit_ai_generation_event(
         self,
@@ -561,24 +562,15 @@ class LLMProvider(ABC):
             from nanobot.analytics.llm_telemetry import track_llm_generation
 
             usage = response.usage or {}
-            input_tokens = int(usage.get("prompt_tokens", 0) or 0)
-            output_tokens = int(usage.get("completion_tokens", 0) or 0)
-            cache_read = int(usage.get("cached_tokens", 0) or 0)
-
-            model = requested_model or getattr(self, "default_model", "") or ""
-            provider = self.provider_name or ""
-            is_error = response.finish_reason == "error"
-            http_status = response.error_status_code
-
             track_llm_generation(
-                model=str(model),
-                provider=str(provider),
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cache_read_tokens=cache_read,
+                model=str(requested_model or getattr(self, "default_model", "") or ""),
+                provider=str(self.provider_name or ""),
+                input_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                output_tokens=int(usage.get("completion_tokens", 0) or 0),
+                cache_read_tokens=int(usage.get("cached_tokens", 0) or 0),
                 latency_s=latency_s,
-                is_error=is_error,
-                http_status=http_status,
+                is_error=response.finish_reason == "error",
+                http_status=response.error_status_code,
             )
         except Exception:  # noqa: BLE001 — telemetry must never crash the loop.
             logger.opt(exception=True).debug("ai_generation telemetry emit failed")
