@@ -126,9 +126,8 @@ def format_cap_hit_reply(reset_at: str | None) -> str:
     return _CAP_HIT_TEMPLATE.format(friendly_reset=_friendly_reset(reset_at))
 
 
-# Back-compat: some call-sites / tests still import ``CAP_HIT_REPLY`` as a
-# constant. Keep it available as the "no reset_at info" rendering — same
-# behavior as before this follow-up.
+# The "no reset_at" rendering, exposed as a constant for callers that want
+# the default copy without computing a reset phrase.
 CAP_HIT_REPLY = format_cap_hit_reply(None)
 
 
@@ -334,7 +333,7 @@ def maybe_append_quota_warn(
     if not isinstance(pct, int):
         return reply
     appendix = WARN_APPENDIX.format(pct=pct)
-    if appendix.strip() and appendix.strip() in reply:
+    if appendix in reply:  # defensive idempotency
         return reply
     return reply + appendix
 
