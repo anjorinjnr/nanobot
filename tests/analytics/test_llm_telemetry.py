@@ -7,8 +7,9 @@ can inspect every emitted event without touching the network. They cover:
 * error path (provider raises) → ``$ai_is_error=True``
 * heartbeat task_kind context → ``heartbeat_system`` / ``heartbeat_user``
 * synthetic flag honored
-* cost-table sanity: 1M Haiku in/out → $6.00, unknown model → $0
 * PII regression: no email / 10-digit number / >200-char free-form props
+
+Cost-table behavior is exercised in ``test_pricing.py``.
 """
 
 from __future__ import annotations
@@ -21,7 +22,6 @@ import pytest
 
 from nanobot.analytics import hook as hook_module
 from nanobot.analytics.llm_telemetry import (
-    estimate_cost_usd,
     llm_telemetry_context,
     track_llm_generation,
 )
@@ -75,57 +75,6 @@ def _last_event(client: MagicMock) -> tuple[str, dict[str, Any]]:
     args, kwargs = client.capture.call_args
     # capture(distinct_id, event_name, props)
     return args[1], args[2]
-
-
-# ── cost table ───────────────────────────────────────────────────────────
-
-
-def test_cost_table_haiku_one_million_each():
-    """1M input + 1M output @ Haiku rates = $1.00 + $5.00 = $6.00."""
-    cost = estimate_cost_usd(
-        "claude-haiku-4-5-20251001",
-        input_tokens=1_000_000,
-        output_tokens=1_000_000,
-    )
-    assert cost == pytest.approx(6.00, abs=1e-9)
-
-
-def test_cost_table_unknown_model_returns_zero():
-    assert estimate_cost_usd("not-a-real-model", input_tokens=10_000, output_tokens=10_000) == 0.0
-
-
-def test_cost_table_normalizes_bare_gemini_name():
-    """Caller may pass ``gemini-2.5-flash`` instead of ``gemini/gemini-2.5-flash``."""
-    bare = estimate_cost_usd("gemini-2.5-flash", input_tokens=1_000_000, output_tokens=1_000_000)
-    full = estimate_cost_usd("gemini/gemini-2.5-flash", input_tokens=1_000_000, output_tokens=1_000_000)
-    assert bare == full == pytest.approx(0.075 + 0.30, abs=1e-9)
-
-
-def test_cost_table_cache_read_billed_at_cache_rate():
-    """Anthropic cache read is billed at 0.10/MTok, not 1.00 input."""
-    full_input = estimate_cost_usd(
-        "claude-haiku-4-5-20251001",
-        input_tokens=1_000_000,
-        output_tokens=0,
-    )
-    half_cached = estimate_cost_usd(
-        "claude-haiku-4-5-20251001",
-        input_tokens=1_000_000,
-        output_tokens=0,
-        cache_read_tokens=500_000,
-    )
-    # 500k @ $1/MTok + 500k @ $0.10/MTok = $0.55, vs all-fresh $1.00.
-    assert full_input == pytest.approx(1.00, abs=1e-9)
-    assert half_cached == pytest.approx(0.55, abs=1e-9)
-
-
-def test_cost_table_free_models_are_zero():
-    cost = estimate_cost_usd(
-        "openrouter/deepseek/deepseek-chat-v3.2:free",
-        input_tokens=10_000_000,
-        output_tokens=10_000_000,
-    )
-    assert cost == 0.0
 
 
 # ── direct track_llm_generation ───────────────────────────────────────────

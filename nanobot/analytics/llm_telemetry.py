@@ -10,9 +10,9 @@ Privacy contract: prompt and completion content never enter this module.
 Only counts, model identifiers, latency, cost, and a small set of context
 flags (task_kind, tier, household_id) are emitted.
 
-Cost estimation tracks Homer's ``_USD_PER_MTOK`` table verbatim. This is
-acknowledged tech debt — the two should be factored into a shared package
-later. For now, when adding/changing prices update both files together.
+Cost estimation lives in :mod:`nanobot.analytics.pricing`; this module
+re-exports :func:`estimate_cost_usd` for back-compat. Update prices there
+— Homer's ``tools/analytics/llm_call.py`` imports the same table.
 
 Heartbeat / cron callers set ``task_kind`` via ``llm_telemetry_context()``
 before invoking the agent loop; the LLM-call boundary in
@@ -28,68 +28,12 @@ import os
 from contextlib import contextmanager
 from typing import Any, Iterator
 
+from nanobot.analytics.pricing import estimate_cost_usd
+
 logger = logging.getLogger(__name__)
 
 
-# ── Pricing table (USD per 1M tokens) ────────────────────────────────────
-# Keep in sync with homer's tools/analytics/llm_call.py::_USD_PER_MTOK.
-# Tuples: (input, output) or (input, output, cache_read).
-_USD_PER_MTOK: dict[str, tuple[float, float] | tuple[float, float, float]] = {
-    # Anthropic
-    "claude-haiku-4-5-20251001": (1.00, 5.00, 0.10),
-    "claude-sonnet-4-6": (3.00, 15.00, 0.30),
-    # Gemini
-    "gemini/gemini-2.5-flash": (0.075, 0.30),
-    "gemini/gemini-3-flash-preview": (0.30, 2.50),
-    "gemini/gemini-3.1-pro-preview": (1.25, 10.00),
-    # OpenRouter — DeepSeek
-    "openrouter/deepseek/deepseek-chat-v3.2": (0.27, 0.41),
-    "openrouter/deepseek/deepseek-chat-v3.2:free": (0.0, 0.0),
-    # OpenRouter — Cerebras Qwen
-    "cerebras/qwen-3-235b-a22b-instruct": (0.60, 1.20),
-}
-
-
 _VALID_TASK_KINDS = {"chat", "heartbeat_system", "heartbeat_user", "tool_classifier"}
-
-
-def _normalize_model(model: str) -> str:
-    """Match the emitted model string against the price-table key.
-
-    Some callers pass the bare API name (``gemini-2.5-flash``) while
-    nanobot's config uses the prefixed form (``gemini/gemini-2.5-flash``).
-    Accept either.
-    """
-    if not model:
-        return ""
-    if model in _USD_PER_MTOK:
-        return model
-    for prefix in ("gemini/", "openrouter/", "cerebras/"):
-        if (prefix + model) in _USD_PER_MTOK:
-            return prefix + model
-    return model
-
-
-def estimate_cost_usd(
-    model: str,
-    *,
-    input_tokens: int,
-    output_tokens: int,
-    cache_read_tokens: int = 0,
-) -> float:
-    """Return a USD estimate for one call. 0.0 if the model isn't priced."""
-    key = _normalize_model(model)
-    prices = _USD_PER_MTOK.get(key)
-    if prices is None:
-        return 0.0
-    in_rate, out_rate = prices[0], prices[1]
-    cache_rate = prices[2] if len(prices) >= 3 else in_rate
-    billed_input = max(0, input_tokens - cache_read_tokens)
-    return (
-        (billed_input * in_rate)
-        + (cache_read_tokens * cache_rate)
-        + (output_tokens * out_rate)
-    ) / 1_000_000.0
 
 
 # ── task_kind / synthetic context ─────────────────────────────────────────
