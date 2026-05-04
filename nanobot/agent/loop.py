@@ -400,17 +400,44 @@ class AgentLoop:
     def _resolve_guest_agent_workspace(self, sender_id: str) -> tuple[ContextBuilder, SessionManager, frozenset[str]] | None:
         """Check if sender_id is a guest and return guest-specific context + sessions.
 
-        Reads guest_agent_acl.json from the main workspace. If the sender matches,
-        returns a (ContextBuilder, SessionManager, blocked_tools) tuple pointing to the
-        guest_agent/ subdirectory.
+        Two routing paths:
 
-        Per-scope-type override: if ``<guest_workspace>/scope_workspaces.json``
-        maps the sender to a subdirectory, return a tuple pointing to that
-        subdirectory instead. Used by Homer's family_history scope to swap to
-        a dedicated historian SOUL/AGENTS workspace per inbound, so the agent's
-        identity matches the relationship rather than defaulting to the
-        generic guest framing.
+        1. **Per-scope-type override** (preferred): if the agent's own
+           workspace contains ``scope_workspaces.json`` mapping sender →
+           subdir, return a tuple pointing to that subdir's
+           ContextBuilder/SessionManager. Used when the agent is already
+           running as the guest nanobot (workspace=guest_workspace) and we
+           want to swap to a per-scope-type SOUL/AGENTS for the active
+           sender.
+
+        2. **ACL-based override** (legacy): reads ``guest_agent_acl.json``
+           from the agent's workspace. If the sender matches, returns a
+           tuple pointing to the ``guest_agent/`` subdirectory of the main
+           workspace. Used when one nanobot serves both main and guest.
+
+        Per-scope-type also applies when the ACL path matches — so a single
+        nanobot setup with both ACL and scope_workspaces.json gets the
+        scope-type subdir within the guest_agent/ workspace.
         """
+        # Path 1: scope_workspaces.json directly under self.workspace.
+        # Honours the case where this AgentLoop IS the guest nanobot.
+        sw = self._read_scope_workspaces(self.workspace)
+        if sw is not None:
+            subdir = self._lookup_scope_workspace(sw, sender_id)
+            if subdir:
+                candidate = self.workspace / subdir
+                if candidate.exists():
+                    logger.info(
+                        "scope_workspaces: sender={} → workspace={}",
+                        sender_id, candidate,
+                    )
+                    return self._cached_guest_workspace(candidate)
+                logger.warning(
+                    "scope_workspaces.json maps sender {} to {} but {} missing — falling back",
+                    sender_id, subdir, candidate,
+                )
+
+        # Path 2: legacy ACL routing — guest_agent_acl.json in main workspace.
         acl_path = self.workspace / "guest_agent_acl.json"
         if not acl_path.exists():
             return None
@@ -436,33 +463,20 @@ class AgentLoop:
             logger.warning("Guest agent ACL matched sender {} but guest_agent workspace missing", sender_id)
             return None
 
-        # Resolve a scope-type override workspace if the sender has one.
-        # scope_workspaces.json: { "<sender_id_or_jid>": "<subdir>" }
+        # Within the legacy guest_agent/ workspace, scope_workspaces.json may
+        # also exist — check it again so single-nanobot setups get the same
+        # per-scope-type subdir routing.
         guest_agent_workspace = default_workspace
-        sw_path = default_workspace / "scope_workspaces.json"
-        if sw_path.exists():
-            try:
-                sw = json.loads(sw_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                sw = {}
-            subdir = sw.get(sender_id)
-            if not subdir:
-                # Try common JID variants too.
-                for variant in (
-                    f"{sender_id}@s.whatsapp.net",
-                    f"{sender_id}@lid",
-                    f"tg:{sender_id}",
-                ):
-                    subdir = sw.get(variant)
-                    if subdir:
-                        break
+        sw2 = self._read_scope_workspaces(default_workspace)
+        if sw2 is not None:
+            subdir = self._lookup_scope_workspace(sw2, sender_id)
             if subdir:
                 candidate = default_workspace / subdir
                 if candidate.exists():
                     guest_agent_workspace = candidate
                     logger.info(
-                        "scope_workspaces: sender={} → subdir={}",
-                        sender_id, subdir,
+                        "scope_workspaces (within guest_agent): sender={} → workspace={}",
+                        sender_id, candidate,
                     )
                 else:
                     logger.warning(
@@ -470,15 +484,46 @@ class AgentLoop:
                         sender_id, subdir, candidate,
                     )
 
-        # Cache guest_agent context + sessions to avoid re-creating per message
-        if guest_agent_workspace not in self._guest_agent_cache:
-            blocked = self._load_blocked_tools(guest_agent_workspace)
-            self._guest_agent_cache[guest_agent_workspace] = (
-                ContextBuilder(guest_agent_workspace),
-                SessionManager(guest_agent_workspace),
+        return self._cached_guest_workspace(guest_agent_workspace)
+
+    @staticmethod
+    def _read_scope_workspaces(workspace: Path) -> dict[str, str] | None:
+        """Read scope_workspaces.json, returning None if absent or unparseable."""
+        path = workspace / "scope_workspaces.json"
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _lookup_scope_workspace(sw: dict[str, str], sender_id: str) -> str | None:
+        """Find a sender → subdir mapping, trying common JID/LID/Telegram variants."""
+        if sender_id in sw:
+            return sw[sender_id]
+        for variant in (
+            f"{sender_id}@s.whatsapp.net",
+            f"{sender_id}@lid",
+            f"tg:{sender_id}",
+        ):
+            if variant in sw:
+                return sw[variant]
+        return None
+
+    def _cached_guest_workspace(
+        self, workspace: Path,
+    ) -> tuple[ContextBuilder, SessionManager, frozenset[str]]:
+        """Get or build cached (ContextBuilder, SessionManager, blocked) for a workspace."""
+        if workspace not in self._guest_agent_cache:
+            blocked = self._load_blocked_tools(workspace)
+            self._guest_agent_cache[workspace] = (
+                ContextBuilder(workspace),
+                SessionManager(workspace),
                 blocked,
             )
-        return self._guest_agent_cache[guest_agent_workspace]
+        return self._guest_agent_cache[workspace]
 
     @staticmethod
     def _load_blocked_tools(workspace: Path) -> frozenset[str]:
