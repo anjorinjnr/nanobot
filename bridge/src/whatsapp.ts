@@ -159,6 +159,14 @@ export class WhatsAppClient {
         const content = this.getTextContent(unwrapped);
         let fallbackContent: string | null = null;
         const mediaPaths: string[] = [];
+        // Audio is special: the nanobot WhatsApp channel keys off
+        // content == "[Voice Message]" to invoke Whisper transcription on
+        // media_paths[0]. For images/documents/videos the channel just
+        // attaches a "[file: /path]" tag and the LLM looks at the path —
+        // for audio, transcription is the actual extraction step, so the
+        // sentinel content must arrive verbatim even when a media path is
+        // present.
+        let isAudio = false;
 
         if (unwrapped.imageMessage) {
           fallbackContent = '[Image]';
@@ -174,13 +182,10 @@ export class WhatsAppClient {
           const path = await this.downloadMedia(msg, unwrapped.videoMessage.mimetype ?? undefined);
           if (path) mediaPaths.push(path);
         } else if (unwrapped.audioMessage) {
-          // Voice note (ptt) or audio file — download to disk like other media.
-          // The nanobot WhatsApp channel transcribes via Whisper from a file
-          // path (BaseChannel.transcribe_audio), and downstream skills (e.g.
-          // family-historian) reference the file via --storage-path. Sending
-          // base64 in an `audio` field meant nanobot's media_paths was empty
-          // and the message body came through as "[Voice Message: Audio not
-          // available]". Default mime is OGG/Opus for PTT.
+          // Voice note (ptt) or audio file — download to disk like other media,
+          // and force the [Voice Message] sentinel content so the channel
+          // triggers transcription. Default mime is OGG/Opus for PTT.
+          isAudio = true;
           fallbackContent = '[Voice Message]';
           const path = await this.downloadMedia(
             msg,
@@ -189,7 +194,14 @@ export class WhatsAppClient {
           if (path) mediaPaths.push(path);
         }
 
-        const finalContent = content || (mediaPaths.length === 0 ? fallbackContent : '') || '';
+        // For audio, ALWAYS surface fallbackContent ([Voice Message]) so the
+        // channel's transcription branch fires. For other media types, an
+        // empty content + the media path is fine because the channel adds a
+        // [file: /path] / [image: /path] tag downstream.
+        const finalContent =
+          content ||
+          (isAudio || mediaPaths.length === 0 ? fallbackContent : '') ||
+          '';
         if (!finalContent && mediaPaths.length === 0) continue;
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
