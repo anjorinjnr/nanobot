@@ -403,6 +403,13 @@ class AgentLoop:
         Reads guest_agent_acl.json from the main workspace. If the sender matches,
         returns a (ContextBuilder, SessionManager, blocked_tools) tuple pointing to the
         guest_agent/ subdirectory.
+
+        Per-scope-type override: if ``<guest_workspace>/scope_workspaces.json``
+        maps the sender to a subdirectory, return a tuple pointing to that
+        subdirectory instead. Used by Homer's family_history scope to swap to
+        a dedicated historian SOUL/AGENTS workspace per inbound, so the agent's
+        identity matches the relationship rather than defaulting to the
+        generic guest framing.
         """
         acl_path = self.workspace / "guest_agent_acl.json"
         if not acl_path.exists():
@@ -424,10 +431,44 @@ class AgentLoop:
         if not matched:
             return None
 
-        guest_agent_workspace = self._guest_workspace or self.workspace / "guest_agent"
-        if not guest_agent_workspace.exists():
+        default_workspace = self._guest_workspace or self.workspace / "guest_agent"
+        if not default_workspace.exists():
             logger.warning("Guest agent ACL matched sender {} but guest_agent workspace missing", sender_id)
             return None
+
+        # Resolve a scope-type override workspace if the sender has one.
+        # scope_workspaces.json: { "<sender_id_or_jid>": "<subdir>" }
+        guest_agent_workspace = default_workspace
+        sw_path = default_workspace / "scope_workspaces.json"
+        if sw_path.exists():
+            try:
+                sw = json.loads(sw_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                sw = {}
+            subdir = sw.get(sender_id)
+            if not subdir:
+                # Try common JID variants too.
+                for variant in (
+                    f"{sender_id}@s.whatsapp.net",
+                    f"{sender_id}@lid",
+                    f"tg:{sender_id}",
+                ):
+                    subdir = sw.get(variant)
+                    if subdir:
+                        break
+            if subdir:
+                candidate = default_workspace / subdir
+                if candidate.exists():
+                    guest_agent_workspace = candidate
+                    logger.info(
+                        "scope_workspaces: sender={} → subdir={}",
+                        sender_id, subdir,
+                    )
+                else:
+                    logger.warning(
+                        "scope_workspaces.json maps sender {} to {} but {} missing — falling back",
+                        sender_id, subdir, candidate,
+                    )
 
         # Cache guest_agent context + sessions to avoid re-creating per message
         if guest_agent_workspace not in self._guest_agent_cache:
