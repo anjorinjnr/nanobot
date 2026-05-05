@@ -1341,14 +1341,40 @@ class AgentLoop:
                 logger.debug("Analytics hook error (non-fatal)", exc_info=True)
 
         meta = dict(msg.metadata or {})
-        if on_stream is not None and stop_reason != STOP_ERROR:
+        streamed = on_stream is not None and stop_reason != STOP_ERROR
+        if streamed:
             meta["_streamed"] = True
 
-        # Post-turn quota warn — append a single-message nudge to the agent's
-        # reply when the household crossed the warn threshold this turn.
+        # Post-turn quota warn — nudge the user when the household crossed the
+        # warn threshold this turn.
+        #
+        # On non-streamed channels we append the warn copy to ``final_content``
+        # so the user reads one coherent message. On streamed channels (Telegram
+        # et al.) the user already saw ``final_content`` live; the dispatcher
+        # then SKIPS the returned OutboundMessage when ``_streamed=True`` (see
+        # ``ChannelManager._send_once``), which means an in-content appendix
+        # would never reach the user (issue #58). Publish the appendix as a
+        # separate, non-streamed follow-up message instead — same delivery path
+        # the heartbeat / cron uses for proactive nudges. ``final_content``
+        # itself stays unchanged so session history doesn't double-record the
+        # appendix that already lives in the streamed transcript.
         try:
             from nanobot.analytics.quota_gate import maybe_append_quota_warn
-            final_content = maybe_append_quota_warn(_turn_ctx, final_content) or final_content
+            with_warn = maybe_append_quota_warn(_turn_ctx, final_content)
+            if with_warn is not None and with_warn != final_content:
+                if streamed:
+                    appendix_text = with_warn[len(final_content):].lstrip()
+                    if appendix_text:
+                        await self.bus.publish_outbound(
+                            OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content=appendix_text,
+                                metadata=dict(msg.metadata or {}),
+                            )
+                        )
+                else:
+                    final_content = with_warn
         except Exception:
             logger.debug("quota_gate warn appendix error (non-fatal)", exc_info=True)
 
