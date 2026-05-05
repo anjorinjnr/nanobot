@@ -28,8 +28,11 @@ on the portal side.
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
-from datetime import datetime
+import secrets
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -42,6 +45,43 @@ _CHANNEL_TO_COLUMN: dict[str, str] = {
     "whatsapp": "phone",
     "email": "email",
 }
+
+# Media bigger than this gets logged + skipped rather than uploaded. WhatsApp
+# voice notes can be multi-MB; the portal cap is generous so contributors
+# don't lose context. Above this is almost certainly a misconfiguration.
+_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+
+def _kind_from_mime(mime: str | None) -> str | None:
+    """Map a mime type to the `pending_upload.kind` enum (image/audio/video).
+
+    Returns None for unknown / non-media — the caller skips the upload.
+    """
+    if not mime:
+        return None
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("audio/"):
+        return "audio"
+    if mime.startswith("video/"):
+        return "video"
+    return None
+
+
+def _safe_filename(name: str) -> str:
+    """Sanitize a filename to match the portal's _STORAGE_PATH_RE charset."""
+    cleaned = "".join(c if c.isalnum() or c in ".-_" else "_" for c in name)
+    return cleaned[:200] or "file"
+
+
+def _build_storage_path(filename: str) -> str:
+    """`YYYY/MM/<12-hex>-<safe-filename>` — matches portal create_signed_upload_url."""
+    now = datetime.now(timezone.utc)
+    return f"{now.strftime('%Y/%m')}/{secrets.token_hex(6)}-{_safe_filename(filename)}"
+
+
+def _bucket_for(household_id: str) -> str:
+    return f"history-media-{household_id}"
 
 
 class ChatPersistHook:
@@ -66,6 +106,10 @@ class ChatPersistHook:
         # and dict assignment is atomic in CPython.
         self._contrib_cache: dict[tuple[str, str], Optional[str]] = {}
         self._client: httpx.AsyncClient | None = None
+        # Separate client for /storage/v1: different base path, different
+        # default timeout (uploads run minutes for big voice notes; the REST
+        # client's 10s would clobber them).
+        self._storage_client: httpx.AsyncClient | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -106,13 +150,30 @@ class ChatPersistHook:
             )
         return self._client
 
+    def _storage_http(self) -> httpx.AsyncClient:
+        if self._storage_client is None:
+            self._storage_client = httpx.AsyncClient(
+                base_url=f"{self._supabase_url}/storage/v1",
+                headers=self._service_role_headers(),
+                timeout=60.0,
+            )
+        return self._storage_client
+
+    def _service_role_headers(self) -> dict[str, str]:
+        return {
+            "apikey": self._service_key,
+            "Authorization": f"Bearer {self._service_key}",
+        }
+
     async def aclose(self) -> None:
-        """Close the underlying httpx client. Safe to call repeatedly."""
-        if self._client is not None:
-            try:
-                await self._client.aclose()
-            finally:
-                self._client = None
+        """Close underlying httpx clients. Safe to call repeatedly."""
+        for attr in ("_client", "_storage_client"):
+            client = getattr(self, attr)
+            if client is not None:
+                try:
+                    await client.aclose()
+                finally:
+                    setattr(self, attr, None)
 
     # ── public hooks (called from AgentLoop) ─────────────────────────────
 
@@ -136,9 +197,15 @@ class ChatPersistHook:
         contributor_id = await self._resolve_contributor(channel, sender_id)
         if contributor_id is None:
             return None
+        pending_upload = await self._upload_first_media(media or [])
         text = content or ""
-        if text or media:
-            await self._insert(role="user", contributor_id=contributor_id, text=text)
+        if text or pending_upload or media:
+            await self._insert(
+                role="user",
+                contributor_id=contributor_id,
+                text=text,
+                pending_upload=pending_upload,
+            )
         return {"contributor_id": contributor_id, "channel": channel}
 
     async def on_response_sent(
@@ -246,24 +313,179 @@ class ChatPersistHook:
         return sender_id.strip()
 
     async def _insert(
-        self, *, role: str, contributor_id: str, text: str,
+        self,
+        *,
+        role: str,
+        contributor_id: str,
+        text: str,
+        pending_upload: dict[str, Any] | None = None,
     ) -> None:
+        body: dict[str, Any] = {
+            "household_id": self._household_id,
+            "contributor_id": contributor_id,
+            "role": role,
+            "text": text,
+        }
+        if pending_upload is not None:
+            body["pending_upload"] = pending_upload
         try:
-            r = await self._http().post(
-                "/hist_chat_messages",
-                json={
-                    "household_id": self._household_id,
-                    "contributor_id": contributor_id,
-                    "role": role,
-                    "text": text,
-                },
-            )
+            r = await self._http().post("/hist_chat_messages", json=body)
             r.raise_for_status()
         except Exception:
             logger.warning(
                 "chat_persist: insert failed (role=%s contributor=%s)",
                 role, contributor_id, exc_info=True,
             )
+
+    async def _upload_first_media(
+        self, media: list[str],
+    ) -> dict[str, Any] | None:
+        """Upload the first media item to Supabase storage; return pending_upload.
+
+        Channel adapters hand us already-downloaded local file paths. We only
+        persist one upload per row (matching the portal's `pending_upload`
+        single-object schema); additional items in the same turn are logged
+        and dropped — multi-attachment WhatsApp messages are rare and the
+        contributor can re-send.
+
+        Returns None if media is empty, the file is missing, the kind isn't
+        recognized as image/audio/video, the file is too big, or the upload
+        fails — in every case the caller still records the user-row text.
+        """
+        paths = [p for p in media if isinstance(p, str) and p]
+        if not paths:
+            return None
+        if len(paths) > 1:
+            logger.warning(
+                "chat_persist: multi-attachment turn (%d items) — keeping first, dropping %r",
+                len(paths), paths[1:],
+            )
+        path_str = paths[0]
+        path = Path(path_str)
+        if not path.is_file():
+            logger.warning("chat_persist: media file not found at %s — skipping", path_str)
+            return None
+
+        mime, _ = mimetypes.guess_type(path_str)
+        kind = _kind_from_mime(mime)
+        if kind is None:
+            logger.warning(
+                "chat_persist: unsupported media kind (mime=%r path=%s) — skipping",
+                mime, path_str,
+            )
+            return None
+
+        try:
+            size = path.stat().st_size
+        except OSError:
+            logger.warning("chat_persist: stat failed on %s — skipping", path_str, exc_info=True)
+            return None
+        if size > _MAX_UPLOAD_BYTES:
+            logger.warning(
+                "chat_persist: media exceeds %d bytes (size=%d path=%s) — skipping",
+                _MAX_UPLOAD_BYTES, size, path_str,
+            )
+            return None
+
+        filename = path.name
+        storage_path = _build_storage_path(filename)
+        bucket = _bucket_for(self._household_id)
+
+        try:
+            data = path.read_bytes()
+        except OSError:
+            logger.warning("chat_persist: read failed on %s — skipping", path_str, exc_info=True)
+            return None
+
+        if not await self._upload_object(bucket, storage_path, data, mime):
+            return None
+
+        return {
+            "storage_path": f"{bucket}/{storage_path}",
+            "filename": filename,
+            "mime": mime,
+            "kind": kind,
+        }
+
+    async def _upload_object(
+        self, bucket: str, object_path: str, data: bytes, mime: str | None,
+    ) -> bool:
+        """PUT object bytes; auto-provision the bucket on first 404/400.
+
+        Returns True on success, False on any failure. Logs WARN with the
+        underlying error so a failed upload can be diagnosed without crashing
+        the conversation.
+        """
+        path = f"/object/{bucket}/{object_path}"
+        headers = {"Content-Type": mime or "application/octet-stream"}
+
+        async def _put() -> httpx.Response | None:
+            try:
+                return await self._storage_http().post(path, headers=headers, content=data)
+            except Exception:
+                logger.warning(
+                    "chat_persist: storage upload error (bucket=%s path=%s)",
+                    bucket, object_path, exc_info=True,
+                )
+                return None
+
+        resp = await _put()
+        if resp is None:
+            return False
+        if resp.status_code in (200, 201):
+            return True
+        if resp.status_code in (400, 404):
+            # Bucket likely missing — log the original error so a non-bucket
+            # 400 (malformed path, etc.) is still diagnosable post-retry.
+            logger.debug(
+                "chat_persist: storage upload returned %d, attempting bucket provision (body=%s)",
+                resp.status_code, resp.text[:200],
+            )
+            if not await self._ensure_bucket(bucket):
+                return False
+            resp = await _put()
+            if resp is None:
+                return False
+            if resp.status_code in (200, 201):
+                return True
+        logger.warning(
+            "chat_persist: storage upload failed (status=%d bucket=%s path=%s body=%s)",
+            resp.status_code, bucket, object_path, resp.text[:200],
+        )
+        return False
+
+    async def _ensure_bucket(self, bucket: str) -> bool:
+        """Create the per-household private bucket if missing.
+
+        Mirrors `backend/services/history_service.py:_ensure_history_bucket`:
+        Storage returns HTTP 400 with a 409-shaped JSON body when a bucket
+        already exists, so we have to read the body to distinguish "already
+        there" (success) from a real validation error.
+        """
+        try:
+            resp = await self._storage_http().post(
+                "/bucket",
+                headers={"Content-Type": "application/json"},
+                json={"id": bucket, "name": bucket, "public": False},
+                timeout=15.0,
+            )
+        except Exception:
+            logger.warning("chat_persist: bucket ensure error (bucket=%s)", bucket, exc_info=True)
+            return False
+        if resp.status_code in (200, 201, 409):
+            return True
+        if resp.status_code == 400:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            if str(body.get("statusCode")) == "409" or body.get("error") == "Duplicate":
+                return True
+        logger.warning(
+            "chat_persist: bucket ensure failed (status=%d bucket=%s body=%s)",
+            resp.status_code, bucket, resp.text[:200],
+        )
+        return False
 
 
 # ── singleton accessor ───────────────────────────────────────────────────

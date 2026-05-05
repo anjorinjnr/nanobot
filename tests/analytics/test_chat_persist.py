@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from nanobot.analytics import chat_persist as chat_persist_module
-from nanobot.analytics.chat_persist import ChatPersistHook, get_chat_persist_hook
+from nanobot.analytics.chat_persist import (
+    ChatPersistHook,
+    _build_storage_path,
+    _kind_from_mime,
+    _safe_filename,
+    get_chat_persist_hook,
+)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -349,3 +356,274 @@ class TestOnResponseSent:
         # Drain the scheduled coroutine so the test doesn't leak unawaited tasks.
         await scheduled[0]
         assert client.post.await_count == 1
+
+
+# ── helpers / pure functions ─────────────────────────────────────────────
+
+
+class TestPureHelpers:
+    def test_kind_from_mime_image(self):
+        assert _kind_from_mime("image/jpeg") == "image"
+        assert _kind_from_mime("image/png") == "image"
+
+    def test_kind_from_mime_audio(self):
+        assert _kind_from_mime("audio/ogg") == "audio"
+
+    def test_kind_from_mime_video(self):
+        assert _kind_from_mime("video/mp4") == "video"
+
+    def test_kind_from_mime_unknown_returns_none(self):
+        assert _kind_from_mime(None) is None
+        assert _kind_from_mime("application/pdf") is None
+        assert _kind_from_mime("") is None
+
+    def test_safe_filename_strips_unsafe(self):
+        assert _safe_filename("hello world!@#.jpg") == "hello_world___.jpg"
+
+    def test_safe_filename_keeps_dotdash(self):
+        assert _safe_filename("photo-2024.jpg") == "photo-2024.jpg"
+
+    def test_safe_filename_truncates(self):
+        out = _safe_filename("a" * 500 + ".jpg")
+        assert len(out) <= 200
+
+    def test_safe_filename_empty_input_falls_back(self):
+        assert _safe_filename("") == "file"
+
+    def test_safe_filename_replaces_unsafe_with_underscore(self):
+        # Unsafe chars become "_"; underscores are themselves portal-safe so
+        # there's no further fallback. (`_` is in [A-Za-z0-9._\-].)
+        assert _safe_filename("###") == "___"
+
+    def test_build_storage_path_matches_portal_regex(self):
+        import re
+        # Mirror of backend/routers/history.py:_STORAGE_PATH_RE
+        pattern = re.compile(r"^\d{4}/\d{2}/[a-f0-9]{12}-[A-Za-z0-9._\-]{1,200}$")
+        path = _build_storage_path("photo.jpg")
+        assert pattern.match(path), f"{path!r} does not match portal regex"
+
+
+# ── on_message_received with media ───────────────────────────────────────
+
+
+class TestMediaUpload:
+    @pytest.fixture
+    def jpg_file(self, tmp_path):
+        p = tmp_path / "photo.jpg"
+        p.write_bytes(b"\xff\xd8\xff\xe0fake jpeg bytes")
+        return p
+
+    @pytest.fixture
+    def ogg_file(self, tmp_path):
+        p = tmp_path / "voice.ogg"
+        p.write_bytes(b"OggS" + b"\x00" * 100)
+        return p
+
+    @pytest.fixture
+    def patched_httpx(self, monkeypatch):
+        """Patch httpx.AsyncClient inside chat_persist for storage calls.
+
+        Returns a MagicMock with a `.post` AsyncMock you can configure.
+        Successful by default.
+        """
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=cm)
+        cm.__aexit__ = AsyncMock(return_value=False)
+
+        def _resp(status: int, body: dict | None = None, text: str = ""):
+            r = MagicMock()
+            r.status_code = status
+            r.text = text
+            r.json = MagicMock(return_value=body or {})
+            return r
+
+        cm.post = AsyncMock(return_value=_resp(201))
+        cm._resp = _resp  # expose so tests can override
+
+        monkeypatch.setattr(chat_persist_module.httpx, "AsyncClient", lambda **kw: cm)
+        return cm
+
+    @pytest.mark.asyncio
+    async def test_image_upload_sets_pending_upload(self, jpg_file, patched_httpx):
+        hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
+        ctx = await hook.on_message_received(
+            channel="whatsapp",
+            sender_id="14125551234",
+            content="check this out",
+            media=[str(jpg_file)],
+            timestamp=datetime.now(timezone.utc),
+        )
+        assert ctx == {"contributor_id": "c-1", "channel": "whatsapp"}
+        # Storage upload happened.
+        assert patched_httpx.post.await_count >= 1
+        upload_call = patched_httpx.post.await_args_list[0]
+        # base_url=/storage/v1 is on the AsyncClient; the request path is relative.
+        assert upload_call.args[0].startswith("/object/history-media-hh-1/")
+        assert upload_call.kwargs["headers"]["Content-Type"] == "image/jpeg"
+        assert upload_call.kwargs["content"] == jpg_file.read_bytes()
+        # Insert body has pending_upload.
+        post_body = rest_client.post.await_args.kwargs["json"]
+        assert post_body["role"] == "user"
+        assert post_body["text"] == "check this out"
+        pu = post_body["pending_upload"]
+        assert pu["filename"] == "photo.jpg"
+        assert pu["mime"] == "image/jpeg"
+        assert pu["kind"] == "image"
+        assert pu["storage_path"].startswith("history-media-hh-1/")
+
+    @pytest.mark.asyncio
+    async def test_audio_upload_kind_audio(self, ogg_file, patched_httpx):
+        hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
+        await hook.on_message_received(
+            channel="whatsapp",
+            sender_id="14125551234",
+            content="",
+            media=[str(ogg_file)],
+            timestamp=datetime.now(timezone.utc),
+        )
+        post_body = rest_client.post.await_args.kwargs["json"]
+        assert post_body["pending_upload"]["kind"] == "audio"
+        assert post_body["pending_upload"]["mime"] == "audio/ogg"
+
+    @pytest.mark.asyncio
+    async def test_unsupported_mime_skips_upload_keeps_text(
+        self, tmp_path, patched_httpx,
+    ):
+        # PDF (kind not in image/audio/video) → no upload, no pending_upload,
+        # but the user row still records the text.
+        pdf = tmp_path / "doc.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+        hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
+        await hook.on_message_received(
+            channel="whatsapp",
+            sender_id="14125551234",
+            content="see attached",
+            media=[str(pdf)],
+            timestamp=datetime.now(timezone.utc),
+        )
+        # No storage upload.
+        assert patched_httpx.post.await_count == 0
+        # Insert went through with text, no pending_upload.
+        post_body = rest_client.post.await_args.kwargs["json"]
+        assert post_body["text"] == "see attached"
+        assert "pending_upload" not in post_body
+
+    @pytest.mark.asyncio
+    async def test_missing_file_skips_upload(self, tmp_path, patched_httpx):
+        ghost = str(tmp_path / "nope.jpg")
+        hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
+        await hook.on_message_received(
+            channel="whatsapp",
+            sender_id="14125551234",
+            content="hi",
+            media=[ghost],
+            timestamp=datetime.now(timezone.utc),
+        )
+        assert patched_httpx.post.await_count == 0
+        post_body = rest_client.post.await_args.kwargs["json"]
+        assert post_body["text"] == "hi"
+        assert "pending_upload" not in post_body
+
+    @pytest.mark.asyncio
+    async def test_oversize_file_skipped(self, tmp_path, patched_httpx, monkeypatch):
+        # Lower the cap so the test doesn't have to allocate 50MB.
+        monkeypatch.setattr(chat_persist_module, "_MAX_UPLOAD_BYTES", 100)
+        big = tmp_path / "big.jpg"
+        big.write_bytes(b"x" * 500)
+        hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
+        await hook.on_message_received(
+            channel="whatsapp",
+            sender_id="14125551234",
+            content="huge",
+            media=[str(big)],
+            timestamp=datetime.now(timezone.utc),
+        )
+        assert patched_httpx.post.await_count == 0
+        assert "pending_upload" not in rest_client.post.await_args.kwargs["json"]
+
+    @pytest.mark.asyncio
+    async def test_upload_failure_keeps_text(self, jpg_file, patched_httpx):
+        # First POST returns 500 — bucket retry path is only taken on 400/404,
+        # so a 500 means upload is unrecoverable. Row still persists w/o pending_upload.
+        patched_httpx.post = AsyncMock(return_value=patched_httpx._resp(500, text="oops"))
+        hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
+        await hook.on_message_received(
+            channel="whatsapp",
+            sender_id="14125551234",
+            content="hi",
+            media=[str(jpg_file)],
+            timestamp=datetime.now(timezone.utc),
+        )
+        post_body = rest_client.post.await_args.kwargs["json"]
+        assert post_body["text"] == "hi"
+        assert "pending_upload" not in post_body
+
+    @pytest.mark.asyncio
+    async def test_bucket_missing_provisions_and_retries(self, jpg_file, patched_httpx):
+        # POST sequence: 404 (bucket missing) → 201 (bucket create) → 201 (retry upload).
+        sequence = [
+            patched_httpx._resp(404, text="Bucket not found"),  # initial upload
+            patched_httpx._resp(201),                            # bucket create
+            patched_httpx._resp(201),                            # retry upload
+        ]
+        patched_httpx.post = AsyncMock(side_effect=sequence)
+        hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
+        await hook.on_message_received(
+            channel="whatsapp",
+            sender_id="14125551234",
+            content="hi",
+            media=[str(jpg_file)],
+            timestamp=datetime.now(timezone.utc),
+        )
+        # All three storage calls happened.
+        assert patched_httpx.post.await_count == 3
+        # Bucket-create call hit /bucket on the storage client (base_url=/storage/v1).
+        bucket_call = patched_httpx.post.await_args_list[1]
+        assert bucket_call.args[0] == "/bucket"
+        assert bucket_call.kwargs["json"] == {
+            "id": "history-media-hh-1",
+            "name": "history-media-hh-1",
+            "public": False,
+        }
+        # Final row carries pending_upload (upload succeeded after retry).
+        post_body = rest_client.post.await_args.kwargs["json"]
+        assert post_body["pending_upload"]["kind"] == "image"
+
+    @pytest.mark.asyncio
+    async def test_bucket_create_409_treated_as_success(self, jpg_file, patched_httpx):
+        # 400 with statusCode=409 body == bucket already exists.
+        sequence = [
+            patched_httpx._resp(404),                                                       # upload
+            patched_httpx._resp(400, body={"statusCode": "409", "error": "Duplicate"}),     # ensure
+            patched_httpx._resp(201),                                                       # retry
+        ]
+        patched_httpx.post = AsyncMock(side_effect=sequence)
+        hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
+        await hook.on_message_received(
+            channel="whatsapp",
+            sender_id="14125551234",
+            content="hi",
+            media=[str(jpg_file)],
+            timestamp=datetime.now(timezone.utc),
+        )
+        # Retry succeeded → pending_upload present.
+        assert "pending_upload" in rest_client.post.await_args.kwargs["json"]
+
+    @pytest.mark.asyncio
+    async def test_multi_attachment_keeps_first_only(
+        self, tmp_path, jpg_file, patched_httpx,
+    ):
+        second = tmp_path / "extra.jpg"
+        second.write_bytes(b"\xff\xd8")
+        hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
+        await hook.on_message_received(
+            channel="whatsapp",
+            sender_id="14125551234",
+            content="two photos",
+            media=[str(jpg_file), str(second)],
+            timestamp=datetime.now(timezone.utc),
+        )
+        # Exactly one storage upload — the first.
+        assert patched_httpx.post.await_count == 1
+        pu = rest_client.post.await_args.kwargs["json"]["pending_upload"]
+        assert pu["filename"] == "photo.jpg"
