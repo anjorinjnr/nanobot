@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 from datetime import datetime
 from typing import Any, Optional
 
@@ -63,8 +62,9 @@ class ChatPersistHook:
         # An archived contributor remains cached as their id; the row stays
         # FK-valid, and inbound messages from archived contributors are
         # filtered upstream by the channel's allow_from list anyway.
+        # No lock: AgentLoop._process_message is single-tasked per session,
+        # and dict assignment is atomic in CPython.
         self._contrib_cache: dict[tuple[str, str], Optional[str]] = {}
-        self._cache_lock = threading.Lock()
         self._client: httpx.AsyncClient | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────────
@@ -146,18 +146,30 @@ class ChatPersistHook:
         ctx: dict[str, Any] | None,
         *,
         response_content: str | None,
+        schedule_background: Any = None,
     ) -> None:
-        """Persist the assistant reply. No-op when ctx is None or text is empty."""
+        """Persist the assistant reply.
+
+        When `schedule_background` is provided (AgentLoop's `_schedule_background`),
+        the insert is fired as a background task so the user-visible response
+        isn't held up by Supabase round-trips. With strict ordering already
+        guaranteed by the user-row insert that completed in
+        `on_message_received`, the assistant write doesn't need to block the
+        OutboundMessage return.
+        """
         if ctx is None or not self._ensure_init():
             return
-        text = (response_content or "").strip()
-        if not text:
+        if not (response_content or "").strip():
             return
-        await self._insert(
+        coro = self._insert(
             role="assistant",
             contributor_id=ctx["contributor_id"],
-            text=response_content,  # preserve trailing whitespace
+            text=response_content,
         )
+        if schedule_background is not None:
+            schedule_background(coro)
+        else:
+            await coro
 
     # ── internals ────────────────────────────────────────────────────────
 
@@ -166,9 +178,8 @@ class ChatPersistHook:
     ) -> Optional[str]:
         normalized = self._normalize_sender(channel, sender_id)
         cache_key = (channel, normalized)
-        with self._cache_lock:
-            if cache_key in self._contrib_cache:
-                return self._contrib_cache[cache_key]
+        if cache_key in self._contrib_cache:
+            return self._contrib_cache[cache_key]
 
         column = _CHANNEL_TO_COLUMN.get(channel)
         if not column:
@@ -177,8 +188,7 @@ class ChatPersistHook:
                 "(no hist_contributors lookup column; add a join table to extend)",
                 channel, sender_id,
             )
-            with self._cache_lock:
-                self._contrib_cache[cache_key] = None
+            self._contrib_cache[cache_key] = None
             return None
 
         if not normalized:
@@ -186,8 +196,7 @@ class ChatPersistHook:
                 "chat_persist: empty normalized sender_id (channel=%s raw=%r)",
                 channel, sender_id,
             )
-            with self._cache_lock:
-                self._contrib_cache[cache_key] = None
+            self._contrib_cache[cache_key] = None
             return None
 
         try:
@@ -216,8 +225,7 @@ class ChatPersistHook:
                 "chat_persist: unknown sender — channel=%s sender_id=%s",
                 channel, sender_id,
             )
-        with self._cache_lock:
-            self._contrib_cache[cache_key] = cid
+        self._contrib_cache[cache_key] = cid
         return cid
 
     @staticmethod

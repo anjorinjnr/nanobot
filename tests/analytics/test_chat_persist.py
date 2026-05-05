@@ -330,3 +330,22 @@ class TestOnResponseSent:
         ctx = {"contributor_id": "c-1", "channel": "whatsapp"}
         # Must not raise.
         await hook.on_response_sent(ctx, response_content="hi")
+
+    @pytest.mark.asyncio
+    async def test_schedule_background_offloads_insert(self):
+        # When schedule_background is provided, the insert isn't awaited
+        # inline — the user-visible OutboundMessage return doesn't wait.
+        hook, client = _make_hook(contributor_rows=[{"id": "c-1"}])
+        ctx = {"contributor_id": "c-1", "channel": "whatsapp"}
+
+        scheduled: list = []
+        def _schedule(coro):
+            scheduled.append(coro)
+
+        await hook.on_response_sent(ctx, response_content="hi", schedule_background=_schedule)
+        # Insert was scheduled, not awaited.
+        assert client.post.await_count == 0
+        assert len(scheduled) == 1
+        # Drain the scheduled coroutine so the test doesn't leak unawaited tasks.
+        await scheduled[0]
+        assert client.post.await_count == 1

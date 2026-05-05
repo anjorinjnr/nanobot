@@ -1366,7 +1366,9 @@ class AgentLoop:
         if _chat_ctx is not None:
             try:
                 await _chat_persist.on_response_sent(
-                    _chat_ctx, response_content=final_content,
+                    _chat_ctx,
+                    response_content=final_content,
+                    schedule_background=self._schedule_background,
                 )
             except Exception:
                 logger.debug("chat_persist on_response_sent error (non-fatal)", exc_info=True)
