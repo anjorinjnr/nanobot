@@ -1162,6 +1162,25 @@ class AgentLoop:
             is_guest=guest is not None,
         )
 
+        # hist_chat_messages persistence (homer family-history). No-op unless
+        # HOMER_CHAT_PERSIST_ENABLED + Supabase env are set; failures swallow.
+        # Synthetic turns (heartbeat/cron) are not chat and shouldn't land in
+        # the contributor's transcript.
+        from nanobot.analytics.chat_persist import get_chat_persist_hook
+        _chat_persist = get_chat_persist_hook()
+        _chat_ctx = None
+        if not _synthetic:
+            try:
+                _chat_ctx = await _chat_persist.on_message_received(
+                    channel=msg.channel,
+                    sender_id=msg.sender_id,
+                    content=msg.content,
+                    media=msg.media,
+                    timestamp=msg.timestamp,
+                )
+            except Exception:
+                logger.debug("chat_persist on_message_received error (non-fatal)", exc_info=True)
+
         key = session_key or msg.session_key
         session = sessions.get_or_create(key)
         if self._restore_runtime_checkpoint(session):
@@ -1339,6 +1358,18 @@ class AgentLoop:
                 )
             except Exception:
                 logger.debug("Analytics hook error (non-fatal)", exc_info=True)
+
+        # Persist assistant reply to hist_chat_messages. _chat_ctx is None
+        # when persistence is disabled, the channel is unsupported, or the
+        # sender didn't resolve to a contributor — all already logged in
+        # on_message_received.
+        if _chat_ctx is not None:
+            try:
+                await _chat_persist.on_response_sent(
+                    _chat_ctx, response_content=final_content,
+                )
+            except Exception:
+                logger.debug("chat_persist on_response_sent error (non-fatal)", exc_info=True)
 
         meta = dict(msg.metadata or {})
         streamed = on_stream is not None and stop_reason != STOP_ERROR
