@@ -51,6 +51,10 @@ _CHANNEL_TO_COLUMN: dict[str, str] = {
 # don't lose context. Above this is almost certainly a misconfiguration.
 _MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
+# Curator bootstrap role constants.
+_CURATOR_ROLE = "curator"
+_ADMIN_ROLE = "admin"
+
 
 def _kind_from_mime(mime: str | None) -> str | None:
     """Map a mime type to the `pending_upload.kind` enum (image/audio/video).
@@ -287,6 +291,12 @@ class ChatPersistHook:
             return None
 
         cid: Optional[str] = rows[0]["id"] if rows else None
+        if cid is None and channel == "whatsapp":
+            # Bootstrap path: if the inbound matches the household's admin
+            # phone, ensure the curator's hist_contributors row exists with
+            # phone populated. Curator rows created by portal signup have
+            # phone=null, so curator-on-WhatsApp wouldn't otherwise resolve.
+            cid = await self._bootstrap_curator_if_admin(normalized)
         if cid is None:
             logger.warning(
                 "chat_persist: unknown sender — channel=%s sender_id=%s",
@@ -294,6 +304,144 @@ class ChatPersistHook:
             )
         self._contrib_cache[cache_key] = cid
         return cid
+
+    async def _bootstrap_curator_if_admin(
+        self, sender_phone: str,
+    ) -> Optional[str]:
+        """Idempotent curator-row upsert when sender matches HOMER_ADMIN_PHONE.
+
+        Three branches:
+        - Existing curator row with phone matching → return its id (no-op
+          beyond returning).
+        - Existing curator row with phone null → PATCH phone, return id.
+        - Existing curator row with a different phone → log warning and
+          decline to override (defends against the rare co-curator case).
+        - No curator row → look up the admin from household_members, INSERT
+          a new curator row mirroring the shape `ensure_contributor_for_user`
+          Path 2 produces (auth_user_id from members.user_id, display_name
+          from members.name, status='active'), but with phone populated.
+
+        Returns the curator's contributor_id on success, None on miss
+        (sender isn't admin, or any Supabase call failed).
+        """
+        admin_phone = os.environ.get("HOMER_ADMIN_PHONE", "").strip()
+        if not admin_phone or admin_phone != sender_phone:
+            return None
+
+        # Find an existing curator row for this household.
+        try:
+            r = await self._http().get(
+                "/hist_contributors",
+                params={
+                    "select": "id,phone",
+                    "household_id": f"eq.{self._household_id}",
+                    "role": f"eq.{_CURATOR_ROLE}",
+                    "limit": "1",
+                },
+            )
+            r.raise_for_status()
+            existing = r.json()
+        except Exception:
+            logger.warning(
+                "chat_persist: curator lookup failed for bootstrap", exc_info=True,
+            )
+            return None
+
+        if existing:
+            cur = existing[0]
+            cur_phone = cur.get("phone")
+            if cur_phone == sender_phone:
+                logger.debug("chat_persist: curator row already has matching phone")
+                return cur["id"]
+            if cur_phone:
+                # A different phone is already on the curator row. Don't
+                # override — that's almost certainly an admin's previous
+                # number, and overwriting silently would lose audit trail.
+                logger.warning(
+                    "chat_persist: curator row has phone=%s but sender=%s; not overriding",
+                    cur_phone, sender_phone,
+                )
+                return None
+            # phone is null — patch it.
+            try:
+                r = await self._http().patch(
+                    "/hist_contributors",
+                    params={"id": f"eq.{cur['id']}"},
+                    json={"phone": sender_phone},
+                )
+                r.raise_for_status()
+            except Exception:
+                logger.warning(
+                    "chat_persist: failed to patch curator phone", exc_info=True,
+                )
+                return None
+            logger.info(
+                "chat_persist: bootstrapped curator phone for id=%s", cur["id"],
+            )
+            return cur["id"]
+
+        # No curator row yet — insert one. Mirror what
+        # `ensure_contributor_for_user` Path 2 does on the portal side, but
+        # with phone populated since we have it from the inbound sender.
+        try:
+            r = await self._http().get(
+                "/household_members",
+                params={
+                    "select": "user_id,name",
+                    "household_id": f"eq.{self._household_id}",
+                    "role": f"eq.{_ADMIN_ROLE}",
+                    "limit": "1",
+                },
+            )
+            r.raise_for_status()
+            admin_rows = r.json()
+        except Exception:
+            logger.warning(
+                "chat_persist: household_members lookup failed for bootstrap",
+                exc_info=True,
+            )
+            return None
+
+        if not admin_rows:
+            logger.warning(
+                "chat_persist: no admin in household_members for household=%s — "
+                "cannot bootstrap curator",
+                self._household_id,
+            )
+            return None
+
+        admin = admin_rows[0]
+        new_row = {
+            "household_id": self._household_id,
+            "role": _CURATOR_ROLE,
+            "display_name": (admin.get("name") or "").strip() or "Curator",
+            "phone": sender_phone,
+            "auth_user_id": admin.get("user_id"),
+            "status": "active",
+        }
+        try:
+            r = await self._http().post(
+                "/hist_contributors",
+                headers={"Prefer": "return=representation"},
+                json=new_row,
+            )
+            r.raise_for_status()
+            inserted = r.json()
+        except Exception:
+            logger.warning(
+                "chat_persist: curator insert failed for bootstrap", exc_info=True,
+            )
+            return None
+
+        if isinstance(inserted, list) and inserted:
+            new_id = inserted[0].get("id")
+            if new_id:
+                logger.info(
+                    "chat_persist: bootstrapped new curator row id=%s for household=%s",
+                    new_id, self._household_id,
+                )
+                return new_id
+        return None
 
     @staticmethod
     def _normalize_sender(channel: str, sender_id: str) -> str:
