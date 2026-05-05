@@ -51,6 +51,10 @@ _CHANNEL_TO_COLUMN: dict[str, str] = {
 # don't lose context. Above this is almost certainly a misconfiguration.
 _MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
+# Curator bootstrap role constants.
+_CURATOR_ROLE = "curator"
+_ADMIN_ROLE = "admin"
+
 
 def _kind_from_mime(mime: str | None) -> str | None:
     """Map a mime type to the `pending_upload.kind` enum (image/audio/video).
@@ -331,7 +335,7 @@ class ChatPersistHook:
                 params={
                     "select": "id,phone",
                     "household_id": f"eq.{self._household_id}",
-                    "role": "eq.curator",
+                    "role": f"eq.{_CURATOR_ROLE}",
                     "limit": "1",
                 },
             )
@@ -385,7 +389,7 @@ class ChatPersistHook:
                 params={
                     "select": "user_id,name",
                     "household_id": f"eq.{self._household_id}",
-                    "role": "eq.admin",
+                    "role": f"eq.{_ADMIN_ROLE}",
                     "limit": "1",
                 },
             )
@@ -409,7 +413,7 @@ class ChatPersistHook:
         admin = admin_rows[0]
         new_row = {
             "household_id": self._household_id,
-            "role": "curator",
+            "role": _CURATOR_ROLE,
             "display_name": (admin.get("name") or "").strip() or "Curator",
             "phone": sender_phone,
             "auth_user_id": admin.get("user_id"),
