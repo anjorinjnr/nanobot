@@ -627,3 +627,210 @@ class TestMediaUpload:
         assert patched_httpx.post.await_count == 1
         pu = rest_client.post.await_args.kwargs["json"]["pending_upload"]
         assert pu["filename"] == "photo.jpg"
+
+
+# ── curator bootstrap (HOMER_ADMIN_PHONE) ────────────────────────────────
+
+
+def _bootstrap_hook(
+    *,
+    initial_lookup_rows: list[dict] | None = None,
+    curator_lookup_rows: list[dict] | None = None,
+    admin_lookup_rows: list[dict] | None = None,
+    insert_rows: list[dict] | None = None,
+) -> tuple[ChatPersistHook, MagicMock]:
+    """Build a hook whose mocked httpx client returns scripted GET/POST/PATCH
+    responses suitable for the bootstrap flow.
+
+    The bootstrap path can issue up to 3 GETs:
+      1. initial contributor lookup by phone (always happens first)
+      2. curator lookup by role='curator'
+      3. household_members admin lookup
+    Plus optionally a PATCH (existing curator phone=null) or POST (insert
+    new curator).
+
+    The fixture sequences GETs in that order and returns the last queued
+    POST/PATCH response on every write.
+    """
+    hook = ChatPersistHook()
+    hook._initialized = True
+    hook._enabled = True
+    hook._supabase_url = "https://example.supabase.co"
+    hook._service_key = "tok_test"
+    hook._household_id = "hh-1"
+
+    def _resp(rows: list[dict] | None) -> MagicMock:
+        r = MagicMock()
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.json.return_value = rows or []
+        return r
+
+    get_sequence = [
+        _resp(initial_lookup_rows),
+        _resp(curator_lookup_rows),
+        _resp(admin_lookup_rows),
+    ]
+    write_resp = MagicMock()
+    write_resp.status_code = 201
+    write_resp.raise_for_status = MagicMock()
+    write_resp.json.return_value = insert_rows or []
+
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=get_sequence)
+    client.post = AsyncMock(return_value=write_resp)
+    client.patch = AsyncMock(return_value=write_resp)
+    hook._client = client
+    return hook, client
+
+
+class TestCuratorBootstrap:
+    @pytest.mark.asyncio
+    async def test_bootstrap_skipped_when_admin_phone_unset(self, monkeypatch):
+        monkeypatch.delenv("HOMER_ADMIN_PHONE", raising=False)
+        hook, client = _bootstrap_hook(initial_lookup_rows=[])
+        cid = await hook._resolve_contributor("whatsapp", "14125551234")
+        assert cid is None
+        # Only the initial contributor lookup happened — no bootstrap calls.
+        assert client.get.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_skipped_when_sender_doesnt_match_admin(self, monkeypatch):
+        monkeypatch.setenv("HOMER_ADMIN_PHONE", "19998887777")
+        hook, client = _bootstrap_hook(initial_lookup_rows=[])
+        cid = await hook._resolve_contributor("whatsapp", "14125551234")
+        assert cid is None
+        assert client.get.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_existing_curator_phone_match_returns_id(
+        self, monkeypatch,
+    ):
+        # Curator row already has matching phone (race / no-op case) — just
+        # return the existing id without a write.
+        monkeypatch.setenv("HOMER_ADMIN_PHONE", "14125551234")
+        hook, client = _bootstrap_hook(
+            initial_lookup_rows=[],
+            curator_lookup_rows=[{"id": "c-curator", "phone": "14125551234"}],
+        )
+        cid = await hook._resolve_contributor("whatsapp", "14125551234")
+        assert cid == "c-curator"
+        # No write — phone already matches.
+        assert client.post.await_count == 0
+        assert client.patch.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_existing_curator_phone_null_patches(self, monkeypatch):
+        # The common case: portal-signup created the curator row with
+        # phone=null, the curator's first WhatsApp message patches it.
+        monkeypatch.setenv("HOMER_ADMIN_PHONE", "14125551234")
+        hook, client = _bootstrap_hook(
+            initial_lookup_rows=[],
+            curator_lookup_rows=[{"id": "c-curator", "phone": None}],
+        )
+        cid = await hook._resolve_contributor("whatsapp", "14125551234")
+        assert cid == "c-curator"
+        # PATCH fired with the resolved phone.
+        assert client.patch.await_count == 1
+        body = client.patch.await_args.kwargs["json"]
+        assert body == {"phone": "14125551234"}
+        params = client.patch.await_args.kwargs["params"]
+        assert params == {"id": "eq.c-curator"}
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_existing_curator_different_phone_declines(
+        self, monkeypatch,
+    ):
+        # Defends against silently overwriting a curator's previous phone
+        # — could be a co-curator scenario or an admin who changed numbers
+        # via portal. Manual reconciliation needed.
+        monkeypatch.setenv("HOMER_ADMIN_PHONE", "14125551234")
+        hook, client = _bootstrap_hook(
+            initial_lookup_rows=[],
+            curator_lookup_rows=[{"id": "c-curator", "phone": "19998887777"}],
+        )
+        cid = await hook._resolve_contributor("whatsapp", "14125551234")
+        assert cid is None
+        assert client.patch.await_count == 0
+        assert client.post.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_no_curator_inserts_from_household_members(
+        self, monkeypatch,
+    ):
+        # No curator row yet (household provisioned but no portal visit) —
+        # look up the admin from household_members and INSERT.
+        monkeypatch.setenv("HOMER_ADMIN_PHONE", "14125551234")
+        hook, client = _bootstrap_hook(
+            initial_lookup_rows=[],
+            curator_lookup_rows=[],
+            admin_lookup_rows=[{"user_id": "u-admin", "name": "Ebby"}],
+            insert_rows=[{"id": "c-new"}],
+        )
+        cid = await hook._resolve_contributor("whatsapp", "14125551234")
+        assert cid == "c-new"
+        assert client.post.await_count == 1
+        body = client.post.await_args.kwargs["json"]
+        assert body["household_id"] == "hh-1"
+        assert body["role"] == "curator"
+        assert body["phone"] == "14125551234"
+        assert body["auth_user_id"] == "u-admin"
+        assert body["display_name"] == "Ebby"
+        assert body["status"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_no_curator_no_admin_returns_none(self, monkeypatch):
+        # Genuinely empty household — refuse to invent a curator without
+        # an underlying household_members admin to anchor the row to.
+        monkeypatch.setenv("HOMER_ADMIN_PHONE", "14125551234")
+        hook, client = _bootstrap_hook(
+            initial_lookup_rows=[],
+            curator_lookup_rows=[],
+            admin_lookup_rows=[],
+        )
+        cid = await hook._resolve_contributor("whatsapp", "14125551234")
+        assert cid is None
+        assert client.post.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_falls_back_to_default_display_name(self, monkeypatch):
+        # household_members.name is sometimes empty; insert should still
+        # succeed with a sensible default rather than reject the bootstrap.
+        monkeypatch.setenv("HOMER_ADMIN_PHONE", "14125551234")
+        hook, client = _bootstrap_hook(
+            initial_lookup_rows=[],
+            curator_lookup_rows=[],
+            admin_lookup_rows=[{"user_id": "u-admin", "name": ""}],
+            insert_rows=[{"id": "c-new"}],
+        )
+        cid = await hook._resolve_contributor("whatsapp", "14125551234")
+        assert cid == "c-new"
+        body = client.post.await_args.kwargs["json"]
+        assert body["display_name"] == "Curator"
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_curator_first_message_persists(self, monkeypatch):
+        # Real-world flow: curator's first WhatsApp message after
+        # provisioning. Initial lookup misses, bootstrap creates curator,
+        # then on_message_received persists the user row under the new id.
+        monkeypatch.setenv("HOMER_ADMIN_PHONE", "14125551234")
+        hook, client = _bootstrap_hook(
+            initial_lookup_rows=[],
+            curator_lookup_rows=[],
+            admin_lookup_rows=[{"user_id": "u-admin", "name": "Ebby"}],
+            insert_rows=[{"id": "c-new"}],
+        )
+        ctx = await hook.on_message_received(
+            channel="whatsapp",
+            sender_id="14125551234",
+            content="hello, starting family history",
+            media=[],
+            timestamp=datetime.now(timezone.utc),
+        )
+        assert ctx == {"contributor_id": "c-new", "channel": "whatsapp"}
+        # Two POSTs total: the curator INSERT + the chat message INSERT.
+        assert client.post.await_count == 2
+        chat_insert = client.post.await_args.kwargs["json"]
+        assert chat_insert["role"] == "user"
+        assert chat_insert["text"] == "hello, starting family history"
+        assert chat_insert["contributor_id"] == "c-new"
