@@ -236,8 +236,10 @@ class ChatPersistHook:
                 pending_upload=None,
             )
 
-        for path in media_paths:
-            coro = self._upload_and_insert_media(contributor_id, path)
+        # Schedule media uploads sequentially to avoid overwhelming
+        # the storage endpoint (especially with large voice notes).
+        if media_paths:
+            coro = self._upload_all_media(contributor_id, media_paths)
             if schedule_background is not None:
                 schedule_background(coro)
             else:
@@ -267,6 +269,22 @@ class ChatPersistHook:
             text="",
             pending_upload=pending,
         )
+
+    async def _upload_all_media(
+        self, contributor_id: str, media_paths: list[str],
+    ) -> None:
+        """Upload all media files sequentially to avoid overwhelming the storage endpoint.
+
+        Processes media items one-at-a-time rather than firing concurrent uploads.
+        This is important when handling multi-attachment turns with large files
+        (up to 50MB each), where concurrent uploads could exhaust the endpoint's
+        resources or network bandwidth.
+
+        Failed uploads are logged but don't block subsequent items or raise.
+        """
+        for path in media_paths:
+            await self._upload_and_insert_media(contributor_id, path)
+
 
     async def on_response_sent(
         self,
