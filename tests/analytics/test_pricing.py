@@ -12,6 +12,7 @@ import pytest
 
 from nanobot.analytics.pricing import (
     USD_PER_MTOK,
+    _PROVIDER_PREFIXES,
     estimate_cost_usd,
     normalize_model_name,
 )
@@ -96,3 +97,99 @@ def test_pricing_table_keys_are_strings_and_tuples_well_formed():
         for rate in prices:
             assert isinstance(rate, (int, float))
             assert rate >= 0
+
+
+# ── Issue #53: bedrock/ prefix forward-defense ────────────────────────────
+
+
+def test_provider_prefixes_includes_bedrock():
+    """``bedrock/`` is a known provider prefix even when no bedrock/* row
+    is yet priced — keeps ``normalize_model_name`` future-proof."""
+    assert "bedrock/" in _PROVIDER_PREFIXES
+
+
+def test_normalize_unmatched_bedrock_passthrough():
+    """Bare bedrock model name passes through (no priced row → returned as-is).
+
+    The point of #53 is that ADDING ``bedrock/foo`` to ``USD_PER_MTOK``
+    later will make ``normalize_model_name("foo")`` resolve without a
+    second edit. We can't assert that without seeding the table; the
+    weaker contract is that the prefix is present in the lookup tuple
+    so the future case doesn't silently miss.
+    """
+    assert normalize_model_name("foo-bedrock-model") == "foo-bedrock-model"
+
+
+# ── Issue #57: prefix tuple is auto-derived from USD_PER_MTOK ─────────────
+
+
+def test_provider_prefixes_covers_every_prefixed_key():
+    """Every priced model with a ``provider/`` prefix must be lookup-resolvable
+    via the bare name. Locks the auto-derivation so a new provider key
+    can't sneak in without ``normalize_model_name`` learning about it.
+    """
+    for key in USD_PER_MTOK:
+        head, sep, _rest = key.partition("/")
+        if not sep:
+            continue
+        prefix = head + "/"
+        assert prefix in _PROVIDER_PREFIXES, (
+            f"Provider prefix {prefix!r} (from key {key!r}) is missing "
+            "from auto-derived _PROVIDER_PREFIXES — issue #57 regression."
+        )
+
+
+def test_provider_prefixes_resolves_bare_names_for_every_prefixed_key():
+    """Sanity: each prefixed key's bare form normalizes back to the prefixed key.
+    Catches any auto-derivation bug that drops keys with multiple ``/``s
+    (e.g. ``openrouter/deepseek/deepseek-chat-v3.2``).
+    """
+    for key in USD_PER_MTOK:
+        head, sep, rest = key.partition("/")
+        if not sep:
+            continue
+        # The bare name is everything after the first ``/``.
+        assert normalize_model_name(rest) == key, (
+            f"normalize_model_name({rest!r}) failed to resolve to {key!r}"
+        )
+
+
+# ── Issue #56: estimate_cost_usd docstring is now precise about the contract ──
+
+
+def test_estimate_cost_usd_docstring_documents_cache_read_subset():
+    """Lock that the docstring spells out the cache_read_tokens contract."""
+    doc = estimate_cost_usd.__doc__ or ""
+    assert "input_tokens" in doc
+    assert "cache_read_tokens" in doc
+    # The exact arithmetic is in the docstring so callers don't have to
+    # read the source. (#56)
+    assert "max(0, input_tokens - cache_read_tokens)" in doc
+
+
+def test_cache_read_subset_arithmetic_is_correct():
+    """Direct algebraic check of the subset contract from the docstring.
+
+    cache_read_tokens is the cached subset of input_tokens; non-cached
+    portion is input - cache_read, billed at the input rate.
+    """
+    cost = estimate_cost_usd(
+        "claude-haiku-4-5-20251001",  # (1.00, 5.00, 0.10) per MTok
+        input_tokens=1_000_000,
+        output_tokens=0,
+        cache_read_tokens=300_000,
+    )
+    # 700k @ $1.00/MTok + 300k @ $0.10/MTok = $0.70 + $0.03 = $0.73
+    assert cost == pytest.approx(0.73, abs=1e-9)
+
+
+def test_cache_read_clamps_when_exceeds_input():
+    """If cache_read > input (schema drift), billed_input clamps to 0."""
+    cost = estimate_cost_usd(
+        "claude-haiku-4-5-20251001",
+        input_tokens=100_000,
+        output_tokens=0,
+        cache_read_tokens=500_000,
+    )
+    # 0 @ input + 500k @ $0.10/MTok = $0.05
+    assert cost == pytest.approx(0.05, abs=1e-9)

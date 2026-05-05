@@ -445,3 +445,34 @@ async def test_turn_id_differs_across_turns(tmp_path, monkeypatch):
     responded = _captured_events(hook._client, "agent_responded")
     assert len(responded) == 2
     assert responded[0]["turn_id"] != responded[1]["turn_id"]
+
+
+# ── Issue #49: AnalyticsHook.capture public helper ────────────────────────
+
+
+def test_capture_helper_emits_with_explicit_distinct_id(tmp_path):
+    hook = _make_hook(tmp_path, household_id="hh-cap")
+    hook.capture("custom_event", {"k": "v"}, distinct_id="user-7")
+    hook._client.capture.assert_called_once_with("user-7", "custom_event", {"k": "v"})
+
+
+def test_capture_helper_defaults_to_household_id(tmp_path):
+    hook = _make_hook(tmp_path, household_id="hh-default")
+    hook.capture("custom_event", {"k": "v"})
+    hook._client.capture.assert_called_once_with("hh-default", "custom_event", {"k": "v"})
+
+
+def test_capture_helper_defaults_to_system_when_no_household(tmp_path):
+    hook = _make_hook(tmp_path, household_id="")
+    hook.capture("custom_event", {"k": "v"})
+    hook._client.capture.assert_called_once_with("system", "custom_event", {"k": "v"})
+
+
+def test_capture_helper_no_op_when_uninitialized():
+    """A hook with no API key (real _ensure_init returns False) must silently no-op."""
+    hook = AnalyticsHook()
+    # _initialized=False + no client; _ensure_init runs the real init path,
+    # which returns False without POSTHOG_API_KEY → capture is a no-op.
+    hook.capture("custom_event", {"k": "v"})
+    # No client was assigned, so nothing to assert beyond "no crash".
+    assert hook._client is None

@@ -165,6 +165,30 @@ class AnalyticsHook:
             logger.warning("posthog package not installed — analytics disabled")
             return False
 
+    def capture(
+        self,
+        event: str,
+        properties: dict[str, Any],
+        distinct_id: str | None = None,
+    ) -> None:
+        """Public fire-and-forget event emitter.
+
+        Wraps the ``_ensure_init()`` + ``_client.capture()`` pattern so
+        callers (quota_gate, llm_telemetry, future hooks) don't have to
+        reach into private attrs. ``distinct_id`` defaults to the
+        household id (or ``"system"`` if unset) — matching the
+        backend/tool-side attribution convention.
+
+        Telemetry must never crash callers, so emission is best-effort:
+        an uninitialized client (no ``POSTHOG_API_KEY``) is a silent
+        no-op.
+        """
+        if not self._ensure_init():
+            return
+        if distinct_id is None:
+            distinct_id = self._household_id or "system"
+        self._client.capture(distinct_id, event, properties)
+
     def _base_props(self, turn_id: str | None = None) -> dict:
         """Base props attached to every event.
 
