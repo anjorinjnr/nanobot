@@ -400,6 +400,20 @@ def test_format_cap_hit_reply_three_days_says_on_weekday():
     assert f"on {weekday}" in out
 
 
+def test_format_cap_hit_reply_seven_days_says_on_weekday():
+    """Issue #59: extend the weekday-name path through 7 days.
+
+    A household that signs up + caps on day 1 hits exactly the 7-day
+    boundary, and ``"on Monday"`` reads more naturally than the heavier
+    ``"in 7 days"`` fallback.
+    """
+    target = datetime.now(timezone.utc) + timedelta(days=7)
+    out = format_cap_hit_reply(target.isoformat())
+    weekday = target.strftime("%A")
+    assert f"on {weekday}" in out
+    assert "in 7 days" not in out
+
+
 def test_format_cap_hit_reply_eight_days_says_in_n_days():
     out = format_cap_hit_reply(_iso_in_days(8.05))
     assert "in 8 days" in out

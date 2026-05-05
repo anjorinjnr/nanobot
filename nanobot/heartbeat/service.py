@@ -709,7 +709,16 @@ class HeartbeatService:
             if self.on_execute:
                 # If no structured tasks (LLM fallback), run as before
                 if not due_tasks:
-                    response = await self.on_execute(tasks_str, None)
+                    # Tag the LLM call as heartbeat_system + synthetic so the
+                    # $ai_generation event lands on the right dashboard row.
+                    # Without this wrap the fallback would emit task_kind=chat
+                    # because the LLMProvider has no contextvar set. (#54)
+                    from nanobot.analytics.llm_telemetry import llm_telemetry_context
+
+                    with llm_telemetry_context(
+                        task_kind="heartbeat_system", is_synthetic=True,
+                    ):
+                        response = await self.on_execute(tasks_str, None)
                     if response:
                         should_notify = await evaluate_response(
                             response, tasks_str, self.provider, self.model,

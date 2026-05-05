@@ -100,12 +100,16 @@ def _friendly_reset(reset_at: str | None) -> str:
     * unparseable → ``"soon"``
     * in the past → ``"soon"``
     * 1.0–1.999 days away → ``"tomorrow"``
-    * 2.0–6.999 days away → ``"on <weekday>"``
-    * 7.0+ days away → ``"in N days"`` (defensive — shouldn't happen)
+    * 2.0–7.999 days away → ``"on <weekday>"``
+    * 8.0+ days away → ``"in N days"`` (defensive — shouldn't happen at
+      the current 7-day window)
 
     Distance is computed in UTC against ``datetime.now(timezone.utc)`` and
     floored to whole days, so a reset 1.5 days from now reads as
-    ``"tomorrow"`` (not ``"in 2 days"``).
+    ``"tomorrow"`` (not ``"in 2 days"``). The 7-day branch sits on the
+    weekday path because a household that signs up + caps on day 1 hits
+    exactly the 7-day boundary; ``"on Monday"`` reads more naturally
+    than ``"in 7 days"``. See issues #48 (floor) + #59 (weekday range).
 
     Date-only strings (``"2026-05-11"``) are treated as midnight UTC.
     """
@@ -148,7 +152,7 @@ def _friendly_reset(reset_at: str | None) -> str:
         return "soon"
     if days == 1:
         return "tomorrow"
-    if 2 <= days <= 6:
+    if 2 <= days <= 7:
         return f"on {parsed.strftime('%A')}"
     return f"in {days} days"
 

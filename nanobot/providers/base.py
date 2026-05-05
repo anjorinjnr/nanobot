@@ -530,7 +530,12 @@ class LLMProvider(ABC):
         """Invoke an LLM call, convert exceptions to error responses, and
         emit one ``$ai_generation`` event. Shared body of ``_safe_chat`` and
         ``_safe_chat_stream`` — keep them in lock-step on retries, latency
-        accounting, and event emission."""
+        accounting, and event emission.
+
+        When called inside :meth:`_run_with_retry`'s ``retry_burst_context``,
+        the per-attempt ``track_llm_generation`` call is buffered (not
+        emitted) so the wrapper can ship one consolidated event with
+        ``retry_count`` set. See issue #52."""
         start = time.monotonic()
         try:
             response = await call(**kwargs)
@@ -749,6 +754,45 @@ class LLMProvider(ABC):
             remaining -= chunk
 
     async def _run_with_retry(
+        self,
+        call: Callable[..., Awaitable[LLMResponse]],
+        kw: dict[str, Any],
+        original_messages: list[dict[str, Any]],
+        *,
+        retry_mode: str,
+        on_retry_wait: Callable[[str], Awaitable[None]] | None,
+    ) -> LLMResponse:
+        # Aggregate per-attempt $ai_generation events into ONE consolidated
+        # emit with retry_count=N. Without this, a 3-attempt retry burst
+        # would publish 3 events whose summed latency skews P95/P99
+        # dashboards. See issue #52.
+        from nanobot.analytics.llm_telemetry import (
+            emit_retry_aggregate,
+            retry_burst_context,
+        )
+
+        with retry_burst_context() as buf:
+            response = await self._retry_loop(
+                call,
+                kw,
+                original_messages,
+                retry_mode=retry_mode,
+                on_retry_wait=on_retry_wait,
+            )
+
+        # Outside the buffer: emit one consolidated event when at least
+        # one attempt was buffered. Use the LAST attempt's props so the
+        # latency reflects user-perceived single-attempt time and the
+        # token / error fields reflect the actual returned response, plus
+        # ``retry_count`` = total attempts buffered.
+        if buf:
+            final_props = dict(buf[-1])
+            final_props["retry_count"] = len(buf)
+            emit_retry_aggregate(final_props)
+
+        return response
+
+    async def _retry_loop(
         self,
         call: Callable[..., Awaitable[LLMResponse]],
         kw: dict[str, Any],
