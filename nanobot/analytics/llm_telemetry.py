@@ -166,12 +166,9 @@ def track_llm_generation(
         from nanobot.analytics.hook import get_analytics_hook
 
         hook = get_analytics_hook()
-        if not hook._ensure_init():
-            return
-        client = hook._client
-        client.capture(_distinct_id_for_call(), "$ai_generation", props)
-        if hid:
-            client.group_identify("household", hid, {})
+        hook.capture("$ai_generation", props, distinct_id=_distinct_id_for_call())
+        if hid and hook._client is not None:
+            hook._client.group_identify("household", hid, {})
     except Exception as exc:  # noqa: BLE001 — observability must not crash callers
         logger.debug("track_llm_generation failed: %s", exc)
 

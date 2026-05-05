@@ -18,9 +18,10 @@ Contract (returned by :func:`check_token_budget_before_turn`):
   (HTTP 200, ``{"ok": false}`` payload).
 
 Soft signal: when the household is over the warn threshold but still under
-budget, we set ``turn_ctx["quota_warn"] = True`` and let the turn run; a
-post-turn hook (:func:`maybe_append_quota_warn`) appends the warn appendix
-to the outgoing reply so the user gets a single coherent message.
+budget, we set ``turn_ctx["quota_warn_pct"] = <int>`` (None / unset = no
+warn) and let the turn run; a post-turn hook
+(:func:`maybe_append_quota_warn`) appends the warn appendix to the outgoing
+reply so the user gets a single coherent message.
 
 Failure mode is **fail-open**: any non-cap-hit outcome (timeout, network
 error, unexpected response, missing env) returns ``None`` so a flaky portal
@@ -37,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import math
 import os
 import time
 from datetime import date, datetime, timezone
@@ -45,6 +47,33 @@ from typing import Any, MutableMapping
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+# ── HTTP client ───────────────────────────────────────────────────────────
+
+# Module-level client, reused across calls to avoid rebuilding the
+# connection pool / TLS context on every turn. Lazily initialized so
+# tests that monkeypatch ``_request_quota`` never need a live client.
+_http_client: httpx.Client | None = None
+
+
+def _get_http_client() -> httpx.Client:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.Client()
+    return _http_client
+
+
+def _request_quota(
+    url: str, headers: dict[str, str], timeout: float,
+) -> httpx.Response:
+    """Thin internal wrapper around the module-level httpx client.
+
+    Tests patch this function directly to stub the portal response
+    without touching the global client. Honors the caller-supplied
+    timeout (no per-client default).
+    """
+    return _get_http_client().get(url, headers=headers, timeout=timeout)
 
 
 # ── Copy (module constants for easy editing) ──────────────────────────────
@@ -70,11 +99,14 @@ def _friendly_reset(reset_at: str | None) -> str:
     * missing / empty → ``"next week"`` (preserves pre-follow-up tone)
     * unparseable → ``"soon"``
     * in the past → ``"soon"``
-    * exactly 1 day away → ``"tomorrow"``
-    * 2-6 days away → ``"on <weekday>"``
-    * 7+ days away → ``"in N days"`` (defensive — shouldn't happen)
+    * 1.0–1.999 days away → ``"tomorrow"``
+    * 2.0–6.999 days away → ``"on <weekday>"``
+    * 7.0+ days away → ``"in N days"`` (defensive — shouldn't happen)
 
-    Distance is computed in UTC against ``datetime.now(timezone.utc)``.
+    Distance is computed in UTC against ``datetime.now(timezone.utc)`` and
+    floored to whole days, so a reset 1.5 days from now reads as
+    ``"tomorrow"`` (not ``"in 2 days"``).
+
     Date-only strings (``"2026-05-11"``) are treated as midnight UTC.
     """
     if reset_at is None or reset_at == "":
@@ -105,11 +137,14 @@ def _friendly_reset(reset_at: str | None) -> str:
     if delta_days < 0:
         return "soon"
 
-    # Round to nearest whole day for friendlier copy. We bias slightly upward:
-    # a reset 23h59m away should still read as "tomorrow".
-    days = int(round(delta_days))
+    # Floor to whole days so a 1.5-day delta reads as "tomorrow" (not
+    # "in 2 days"). Banker's rounding via int(round(...)) used to push
+    # 1.5d UP to 2 — off-by-one in the cap-hit message. Floor matches
+    # the user mental model: the reset is N days away iff at least
+    # N*24h still remain.
+    days = math.floor(delta_days)
     if days <= 0:
-        # Future but within ~12h — still "soon".
+        # Future but within ~24h — still "soon".
         return "soon"
     if days == 1:
         return "tomorrow"
@@ -193,7 +228,8 @@ def check_token_budget_before_turn(
 
     Returns:
         * ``None`` — proceed with the turn (also the value when over warn
-          threshold; in that case ``turn_ctx["quota_warn"]`` is set).
+          threshold; in that case ``turn_ctx["quota_warn_pct"]`` is set
+          to the integer pct).
         * ``str`` — the cap-hit reply string. Caller must SKIP the agent
           loop and send this back to the user via the channel.
 
@@ -232,7 +268,7 @@ def check_token_budget_before_turn(
     url = f"{portal}/api/quotas/{hid}"
     try:
         headers = _build_hmac_headers(hid, key)
-        resp = httpx.get(url, headers=headers, timeout=_DEFAULT_TIMEOUT_S)
+        resp = _request_quota(url, headers, _DEFAULT_TIMEOUT_S)
     except httpx.TimeoutException:
         logger.warning("quota_gate: portal timeout — fail-open")
         return None
@@ -300,9 +336,9 @@ def check_token_budget_before_turn(
     pct_used = (used_n / budget_n) * 100.0
     threshold = _warn_pct()
     if pct_used >= threshold:
-        # Round to int for display; expose pct so the post-turn hook can
-        # interpolate into WARN_APPENDIX without re-fetching.
-        turn_ctx["quota_warn"] = True
+        # Single Optional[int] flag: None / unset = no warn,
+        # int = warn pct (rounded for display). The post-turn hook reads
+        # this directly and interpolates into WARN_APPENDIX.
         turn_ctx["quota_warn_pct"] = int(round(pct_used))
     return None
 
@@ -313,7 +349,7 @@ def check_token_budget_before_turn(
 def maybe_append_quota_warn(
     turn_ctx: MutableMapping[str, Any], reply: str | None,
 ) -> str | None:
-    """Append :data:`WARN_APPENDIX` to *reply* iff the pre-turn hook set the flag.
+    """Append :data:`WARN_APPENDIX` to *reply* iff the pre-turn hook set the pct.
 
     Single-message UX: we keep the agent's natural reply intact and tack the
     nudge on at the end so the user reads one coherent message instead of
@@ -321,13 +357,11 @@ def maybe_append_quota_warn(
 
     No-ops if:
 
-    * the warn flag isn't set,
+    * ``turn_ctx["quota_warn_pct"]`` is None / unset / not an int,
     * the reply is empty (no message to ride on),
     * the appendix is already present (defensive idempotency).
     """
     if reply is None:
-        return reply
-    if not turn_ctx.get("quota_warn"):
         return reply
     pct = turn_ctx.get("quota_warn_pct")
     if not isinstance(pct, int):
@@ -350,17 +384,14 @@ def _emit_blocked_event(*, hid: str, used: Any, budget: Any) -> None:
     from nanobot.analytics.hook import get_analytics_hook
 
     hook = get_analytics_hook()
-    if not hook._ensure_init():
-        return
-    client = hook._client
     props: dict[str, Any] = {"household_id": hid}
     if used is not None:
         props["used"] = used
     if budget is not None:
         props["budget"] = budget
-    client.capture(hid or "system", "quota_gate_blocked", props)
-    if hid:
-        client.group_identify("household", hid, {})
+    hook.capture("quota_gate_blocked", props, distinct_id=hid or "system")
+    if hid and hook._client is not None:
+        hook._client.group_identify("household", hid, {})
 
 
 __all__ = [

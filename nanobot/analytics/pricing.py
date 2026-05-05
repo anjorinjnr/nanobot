@@ -39,18 +39,46 @@ USD_PER_MTOK: dict[str, tuple[float, float] | tuple[float, float, float]] = {
 }
 
 
+def _derive_provider_prefixes() -> tuple[str, ...]:
+    """Auto-derive provider prefixes from :data:`USD_PER_MTOK` keys.
+
+    Anything appearing before the FIRST ``/`` in a key is a provider
+    prefix; we collect them so :func:`normalize_model_name` can resolve
+    bare API names without a hard-coded prefix list. Adding a new
+    provider key automatically extends the prefix tuple — no second edit
+    needed (issue #57).
+
+    Includes ``bedrock/`` as forward-defense for AWS Bedrock model ids
+    even before pricing rows land (issue #53).
+    """
+    prefixes: set[str] = {"bedrock/"}
+    for key in USD_PER_MTOK:
+        head, sep, _ = key.partition("/")
+        if sep:
+            prefixes.add(head + "/")
+    # Stable order for deterministic iteration in tests / debugging.
+    return tuple(sorted(prefixes))
+
+
+_PROVIDER_PREFIXES: tuple[str, ...] = _derive_provider_prefixes()
+
+
 def normalize_model_name(model: str) -> str:
     """Match the emitted model string against the price-table key.
 
     Some callers pass the bare API name (``gemini-2.5-flash``) while
     nanobot's config uses the prefixed form (``gemini/gemini-2.5-flash``).
     Accept either.
+
+    The set of prefixes is auto-derived from :data:`USD_PER_MTOK` keys
+    plus a small set of forward-defense entries (e.g. ``bedrock/``) —
+    adding a priced model under a new provider auto-extends the lookup.
     """
     if not model:
         return ""
     if model in USD_PER_MTOK:
         return model
-    for prefix in ("gemini/", "openrouter/", "cerebras/"):
+    for prefix in _PROVIDER_PREFIXES:
         if (prefix + model) in USD_PER_MTOK:
             return prefix + model
     return model
@@ -63,7 +91,20 @@ def estimate_cost_usd(
     output_tokens: int,
     cache_read_tokens: int = 0,
 ) -> float:
-    """Return a USD estimate for one call. 0.0 if the model isn't priced."""
+    """Return a USD estimate for one call. 0.0 if the model isn't priced.
+
+    Token-counting contract:
+
+    * ``input_tokens`` is the *total* prompt size for the call, including
+      any portion served from a provider cache.
+    * ``cache_read_tokens`` is the cached subset of ``input_tokens``;
+      it is billed at the model's cache-read rate (column 3 of the price
+      tuple, falling back to the input rate when omitted).
+    * The non-cached portion of the prompt — billed at the full input
+      rate — is therefore ``max(0, input_tokens - cache_read_tokens)``.
+
+    Output tokens are billed independently at the output rate.
+    """
     key = normalize_model_name(model)
     prices = USD_PER_MTOK.get(key)
     if prices is None:

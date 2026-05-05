@@ -40,11 +40,19 @@ def _clean_env(monkeypatch):
 
 @pytest.fixture
 def mock_hook(monkeypatch):
-    """Stub ``get_analytics_hook()`` so emit lands on a MagicMock client."""
-    fake = MagicMock()
+    """Stub ``get_analytics_hook()`` so emit lands on a MagicMock client.
+
+    Uses a real :class:`AnalyticsHook` with the PostHog client mocked out
+    so the public ``capture()`` helper (issue #49) actually runs and
+    forwards to ``_client.capture(...)`` — that's what ``_last_event``
+    inspects.
+    """
+    from nanobot.analytics.hook import AnalyticsHook
+
+    fake = AnalyticsHook()
     fake._initialized = True
     fake._client = MagicMock()
-    fake._ensure_init = MagicMock(return_value=True)
+    fake._household_id = ""
 
     monkeypatch.setattr(hook_module, "_hook", fake)
     return fake
