@@ -444,7 +444,13 @@ class TestMediaUpload:
         return cm
 
     @pytest.mark.asyncio
-    async def test_image_upload_sets_pending_upload(self, jpg_file, patched_httpx):
+    async def test_image_upload_emits_separate_text_and_media_rows(
+        self, jpg_file, patched_httpx,
+    ):
+        # Text + media now produce TWO user rows: row 1 carries the text
+        # (no pending_upload, lands immediately so the agent isn't blocked);
+        # row 2 carries pending_upload (no text, written from the
+        # background-task path after the upload completes).
         hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
         ctx = await hook.on_message_received(
             channel="whatsapp",
@@ -454,18 +460,25 @@ class TestMediaUpload:
             timestamp=datetime.now(timezone.utc),
         )
         assert ctx == {"contributor_id": "c-1", "channel": "whatsapp"}
-        # Storage upload happened.
+
+        # Storage upload happened (1 POST to /storage/v1/object/...).
         assert patched_httpx.post.await_count >= 1
         upload_call = patched_httpx.post.await_args_list[0]
         # base_url=/storage/v1 is on the AsyncClient; the request path is relative.
         assert upload_call.args[0].startswith("/object/history-media-hh-1/")
         assert upload_call.kwargs["headers"]["Content-Type"] == "image/jpeg"
         assert upload_call.kwargs["content"] == jpg_file.read_bytes()
-        # Insert body has pending_upload.
-        post_body = rest_client.post.await_args.kwargs["json"]
-        assert post_body["role"] == "user"
-        assert post_body["text"] == "check this out"
-        pu = post_body["pending_upload"]
+
+        # Two REST inserts: the text row first, then the media row.
+        assert rest_client.post.await_count == 2
+        bodies = [c.kwargs["json"] for c in rest_client.post.await_args_list]
+        text_row, media_row = bodies[0], bodies[1]
+        assert text_row["role"] == "user"
+        assert text_row["text"] == "check this out"
+        assert "pending_upload" not in text_row
+        assert media_row["role"] == "user"
+        assert media_row["text"] == ""
+        pu = media_row["pending_upload"]
         assert pu["filename"] == "photo.jpg"
         assert pu["mime"] == "image/jpeg"
         assert pu["kind"] == "image"
@@ -473,6 +486,10 @@ class TestMediaUpload:
 
     @pytest.mark.asyncio
     async def test_audio_upload_kind_audio(self, ogg_file, patched_httpx):
+        # Audio-only turn: empty text → no text row inserted, only the media
+        # row from the background-task path. (The on_message_received guard
+        # `if text or media_paths:` still inserts a text row when media is
+        # present, so we expect 2 rows: empty-text row + media row.)
         hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
         await hook.on_message_received(
             channel="whatsapp",
@@ -481,16 +498,18 @@ class TestMediaUpload:
             media=[str(ogg_file)],
             timestamp=datetime.now(timezone.utc),
         )
-        post_body = rest_client.post.await_args.kwargs["json"]
-        assert post_body["pending_upload"]["kind"] == "audio"
-        assert post_body["pending_upload"]["mime"] == "audio/ogg"
+        # Last insert is the media row; first is the empty-text placeholder.
+        bodies = [c.kwargs["json"] for c in rest_client.post.await_args_list]
+        media_row = bodies[-1]
+        assert media_row["pending_upload"]["kind"] == "audio"
+        assert media_row["pending_upload"]["mime"] == "audio/ogg"
 
     @pytest.mark.asyncio
-    async def test_unsupported_mime_skips_upload_keeps_text(
+    async def test_unsupported_mime_skips_media_row_keeps_text(
         self, tmp_path, patched_httpx,
     ):
-        # PDF (kind not in image/audio/video) → no upload, no pending_upload,
-        # but the user row still records the text.
+        # PDF (kind not in image/audio/video) → no upload, no media row.
+        # Text row still goes through so the contributor's words aren't lost.
         pdf = tmp_path / "doc.pdf"
         pdf.write_bytes(b"%PDF-1.4")
         hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
@@ -503,13 +522,14 @@ class TestMediaUpload:
         )
         # No storage upload.
         assert patched_httpx.post.await_count == 0
-        # Insert went through with text, no pending_upload.
+        # Exactly one REST insert: the text row only.
+        assert rest_client.post.await_count == 1
         post_body = rest_client.post.await_args.kwargs["json"]
         assert post_body["text"] == "see attached"
         assert "pending_upload" not in post_body
 
     @pytest.mark.asyncio
-    async def test_missing_file_skips_upload(self, tmp_path, patched_httpx):
+    async def test_missing_file_skips_media_row(self, tmp_path, patched_httpx):
         ghost = str(tmp_path / "nope.jpg")
         hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
         await hook.on_message_received(
@@ -520,6 +540,7 @@ class TestMediaUpload:
             timestamp=datetime.now(timezone.utc),
         )
         assert patched_httpx.post.await_count == 0
+        assert rest_client.post.await_count == 1
         post_body = rest_client.post.await_args.kwargs["json"]
         assert post_body["text"] == "hi"
         assert "pending_upload" not in post_body
@@ -539,12 +560,17 @@ class TestMediaUpload:
             timestamp=datetime.now(timezone.utc),
         )
         assert patched_httpx.post.await_count == 0
-        assert "pending_upload" not in rest_client.post.await_args.kwargs["json"]
+        # Only the text row inserted; oversize media is dropped (logged WARN).
+        assert rest_client.post.await_count == 1
+        post_body = rest_client.post.await_args.kwargs["json"]
+        assert post_body["text"] == "huge"
+        assert "pending_upload" not in post_body
 
     @pytest.mark.asyncio
-    async def test_upload_failure_keeps_text(self, jpg_file, patched_httpx):
+    async def test_upload_failure_keeps_text_row(self, jpg_file, patched_httpx):
         # First POST returns 500 — bucket retry path is only taken on 400/404,
-        # so a 500 means upload is unrecoverable. Row still persists w/o pending_upload.
+        # so a 500 means upload is unrecoverable. Text row still inserts; the
+        # media row is skipped because there's no storage_path to point at.
         patched_httpx.post = AsyncMock(return_value=patched_httpx._resp(500, text="oops"))
         hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
         await hook.on_message_received(
@@ -554,6 +580,7 @@ class TestMediaUpload:
             media=[str(jpg_file)],
             timestamp=datetime.now(timezone.utc),
         )
+        assert rest_client.post.await_count == 1
         post_body = rest_client.post.await_args.kwargs["json"]
         assert post_body["text"] == "hi"
         assert "pending_upload" not in post_body
@@ -610,9 +637,12 @@ class TestMediaUpload:
         assert "pending_upload" in rest_client.post.await_args.kwargs["json"]
 
     @pytest.mark.asyncio
-    async def test_multi_attachment_keeps_first_only(
+    async def test_multi_attachment_uploads_all_items(
         self, tmp_path, jpg_file, patched_httpx,
     ):
+        # Multi-attachment turn: every file is uploaded, every file gets
+        # its own user row with pending_upload populated. No file is
+        # dropped — the previous "first-only" policy lost data.
         second = tmp_path / "extra.jpg"
         second.write_bytes(b"\xff\xd8")
         hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
@@ -623,10 +653,55 @@ class TestMediaUpload:
             media=[str(jpg_file), str(second)],
             timestamp=datetime.now(timezone.utc),
         )
-        # Exactly one storage upload — the first.
-        assert patched_httpx.post.await_count == 1
-        pu = rest_client.post.await_args.kwargs["json"]["pending_upload"]
-        assert pu["filename"] == "photo.jpg"
+        # Two storage uploads — one per file.
+        assert patched_httpx.post.await_count == 2
+        upload_paths = [c.args[0] for c in patched_httpx.post.await_args_list]
+        assert all(p.startswith("/object/history-media-hh-1/") for p in upload_paths)
+
+        # Three REST inserts: text row + two media rows (one per upload).
+        assert rest_client.post.await_count == 3
+        bodies = [c.kwargs["json"] for c in rest_client.post.await_args_list]
+        text_row = bodies[0]
+        media_rows = bodies[1:]
+        assert text_row["text"] == "two photos"
+        assert "pending_upload" not in text_row
+        filenames = sorted(b["pending_upload"]["filename"] for b in media_rows)
+        assert filenames == ["extra.jpg", "photo.jpg"]
+        for row in media_rows:
+            assert row["text"] == ""
+            assert row["pending_upload"]["kind"] == "image"
+
+    @pytest.mark.asyncio
+    async def test_schedule_background_offloads_media_uploads(
+        self, jpg_file, patched_httpx,
+    ):
+        # When schedule_background is provided, media upload + media-row
+        # insert run on the background-task pool. on_message_received
+        # returns as soon as the text row is written.
+        hook, rest_client = _make_hook(contributor_rows=[{"id": "c-1"}])
+        scheduled: list = []
+        def _schedule(coro):
+            scheduled.append(coro)
+
+        ctx = await hook.on_message_received(
+            channel="whatsapp",
+            sender_id="14125551234",
+            content="check this out",
+            media=[str(jpg_file)],
+            timestamp=datetime.now(timezone.utc),
+            schedule_background=_schedule,
+        )
+        assert ctx == {"contributor_id": "c-1", "channel": "whatsapp"}
+        # Text row already inserted (immediate path).
+        assert rest_client.post.await_count == 1
+        # Media-upload coroutine was queued, not awaited.
+        assert len(scheduled) == 1
+        assert patched_httpx.post.await_count == 0
+
+        # Drain the scheduled coroutine — uploads + media-row insert.
+        await scheduled[0]
+        assert patched_httpx.post.await_count == 1  # storage upload
+        assert rest_client.post.await_count == 2    # text row + media row
 
 
 # ── curator bootstrap (HOMER_ADMIN_PHONE) ────────────────────────────────

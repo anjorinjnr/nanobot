@@ -1177,6 +1177,7 @@ class AgentLoop:
                     content=msg.content,
                     media=msg.media,
                     timestamp=msg.timestamp,
+                    schedule_background=self._schedule_background,
                 )
             except Exception:
                 logger.debug("chat_persist on_message_received error (non-fatal)", exc_info=True)

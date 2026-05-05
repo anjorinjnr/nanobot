@@ -189,8 +189,27 @@ class ChatPersistHook:
         content: str,
         media: list[str],
         timestamp: datetime,
+        schedule_background: Any = None,
     ) -> dict[str, Any] | None:
         """Persist the inbound user turn; return ctx for on_response_sent.
+
+        Behavior:
+
+        - Inserts the text portion of the turn as a single user row immediately
+          (with ``pending_upload=None``). The agent's reply is never gated on
+          a media upload — even multi-MB voice notes don't delay the response.
+        - For each media item attached to the turn, schedules an independent
+          background task that uploads the file to Supabase storage and then
+          inserts a separate user row carrying the resulting ``pending_upload``
+          metadata. Multi-attachment turns produce one chat row per file —
+          no media is dropped, ever.
+
+        When ``schedule_background`` is provided (AgentLoop's
+        ``_schedule_background``), media uploads are dispatched onto the
+        background-task pool and ``on_message_received`` returns as soon as
+        the text row is written. When omitted (tests, OSS deploys with no
+        loop wiring), uploads run sequentially via ``await`` so callers can
+        rely on completion-by-return.
 
         Returns None when persistence is disabled, the channel is unsupported,
         or the sender doesn't resolve to a contributor — callers should treat
@@ -201,16 +220,71 @@ class ChatPersistHook:
         contributor_id = await self._resolve_contributor(channel, sender_id)
         if contributor_id is None:
             return None
-        pending_upload = await self._upload_first_media(media or [])
         text = content or ""
-        if text or pending_upload or media:
+        media_paths = [p for p in (media or []) if isinstance(p, str) and p]
+
+        # Insert the text row first so the chat timeline preserves the
+        # contributor's actual message before any media-upload side effects
+        # land. ``pending_upload`` rides on its own row (one per file)
+        # written from the background task — keeps the timeline correct even
+        # under multi-attachment turns.
+        if text or media_paths:
             await self._insert(
                 role="user",
                 contributor_id=contributor_id,
                 text=text,
-                pending_upload=pending_upload,
+                pending_upload=None,
             )
+
+        # Schedule media uploads sequentially to avoid overwhelming
+        # the storage endpoint (especially with large voice notes).
+        if media_paths:
+            coro = self._upload_all_media(contributor_id, media_paths)
+            if schedule_background is not None:
+                schedule_background(coro)
+            else:
+                await coro
+
         return {"contributor_id": contributor_id, "channel": channel}
+
+    async def _upload_and_insert_media(
+        self, contributor_id: str, path: str,
+    ) -> None:
+        """Upload one media file to storage; on success, insert a user row
+        carrying the resulting `pending_upload` metadata.
+
+        Failures (file missing, unsupported mime, oversize, upload error) are
+        already logged inside `_upload_one_media` and result in `None` —
+        when that happens we drop this media item without inserting a row.
+        The text row from `on_message_received` already captured the textual
+        content of the turn, so a failed media upload doesn't lose the
+        contributor's words.
+        """
+        pending = await self._upload_one_media(path)
+        if pending is None:
+            return
+        await self._insert(
+            role="user",
+            contributor_id=contributor_id,
+            text="",
+            pending_upload=pending,
+        )
+
+    async def _upload_all_media(
+        self, contributor_id: str, media_paths: list[str],
+    ) -> None:
+        """Upload all media files sequentially to avoid overwhelming the storage endpoint.
+
+        Processes media items one-at-a-time rather than firing concurrent uploads.
+        This is important when handling multi-attachment turns with large files
+        (up to 50MB each), where concurrent uploads could exhaust the endpoint's
+        resources or network bandwidth.
+
+        Failed uploads are logged but don't block subsequent items or raise.
+        """
+        for path in media_paths:
+            await self._upload_and_insert_media(contributor_id, path)
+
 
     async def on_response_sent(
         self,
@@ -485,30 +559,24 @@ class ChatPersistHook:
                 role, contributor_id, exc_info=True,
             )
 
-    async def _upload_first_media(
-        self, media: list[str],
+    async def _upload_one_media(
+        self, path_str: str,
     ) -> dict[str, Any] | None:
-        """Upload the first media item to Supabase storage; return pending_upload.
+        """Upload a single media file to Supabase storage; return pending_upload.
 
-        Channel adapters hand us already-downloaded local file paths. We only
-        persist one upload per row (matching the portal's `pending_upload`
-        single-object schema); additional items in the same turn are logged
-        and dropped — multi-attachment WhatsApp messages are rare and the
-        contributor can re-send.
+        Caller (typically `_upload_and_insert_media` running on the
+        background-task pool) loops over the inbound's full media list and
+        invokes this once per file — every attachment lands in storage as
+        its own `hist_chat_messages` row, no media is dropped.
 
-        Returns None if media is empty, the file is missing, the kind isn't
-        recognized as image/audio/video, the file is too big, or the upload
-        fails — in every case the caller still records the user-row text.
+        Returns None if the file is missing, the kind isn't recognized as
+        image/audio/video, the file is too big, or the upload fails — in
+        every case the failure is logged WARN. The text row from
+        `on_message_received` already captured the textual content, so a
+        failed media upload never loses the contributor's words.
         """
-        paths = [p for p in media if isinstance(p, str) and p]
-        if not paths:
+        if not path_str:
             return None
-        if len(paths) > 1:
-            logger.warning(
-                "chat_persist: multi-attachment turn (%d items) — keeping first, dropping %r",
-                len(paths), paths[1:],
-            )
-        path_str = paths[0]
         path = Path(path_str)
         if not path.is_file():
             logger.warning("chat_persist: media file not found at %s — skipping", path_str)
