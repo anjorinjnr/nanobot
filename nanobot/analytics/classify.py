@@ -14,6 +14,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
@@ -117,10 +118,21 @@ async def classify_message_async(text: str) -> str:
 
 
 async def _call_gemini_async(text: str) -> str:
-    """Call Gemini Flash and return a validated tag."""
+    """Call Gemini Flash and return a validated tag.
+
+    Emits one ``$ai_generation`` event tagged ``task_kind=tool_classifier``
+    so spend on this side-channel call shows up correctly in PostHog
+    dashboards. This path bypasses :class:`LLMProvider`, so we wire
+    telemetry in directly. (#55)
+    """
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         return _FALLBACK
+    start = time.monotonic()
+    input_tokens = 0
+    output_tokens = 0
+    is_error = False
+    http_status: int | None = None
     try:
         import httpx
 
@@ -140,9 +152,31 @@ async def _call_gemini_async(text: str) -> str:
                 },
                 timeout=5.0,
             )
+            http_status = resp.status_code
             resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"]
+            payload = resp.json()
+            raw = payload["choices"][0]["message"]["content"]
+            usage = payload.get("usage") or {}
+            input_tokens = int(usage.get("prompt_tokens", 0) or 0)
+            output_tokens = int(usage.get("completion_tokens", 0) or 0)
             return _validate(raw)
     except Exception:
+        is_error = True
         logger.debug("Gemini classification request failed", exc_info=True)
         return _FALLBACK
+    finally:
+        try:
+            from nanobot.analytics.llm_telemetry import track_llm_generation
+
+            track_llm_generation(
+                model="gemini-2.5-flash",
+                provider="gemini",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_s=time.monotonic() - start,
+                task_kind="tool_classifier",
+                is_error=is_error,
+                http_status=http_status,
+            )
+        except Exception:
+            logger.debug("classify telemetry emit failed", exc_info=True)

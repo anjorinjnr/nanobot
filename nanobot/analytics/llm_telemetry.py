@@ -18,6 +18,12 @@ Heartbeat / cron callers set ``task_kind`` via ``llm_telemetry_context()``
 before invoking the agent loop; the LLM-call boundary in
 :class:`LLMProvider` reads it via :func:`current_task_kind`. Inbound user
 messages leave the contextvar unset so events default to ``chat``.
+
+Retry aggregation: :func:`retry_burst_context` (used by
+:class:`LLMProvider._run_with_retry`) buffers per-attempt event props so
+the wrapper can ship ONE consolidated ``$ai_generation`` with
+``retry_count: N`` instead of N independent events that would inflate
+P95/P99 latency dashboards. See issue #52.
 """
 
 from __future__ import annotations
@@ -33,7 +39,47 @@ from nanobot.analytics.pricing import estimate_cost_usd
 logger = logging.getLogger(__name__)
 
 
-_VALID_TASK_KINDS = {"chat", "heartbeat_system", "heartbeat_user", "tool_classifier"}
+_VALID_TASK_KINDS = {
+    "chat",
+    "heartbeat_system",
+    "heartbeat_user",
+    "tool_classifier",
+    "cron",
+}
+
+
+# Provider prefixes that nanobot/litellm prepend to bare API model names
+# (e.g. ``gemini-2.5-flash`` arrives as ``gemini/gemini-2.5-flash`` from
+# config but Anthropic SDK returns the bare name from ``response.model``).
+# We strip these on emit so PostHog doesn't split a single model into two
+# rows. See issue #51.
+_KNOWN_PROVIDER_PREFIXES: tuple[str, ...] = (
+    "gemini/",
+    "openrouter/",
+    "cerebras/",
+    "anthropic/",
+    "openai/",
+)
+
+
+def canonicalize_for_telemetry(model: str) -> str:
+    """Return the bare canonical model name for ``$ai_model`` emission.
+
+    Strips any leading provider prefix (``gemini/``, ``openrouter/``,
+    ``cerebras/``, ``anthropic/``, ``openai/``) so PostHog dashboards see a
+    single dimension per model regardless of whether the caller passed the
+    config form (``gemini/gemini-2.5-flash``) or the bare API form
+    (``gemini-2.5-flash``). Provider attribution lives in the separate
+    ``$ai_provider`` property, so this collapse is non-lossy.
+
+    No-op for models without a known prefix.
+    """
+    if not model:
+        return ""
+    for prefix in _KNOWN_PROVIDER_PREFIXES:
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return model
 
 
 # ── task_kind / synthetic context ─────────────────────────────────────────
@@ -64,6 +110,15 @@ _CTX_TASK_KIND: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _CTX_IS_SYNTHETIC: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "homer_llm_is_synthetic", default=False,
 )
+# Retry-aggregation buffer. When :func:`retry_burst_context` is active,
+# per-attempt :func:`track_llm_generation` calls append their props dict
+# to this buffer instead of emitting; the retry wrapper emits one
+# consolidated event with ``retry_count: N`` once the loop exits. See
+# issue #52 — without this each retry attempt fires its own event, which
+# inflates P95/P99 latency dashboards with retry-wait time.
+_CTX_RETRY_BUFFER: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
+    "homer_llm_retry_buffer", default=None,
+)
 
 
 def current_task_kind() -> str:
@@ -73,6 +128,26 @@ def current_task_kind() -> str:
 
 def current_is_synthetic() -> bool:
     return _CTX_IS_SYNTHETIC.get()
+
+
+@contextmanager
+def retry_burst_context() -> Iterator[list[dict[str, Any]]]:
+    """Buffer per-attempt events until the retry loop exits.
+
+    Yields a list that ``track_llm_generation`` will append attempt props
+    to (instead of firing them as their own events). The retry wrapper
+    inspects the list afterwards to emit ONE consolidated
+    ``$ai_generation`` event with ``retry_count`` set to ``len(buffer)``.
+
+    See issue #52 — keeps dashboards reporting user-perceived latency, not
+    sum-of-retries.
+    """
+    buf: list[dict[str, Any]] = []
+    tok = _CTX_RETRY_BUFFER.set(buf)
+    try:
+        yield buf
+    finally:
+        _CTX_RETRY_BUFFER.reset(tok)
 
 
 # ── Event emission ────────────────────────────────────────────────────────
@@ -115,6 +190,10 @@ def track_llm_generation(
 
     Errors during emission are swallowed — observability MUST NOT crash
     the agent loop.
+
+    Inside a :func:`retry_burst_context` window, the per-attempt props
+    are buffered (not emitted) so the retry wrapper can ship ONE
+    aggregated event with ``retry_count: N``.
     """
     try:
         kind = task_kind if task_kind is not None else current_task_kind()
@@ -134,7 +213,7 @@ def track_llm_generation(
         synthetic = current_is_synthetic() if is_synthetic is None else bool(is_synthetic)
 
         props: dict[str, Any] = {
-            "$ai_model": model,
+            "$ai_model": canonicalize_for_telemetry(model),
             "$ai_provider": provider,
             "$ai_input_tokens": int(input_tokens),
             "$ai_output_tokens": int(output_tokens),
@@ -163,6 +242,45 @@ def track_llm_generation(
                 if not k.startswith("$") and k not in props:
                     props[k] = v
 
+        # Retry-burst aggregation: if a buffer is active, stash this
+        # attempt's props for the retry wrapper to consolidate. See #52.
+        buf = _CTX_RETRY_BUFFER.get()
+        if buf is not None:
+            buf.append(props)
+            return
+
+        # Default emission path (no retry burst) — fire the event with
+        # an explicit retry_count=1 so dashboards can sum cleanly across
+        # both the default and retry-aggregated paths.
+        props.setdefault("retry_count", 1)
+        _emit_event(props)
+    except Exception as exc:  # noqa: BLE001 — observability must not crash callers
+        logger.debug("track_llm_generation failed: %s", exc)
+
+
+def emit_retry_aggregate(props: dict[str, Any]) -> None:
+    """Emit one ``$ai_generation`` for an aggregated retry burst.
+
+    Used by :class:`LLMProvider._run_with_retry` to ship a single event
+    after a buffer of per-attempt props has been collapsed into a final
+    record. Caller is responsible for setting ``retry_count`` and any
+    aggregated latency / error fields on ``props`` before calling.
+    """
+    try:
+        _emit_event(props)
+    except Exception as exc:  # noqa: BLE001 — observability never crashes the loop
+        logger.debug("emit_retry_aggregate failed: %s", exc)
+
+
+def _emit_event(props: dict[str, Any]) -> None:
+    """Send one ``$ai_generation`` capture call.
+
+    Centralized so the default emission path and the retry-aggregation
+    path share the same posthog wiring (init guard, distinct_id, group
+    identify).
+    """
+    try:
+        hid = _household_id()
         from nanobot.analytics.hook import get_analytics_hook
 
         hook = get_analytics_hook()
@@ -170,7 +288,7 @@ def track_llm_generation(
         if hid and hook._client is not None:
             hook._client.group_identify("household", hid, {})
     except Exception as exc:  # noqa: BLE001 — observability must not crash callers
-        logger.debug("track_llm_generation failed: %s", exc)
+        logger.debug("_emit_event failed: %s", exc)
 
 
 __all__ = [
@@ -179,4 +297,7 @@ __all__ = [
     "current_task_kind",
     "current_is_synthetic",
     "track_llm_generation",
+    "canonicalize_for_telemetry",
+    "retry_burst_context",
+    "emit_retry_aggregate",
 ]

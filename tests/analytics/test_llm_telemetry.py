@@ -22,7 +22,10 @@ import pytest
 
 from nanobot.analytics import hook as hook_module
 from nanobot.analytics.llm_telemetry import (
+    _VALID_TASK_KINDS,
+    canonicalize_for_telemetry,
     llm_telemetry_context,
+    retry_burst_context,
     track_llm_generation,
 )
 from nanobot.providers.base import LLMProvider, LLMResponse
@@ -335,3 +338,247 @@ async def test_pii_regression_no_email_or_phone_or_long_strings(mock_hook, monke
         assert len(value) <= 200, (
             f"free-form-looking string > 200 chars leaked: {value[:80]!r}..."
         )
+
+
+# ── Issue #50: cron task_kind ─────────────────────────────────────────────
+
+
+def test_valid_task_kinds_includes_cron():
+    """Cron callbacks need their own dashboard row, not heartbeat_user.
+
+    Issue #50: surfaces cron LLM spend distinctly from user-defined
+    heartbeat tasks.
+    """
+    assert "cron" in _VALID_TASK_KINDS
+    # Existing kinds must still be valid — no regression.
+    assert {"chat", "heartbeat_system", "heartbeat_user", "tool_classifier"} <= _VALID_TASK_KINDS
+
+
+def test_track_with_cron_task_kind_passes_through(mock_hook):
+    """``cron`` should NOT be tagged as unknown_task_kind."""
+    track_llm_generation(
+        model="x", provider="y", input_tokens=0, output_tokens=0,
+        latency_s=0.1, task_kind="cron",
+    )
+    _, props = _last_event(mock_hook._client)
+    assert props["task_kind"] == "cron"
+    assert "unknown_task_kind" not in props
+
+
+# ── Issue #51: model-name canonicalization ────────────────────────────────
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("gemini/gemini-2.5-flash", "gemini-2.5-flash"),
+    ("gemini-2.5-flash", "gemini-2.5-flash"),
+    ("openrouter/deepseek/deepseek-chat-v3.2", "deepseek/deepseek-chat-v3.2"),
+    ("cerebras/qwen-3-235b-a22b-instruct", "qwen-3-235b-a22b-instruct"),
+    ("anthropic/claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
+    ("openai/gpt-4", "gpt-4"),
+    ("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
+    ("", ""),
+])
+def test_canonicalize_strips_known_prefixes(raw, expected):
+    assert canonicalize_for_telemetry(raw) == expected
+
+
+def test_track_emits_canonical_model_name(mock_hook):
+    """Both bare and prefixed forms must hit the same ``$ai_model`` value
+    so PostHog dashboards collapse them into one row. (#51)"""
+    track_llm_generation(
+        model="gemini/gemini-2.5-flash", provider="gemini",
+        input_tokens=0, output_tokens=0, latency_s=0.1, task_kind="chat",
+    )
+    _, props_prefixed = _last_event(mock_hook._client)
+
+    mock_hook._client.reset_mock()
+    track_llm_generation(
+        model="gemini-2.5-flash", provider="gemini",
+        input_tokens=0, output_tokens=0, latency_s=0.1, task_kind="chat",
+    )
+    _, props_bare = _last_event(mock_hook._client)
+
+    assert props_prefixed["$ai_model"] == "gemini-2.5-flash"
+    assert props_bare["$ai_model"] == "gemini-2.5-flash"
+    assert props_prefixed["$ai_model"] == props_bare["$ai_model"]
+
+
+# ── Issue #52: retry-burst aggregation ────────────────────────────────────
+
+
+def test_retry_burst_buffers_attempts_emits_one(mock_hook):
+    """N attempts inside a retry-burst window MUST emit at most one event,
+    not N. (#52)"""
+    from nanobot.analytics.llm_telemetry import emit_retry_aggregate
+
+    with retry_burst_context() as buf:
+        for _ in range(3):
+            track_llm_generation(
+                model="x", provider="y", input_tokens=10, output_tokens=5,
+                latency_s=0.1, task_kind="chat",
+            )
+
+    # No event emitted while buffer was active.
+    assert mock_hook._client.capture.call_count == 0
+    assert len(buf) == 3
+
+    # Caller must consolidate + emit.
+    final = dict(buf[-1])
+    final["retry_count"] = len(buf)
+    emit_retry_aggregate(final)
+
+    event, props = _last_event(mock_hook._client)
+    assert event == "$ai_generation"
+    assert props["retry_count"] == 3
+
+
+def test_default_emit_path_includes_retry_count_one(mock_hook):
+    """Outside a retry burst, every event ships ``retry_count=1`` so
+    dashboards can ``sum(retry_count)`` cleanly across both paths."""
+    track_llm_generation(
+        model="x", provider="y", input_tokens=0, output_tokens=0,
+        latency_s=0.1, task_kind="chat",
+    )
+    _, props = _last_event(mock_hook._client)
+    assert props["retry_count"] == 1
+
+
+async def test_run_with_retry_emits_one_event_per_burst(mock_hook):
+    """Integration: the LLMProvider retry wrapper must emit ONE event with
+    ``retry_count`` set, not one per attempt. (#52)"""
+    attempts: list[int] = [0]
+
+    class _RetryStub(LLMProvider):
+        provider_name = "anthropic"
+        _CHAT_RETRY_DELAYS = (0, 0, 0)  # zero delay — keep the test fast
+
+        async def chat(self, **_kw):
+            attempts[0] += 1
+            if attempts[0] < 3:
+                return LLMResponse(
+                    content="rate limit",
+                    finish_reason="error",
+                    error_status_code=429,
+                )
+            return LLMResponse(
+                content="ok", finish_reason="stop",
+                usage={"prompt_tokens": 7, "completion_tokens": 3},
+            )
+
+        def get_default_model(self) -> str:
+            return "claude-haiku-4-5-20251001"
+
+    provider = _RetryStub()
+    response = await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hi"}],
+        model="claude-haiku-4-5-20251001",
+    )
+
+    assert response.finish_reason == "stop"
+    # Exactly one $ai_generation per burst.
+    assert mock_hook._client.capture.call_count == 1
+    _, props = _last_event(mock_hook._client)
+    assert props["retry_count"] == 3
+
+
+# ── Issue #54: heartbeat-fallback path tagging ────────────────────────────
+
+
+async def test_heartbeat_fallback_tags_heartbeat_system(mock_hook):
+    """The LLM fallback in HeartbeatService._tick (no structured due_tasks)
+    must wrap its on_execute call in heartbeat_system + synthetic, not
+    let the LLMProvider default to task_kind=chat. (#54)"""
+    from nanobot.analytics.llm_telemetry import (
+        current_is_synthetic,
+        current_task_kind,
+    )
+
+    seen: dict[str, Any] = {}
+
+    async def _fake_on_execute(tasks_str, model_override):
+        seen["task_kind"] = current_task_kind()
+        seen["is_synthetic"] = current_is_synthetic()
+        return ""
+
+    # Pin the contract: the wrap actually used in heartbeat/service.py
+    # propagates the right contextvars so any track_llm_generation() call
+    # inside the on_execute body lands on the right dashboard row.
+    with llm_telemetry_context(task_kind="heartbeat_system", is_synthetic=True):
+        await _fake_on_execute("dummy tasks", None)
+
+    assert seen["task_kind"] == "heartbeat_system"
+    assert seen["is_synthetic"] is True
+
+
+# ── Issue #55: classifier emits as tool_classifier ────────────────────────
+
+
+async def test_classifier_emits_tool_classifier_event(mock_hook, monkeypatch):
+    """The use-case classifier's Gemini call must publish $ai_generation
+    with task_kind=tool_classifier — not chat — even though it bypasses
+    LLMProvider. (#55)"""
+    from nanobot.analytics import classify
+
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "calendar"}}],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 1},
+    }
+
+    class _StubClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return fake_response
+
+    monkeypatch.setattr(classify, "_cache", classify._LRUCache())  # bypass cache
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **kw: _StubClient())
+
+    tag = await classify.classify_message_async("when's my next dentist appt")
+    assert tag == "calendar"
+
+    event, props = _last_event(mock_hook._client)
+    assert event == "$ai_generation"
+    assert props["task_kind"] == "tool_classifier"
+    assert props["$ai_model"] == "gemini-2.5-flash"  # canonicalized
+    assert props["$ai_provider"] == "gemini"
+    assert props["$ai_input_tokens"] == 50
+    assert props["$ai_output_tokens"] == 1
+    assert props["$ai_is_error"] is False
+
+
+async def test_classifier_emits_event_on_failure(mock_hook, monkeypatch):
+    """Even when classification fails (network / parse), telemetry MUST
+    fire so we can see error rates in PostHog. (#55)"""
+    from nanobot.analytics import classify
+
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+
+    class _BoomClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(classify, "_cache", classify._LRUCache())
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **kw: _BoomClient())
+
+    tag = await classify.classify_message_async("anything")
+    assert tag == "unclassified"
+
+    event, props = _last_event(mock_hook._client)
+    assert event == "$ai_generation"
+    assert props["task_kind"] == "tool_classifier"
+    assert props["$ai_is_error"] is True

@@ -749,7 +749,7 @@ def _run_gateway(
 
         try:
             with llm_telemetry_context(
-                task_kind="heartbeat_user", is_synthetic=True,
+                task_kind="cron", is_synthetic=True,
             ):
                 resp = await agent.process_direct(
                     reminder_note,
