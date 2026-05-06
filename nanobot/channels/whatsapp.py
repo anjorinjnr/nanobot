@@ -36,6 +36,13 @@ class WhatsAppConfig(Base):
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"
     identity_resolution: bool = False  # Enable LID→name resolution via sender_map/lid_map
+    # Optional override for the channel's `sender_map.json` lookup. When set,
+    # this path is checked first and wins; the historic data-dir candidate
+    # remains the fallback. Per-channel (not global) so two WhatsApp configs
+    # in the same process can each point at their own file — necessary for
+    # workspace isolation in multi-agent deployments where main and guest
+    # have different filtered sender maps.
+    sender_map_path: str | None = None
 
 
 def _whatsapp_auth_dir() -> Path:
@@ -467,25 +474,24 @@ class WhatsAppChannel(BaseChannel):
 
         return lid_map, sender_map
 
-    @staticmethod
-    def _sender_map_paths() -> list[Path]:
+    def _sender_map_paths(self) -> list[Path]:
         """Candidate locations for ``sender_map.json``.
 
         Identity-resolution lookup walks this list in order and uses the first
         existing file. Resolution order:
 
-            1. ``NANOBOT_SENDER_MAP_PATH`` env var — explicit override. Set this
-               to point at e.g. an agent's workspace dir when the file lives
-               outside the nanobot data dir (homer's hosted layout writes
-               ``sender_map.json`` into per-agent workspace dirs, which this
-               channel can't otherwise see).
+            1. ``self.config.sender_map_path`` — per-channel explicit override.
+               Each WhatsApp channel instance carries its own value so two
+               channels (e.g. main + guest in a single-process multi-agent
+               setup) can read independent sender maps without leaking through
+               global state.
             2. ``get_data_dir() / "sender_map.json"`` — the per-config-instance
-               data dir. The historic default; matches the bare-metal layout.
+               data dir. Historic default; matches bare-metal layouts.
         """
         from nanobot.config.paths import get_data_dir
 
         candidates: list[Path] = []
-        override = os.environ.get("NANOBOT_SENDER_MAP_PATH")
+        override = self.config.sender_map_path
         if override:
             candidates.append(Path(override).expanduser())
         candidates.append(get_data_dir() / "sender_map.json")
