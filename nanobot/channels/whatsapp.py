@@ -469,9 +469,27 @@ class WhatsAppChannel(BaseChannel):
 
     @staticmethod
     def _sender_map_paths() -> list[Path]:
+        """Candidate locations for ``sender_map.json``.
+
+        Identity-resolution lookup walks this list in order and uses the first
+        existing file. Resolution order:
+
+            1. ``NANOBOT_SENDER_MAP_PATH`` env var — explicit override. Set this
+               to point at e.g. an agent's workspace dir when the file lives
+               outside the nanobot data dir (homer's hosted layout writes
+               ``sender_map.json`` into per-agent workspace dirs, which this
+               channel can't otherwise see).
+            2. ``get_data_dir() / "sender_map.json"`` — the per-config-instance
+               data dir. The historic default; matches the bare-metal layout.
+        """
         from nanobot.config.paths import get_data_dir
 
-        return [get_data_dir() / "sender_map.json"]
+        candidates: list[Path] = []
+        override = os.environ.get("NANOBOT_SENDER_MAP_PATH")
+        if override:
+            candidates.append(Path(override).expanduser())
+        candidates.append(get_data_dir() / "sender_map.json")
+        return candidates
 
     async def _save_lid_mapping(self, phone_jid: str, lid: str) -> None:
         lid_prefix = lid.split("@")[0] if "@" in lid else lid
