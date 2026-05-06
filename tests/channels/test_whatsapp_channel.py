@@ -444,6 +444,50 @@ async def test_sender_name_not_injected_for_media_only():
     assert "[Sender:" not in ch._handle_message.await_args.kwargs["content"]
 
 
+def test_sender_map_paths_honors_env_override(monkeypatch, tmp_path):
+    """NANOBOT_SENDER_MAP_PATH should take precedence over the data-dir default."""
+    from nanobot.channels.whatsapp import WhatsAppChannel
+
+    target = tmp_path / "ws" / "sender_map.json"
+    monkeypatch.setenv("NANOBOT_SENDER_MAP_PATH", str(target))
+
+    paths = WhatsAppChannel._sender_map_paths()
+    assert paths[0] == target
+    # Data-dir candidate stays as the fallback.
+    assert paths[-1].name == "sender_map.json"
+
+
+def test_sender_map_paths_falls_back_to_data_dir(monkeypatch, tmp_path):
+    """Without the override, only the data-dir candidate is returned."""
+    from nanobot.channels.whatsapp import WhatsAppChannel
+
+    monkeypatch.delenv("NANOBOT_SENDER_MAP_PATH", raising=False)
+    monkeypatch.setattr(
+        "nanobot.config.paths.get_config_path", lambda: tmp_path / "config.json"
+    )
+
+    paths = WhatsAppChannel._sender_map_paths()
+    assert paths == [tmp_path / "sender_map.json"]
+
+
+def test_sender_map_loads_from_env_override(monkeypatch, tmp_path):
+    """End-to-end: when override file exists, _read_maps_from_disk loads from it."""
+    import json
+    from nanobot.channels.whatsapp import WhatsAppChannel
+
+    override_file = tmp_path / "ws" / "sender_map.json"
+    override_file.parent.mkdir(parents=True)
+    override_file.write_text(json.dumps({"14125550002": "Emeka"}), encoding="utf-8")
+    monkeypatch.setenv("NANOBOT_SENDER_MAP_PATH", str(override_file))
+    monkeypatch.setattr(
+        "nanobot.config.paths.get_config_path", lambda: tmp_path / "config.json"
+    )
+
+    ch = WhatsAppChannel({"enabled": True, "identity_resolution": True}, MagicMock())
+    _, sender_map = ch._read_maps_from_disk()
+    assert sender_map == {"14125550002": "Emeka"}
+
+
 @pytest.mark.asyncio
 async def test_lid_learned_from_inbound_pn():
     ch = _make_identity_channel(allow_from=["14125550002"])
