@@ -1222,8 +1222,16 @@ class AgentLoop:
 
         # Ephemeral: inserted into this turn's messages only — never written
         # to session history, so stale scope data can't accumulate across turns.
+        #
+        # Gate is just on ``msg.sender_id`` — the previous additional ``guest``
+        # gate (where ``guest = _resolve_guest_agent_workspace(...)``) tied
+        # injection to the existence of a per-scope-type workspace override,
+        # which is a different concern. Many guests are members of relationship
+        # / event scopes that don't have a per-scope-type subdir, and those
+        # were silently missing scope context. The provider itself returns
+        # "" for senders with no scope data, so this gate is sufficient.
         scope_ctx_injected = False
-        if guest and msg.sender_id:
+        if msg.sender_id:
             scope_ctx = self._get_scope_context(msg.sender_id)
             if scope_ctx:
                 initial_messages.insert(
