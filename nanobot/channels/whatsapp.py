@@ -109,21 +109,46 @@ class WhatsAppChannel(BaseChannel):
             await client.disconnect()
             self._client = None
 
+    # Reconnect backoff: start at 5s, double on each failed attempt up to 5min.
+    # Reset to the floor on a successful connection so transient blips don't
+    # leave us paying long delays after recovery.
+    _RECONNECT_MIN_SECONDS = 5
+    _RECONNECT_MAX_SECONDS = 300
+
     async def start(self) -> None:
         """Start the channel by connecting to WhatsApp via neonize."""
         if self.config.identity_resolution:
             await self._ensure_maps_loaded()
 
         self._running = True
-        backoff = 5
+        backoff = self._RECONNECT_MIN_SECONDS
 
         while self._running:
             client = self._build_client()
             self._client = client
+            connected_once = False
             try:
                 await client.connect()
-                await client.wait_until_idle()
-                logger.info("WhatsApp idle loop ended; will reconnect in {}s", backoff)
+                # Track whether we ever reached "connected" so we can reset
+                # backoff after a stable session ends.
+                async def _watch():
+                    nonlocal connected_once
+                    while self._running and not connected_once:
+                        if self._connected:
+                            connected_once = True
+                            return
+                        await asyncio.sleep(0.5)
+
+                watcher = asyncio.create_task(_watch())
+                try:
+                    await client.wait_until_idle()
+                finally:
+                    watcher.cancel()
+                    try:
+                        await watcher
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                logger.info("WhatsApp idle loop ended")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -136,8 +161,14 @@ class WhatsAppChannel(BaseChannel):
                     pass
                 self._client = None
 
-            if self._running:
-                await asyncio.sleep(backoff)
+            if not self._running:
+                break
+
+            if connected_once:
+                backoff = self._RECONNECT_MIN_SECONDS
+            logger.info("Reconnecting WhatsApp in {}s", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, self._RECONNECT_MAX_SECONDS)
 
     async def stop(self) -> None:
         self._running = False

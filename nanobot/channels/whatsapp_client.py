@@ -29,7 +29,6 @@ from neonize.aioze.events import (
     DisconnectedEv,
     LoggedOutEv,
     MessageEv,
-    PairStatusEv,
 )
 from neonize.proto.Neonize_pb2 import JID
 from neonize.utils.enum import ChatPresence, ChatPresenceMedia
@@ -92,22 +91,12 @@ def _parse_legacy_jid(s: str) -> JID:
     user, _, server = s.partition("@")
     # Strip device suffix if present ("12345:42@s.whatsapp.net")
     user = user.split(":", 1)[0]
+    # Bridge surfaced LIDs as "@lid.whatsapp.net"; neonize uses "lid".
+    # All other servers (s.whatsapp.net, g.us, broadcast, newsletter) are
+    # the same string in both representations and pass through unchanged.
     if server == "lid.whatsapp.net":
         server = "lid"
-    elif server == "g.us":
-        server = "g.us"
-    elif server == "s.whatsapp.net":
-        server = "s.whatsapp.net"
     return build_jid(user, server=server)
-
-
-def _is_self_lid(jid_str: str, self_jids: set[str]) -> bool:
-    bare = jid_str.split("@", 1)[0].split(":", 1)[0]
-    for own in self_jids:
-        own_bare = own.split("@", 1)[0].split(":", 1)[0]
-        if bare and bare == own_bare:
-            return True
-    return False
 
 
 class WhatsAppClient:
@@ -121,7 +110,6 @@ class WhatsAppClient:
         self._media_dir.mkdir(parents=True, exist_ok=True)
         self._client: NewAClient | None = None
         self._idle_task: asyncio.Task[None] | None = None
-        self._self_jid_strings: set[str] = set()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -140,22 +128,8 @@ class WhatsAppClient:
             if code:
                 await self.options.on_qr(code)
 
-        @client.event(PairStatusEv)
-        async def _on_pair(_: NewAClient, ev: PairStatusEv) -> None:
-            try:
-                jid = ev.ID
-                self._self_jid_strings.add(_legacy_jid_string(jid))
-            except Exception:
-                pass
-
         @client.event(ConnectedEv)
         async def _on_connected(_: NewAClient, __: ConnectedEv) -> None:
-            try:
-                me = client.me
-                if me is not None:
-                    self._self_jid_strings.add(_legacy_jid_string(me))
-            except Exception:
-                pass
             await self.options.on_status("connected")
 
         @client.event(DisconnectedEv)
@@ -234,8 +208,6 @@ class WhatsAppClient:
         if chat_str.startswith("status@"):
             return
         is_group = chat_jid.Server == "g.us"
-        sender_jid = source.Sender
-        sender_str = _legacy_jid_string(sender_jid) if is_group else chat_str
         # The bridge mirrored Baileys' remoteJidAlt — the alt form of the chat,
         # which only carries useful LID↔phone info for 1:1. Surface SenderAlt
         # only for 1:1; for groups leave pn empty so identity-mapping logic
@@ -271,6 +243,11 @@ class WhatsAppClient:
         except Exception:
             ts = int(time.time())
 
+        # ``sender`` carries the full chat JID (group or 1:1 user) so the
+        # channel can reply to the right destination. Group participant
+        # identity is intentionally NOT exposed — the bridge couldn't, and
+        # callers don't yet handle it. If we expose it later, prefer
+        # ``MessageSource.Sender`` (already available locally).
         await self.options.on_message(
             InboundMessage(
                 id=info.ID or "",
@@ -284,10 +261,6 @@ class WhatsAppClient:
                 push_name=push_name,
             )
         )
-        # The legacy bridge surfaced sender (full chat JID) for replies.
-        # Keep that contract — _handle_message above already used reply_to as
-        # ``sender``. The LID participant string is captured via pn for groups.
-        _ = sender_str  # reserved if we later need to expose the participant JID
 
     def _extract_text_and_media_kind(self, msg) -> tuple[Optional[str], Optional[str], bool, object]:
         """Return (text, fallback_content, is_audio, media_proto_or_None)."""
@@ -317,6 +290,13 @@ class WhatsAppClient:
     def _was_self_mentioned(self, msg, is_group: bool) -> bool:
         if not is_group or self._client is None:
             return False
+        # Read self-identity lazily from neonize's client.me — populated by
+        # whatsmeow's "Me" event, which races against ConnectedEv. Reading at
+        # call time avoids a startup window where group mentions get missed.
+        me = getattr(self._client, "me", None)
+        if me is None or not getattr(me, "User", ""):
+            return False
+        self_user = me.User.split(":", 1)[0]
         ctx_candidates = []
         for field_name in (
             "extendedTextMessage",
@@ -332,15 +312,15 @@ class WhatsAppClient:
                         ctx_candidates.append(sub.contextInfo)
             except (ValueError, AttributeError):
                 continue
-        mentioned: list[str] = []
         for ctx in ctx_candidates:
             try:
-                mentioned.extend(list(ctx.mentionedJID))
+                for jid_str in ctx.mentionedJID:
+                    bare = jid_str.split("@", 1)[0].split(":", 1)[0]
+                    if bare == self_user:
+                        return True
             except (AttributeError, TypeError):
                 continue
-        if not mentioned:
-            return False
-        return any(_is_self_lid(m, self._self_jid_strings) for m in mentioned)
+        return False
 
     async def _download_media(self, msg, media_proto, *, is_audio: bool) -> Optional[str]:
         if self._client is None:
@@ -390,12 +370,15 @@ class WhatsAppClient:
 
     # ------------------------------------------------------------------ outbound
 
-    async def send_message(self, to: str, text: str) -> dict:
+    async def send_message(self, to: str, text: str) -> None:
+        # Bridge era returned ``{"lid": resolved_jid}`` so the channel could
+        # learn outbound phone↔LID. neonize's SendResponse doesn't carry the
+        # resolved JID; inbound MessageSource is the single LID-learning path
+        # now (see whatsapp.py:_save_lid_mapping). Audited 2026-05-05 —
+        # nothing in nanobot or homer reads the return value.
         if self._client is None:
             raise RuntimeError("WhatsApp client not connected")
-        jid = _parse_legacy_jid(to)
-        resp = await self._client.send_message(jid, text)
-        return {"lid": _lid_from_send_response(resp)}
+        await self._client.send_message(_parse_legacy_jid(to), text)
 
     async def send_media(
         self,
@@ -404,27 +387,26 @@ class WhatsAppClient:
         mimetype: str,
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
-    ) -> dict:
+    ) -> None:
         if self._client is None:
             raise RuntimeError("WhatsApp client not connected")
         jid = _parse_legacy_jid(to)
         category = (mimetype or "").split("/", 1)[0]
         is_ptt = bool(re.search(r"audio/.*opus", mimetype or "", re.IGNORECASE))
         if category == "image":
-            resp = await self._client.send_image(jid, file_path, caption=caption or None)
+            await self._client.send_image(jid, file_path, caption=caption or None)
         elif category == "video":
-            resp = await self._client.send_video(jid, file_path, caption=caption or None)
+            await self._client.send_video(jid, file_path, caption=caption or None)
         elif category == "audio":
-            resp = await self._client.send_audio(jid, file_path, ptt=is_ptt)
+            await self._client.send_audio(jid, file_path, ptt=is_ptt)
         else:
-            resp = await self._client.send_document(
+            await self._client.send_document(
                 jid,
                 file_path,
                 caption=caption or None,
                 filename=file_name or Path(file_path).name,
                 mimetype=mimetype or None,
             )
-        return {"lid": _lid_from_send_response(resp)}
 
     async def send_typing(self, to: str, composing: bool) -> None:
         if self._client is None:
@@ -442,10 +424,3 @@ class WhatsAppClient:
             pass
 
 
-def _lid_from_send_response(_resp) -> Optional[str]:
-    """Bridge surfaced the resolved recipient JID after each send so the
-    channel could learn phone↔LID outbound. neonize's SendResponse only
-    carries (ID, Timestamp, ServerID, Message) — no resolved sender JID —
-    so we return None and rely on inbound MessageSource for LID learning.
-    """
-    return None
