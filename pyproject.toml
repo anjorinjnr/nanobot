@@ -62,6 +62,8 @@ dependencies = [
     "python-pptx>=1.0.0,<2.0.0",
     "filelock>=3.25.2",
     "posthog>=3.7.0,<4.0.0",
+    "neonize>=0.3.17,<0.4.0",
+    "qrcode>=7.4,<9.0",
 ]
 
 [project.optional-dependencies]
@@ -127,13 +129,9 @@ packages = ["nanobot"]
 [tool.hatch.build.targets.wheel.sources]
 "nanobot" = "nanobot"
 
-[tool.hatch.build.targets.wheel.force-include]
-"bridge" = "nanobot/bridge"
-
 [tool.hatch.build.targets.sdist]
 include = [
     "nanobot/",
-    "bridge/",
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",

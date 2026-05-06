@@ -43,13 +43,6 @@ uv tool upgrade nanobot-ai
 nanobot --version
 ```
 
-**Using WhatsApp?** Rebuild the local bridge after upgrading:
-
-```bash
-rm -rf ~/.nanobot/bridge
-nanobot channels login whatsapp
-```
-
 ## Quick Start
 
 > [!TIP]
