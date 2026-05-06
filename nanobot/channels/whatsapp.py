@@ -1,12 +1,16 @@
-"""WhatsApp channel implementation using Node.js bridge."""
+"""
+WhatsApp channel — uses neonize (in-process whatsmeow Go bindings).
+
+Replaces the previous Node.js Baileys bridge: no separate process, no
+WebSocket IPC, no BRIDGE_TOKEN. The protocol client lives in
+``whatsapp_client.WhatsAppClient`` and is consumed directly here.
+"""
 
 import asyncio
 import json
 import mimetypes
 import os
-import secrets
-import shutil
-import subprocess
+import tempfile
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Literal
@@ -17,6 +21,11 @@ from pydantic import Field
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.whatsapp_client import (
+    InboundMessage as WAInboundMessage,
+    WhatsAppClient,
+    WhatsAppClientOptions,
+)
 from nanobot.config.schema import Base
 
 
@@ -24,94 +33,19 @@ class WhatsAppConfig(Base):
     """WhatsApp channel configuration."""
 
     enabled: bool = False
-    bridge_url: str = "ws://localhost:3001"
-    bridge_token: str = ""
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"
     identity_resolution: bool = False  # Enable LID→name resolution via sender_map/lid_map
 
 
-def _bridge_token_path() -> Path:
+def _whatsapp_auth_dir() -> Path:
     from nanobot.config.paths import get_runtime_subdir
 
-    return get_runtime_subdir("whatsapp-auth") / "bridge-token"
-
-
-def _load_or_create_bridge_token(path: Path) -> str:
-    """Load a persisted bridge token or create one on first use."""
-    if path.exists():
-        token = path.read_text(encoding="utf-8").strip()
-        if token:
-            return token
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    token = secrets.token_urlsafe(32)
-    path.write_text(token, encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
-    return token
-
-
-def _ensure_bridge_setup() -> Path:
-    """
-    Ensure the WhatsApp bridge is set up and built.
-
-    Returns the bridge directory. Raises RuntimeError if npm is not found
-    or bridge cannot be built.
-    """
-    from nanobot.config.paths import get_bridge_install_dir
-
-    user_bridge = get_bridge_install_dir()
-
-    if (user_bridge / "dist" / "index.js").exists():
-        return user_bridge
-
-    npm_path = shutil.which("npm")
-    if not npm_path:
-        raise RuntimeError("npm not found. Please install Node.js >= 18.")
-
-    # Find source bridge
-    current_file = Path(__file__)
-    pkg_bridge = current_file.parent.parent / "bridge"
-    src_bridge = current_file.parent.parent.parent / "bridge"
-
-    source = None
-    if (pkg_bridge / "package.json").exists():
-        source = pkg_bridge
-    elif (src_bridge / "package.json").exists():
-        source = src_bridge
-
-    if not source:
-        raise RuntimeError(
-            "WhatsApp bridge source not found. "
-            "Try reinstalling: pip install --force-reinstall nanobot"
-        )
-
-    logger.info("Setting up WhatsApp bridge...")
-    user_bridge.parent.mkdir(parents=True, exist_ok=True)
-    if user_bridge.exists():
-        shutil.rmtree(user_bridge)
-    shutil.copytree(source, user_bridge, ignore=shutil.ignore_patterns("node_modules", "dist"))
-
-    logger.info("  Installing dependencies...")
-    subprocess.run([npm_path, "install"], cwd=user_bridge, check=True, capture_output=True)
-
-    logger.info("  Building...")
-    subprocess.run([npm_path, "run", "build"], cwd=user_bridge, check=True, capture_output=True)
-
-    logger.info("Bridge ready")
-    return user_bridge
+    return get_runtime_subdir("whatsapp-auth")
 
 
 class WhatsAppChannel(BaseChannel):
-    """
-    WhatsApp channel that connects to a Node.js bridge.
-
-    The bridge uses @whiskeysockets/baileys to handle the WhatsApp Web protocol.
-    Communication between Python and Node.js is via WebSocket.
-    """
+    """WhatsApp channel backed by an in-process neonize client."""
 
     name = "whatsapp"
     display_name = "WhatsApp"
@@ -125,113 +59,101 @@ class WhatsAppChannel(BaseChannel):
             config = WhatsAppConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
-        self._ws = None
+        self._client: WhatsAppClient | None = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
         self._typing_tasks: dict[str, asyncio.Task] = {}
-        self._pending_acks: dict[str, asyncio.Future[None]] = {}
-        self._msg_id_counter = 0
         # LID identity resolution state
-        self._lid_map: dict[str, dict] = {}  # in-memory cache of lid_map.json
+        self._lid_map: dict[str, dict] = {}
         self._lid_map_lock = asyncio.Lock()
         self._lid_map_loaded = False
-        self._sender_map: dict[str, str] = {}  # in-memory cache of sender_map.json
-        self._greeted_sessions: OrderedDict[str, None] = OrderedDict()  # tracks first-message injection
+        self._sender_map: dict[str, str] = {}
+        self._greeted_sessions: OrderedDict[str, None] = OrderedDict()
         self._lid_to_phone: dict[str, str] = {}
-        self._bridge_token: str | None = None
 
-    def _effective_bridge_token(self) -> str:
-        """Resolve the bridge token, generating a local secret when needed."""
-        if self._bridge_token is not None:
-            return self._bridge_token
-        configured = self.config.bridge_token.strip()
-        if configured:
-            self._bridge_token = configured
-        else:
-            self._bridge_token = _load_or_create_bridge_token(_bridge_token_path())
-        return self._bridge_token
+    # ----------------------------------------------------------- lifecycle
+
+    def _build_client(self) -> WhatsAppClient:
+        return WhatsAppClient(
+            WhatsAppClientOptions(
+                auth_dir=_whatsapp_auth_dir(),
+                on_message=self._on_inbound,
+                on_qr=self._on_qr,
+                on_status=self._on_status,
+            )
+        )
 
     async def login(self, force: bool = False) -> bool:
-        """
-        Set up and run the WhatsApp bridge for QR code login.
+        """Pair the WhatsApp account interactively (QR scan)."""
+        client = self._build_client()
+        self._client = client
+        connected = asyncio.Event()
 
-        This spawns the Node.js bridge process which handles the WhatsApp
-        authentication flow. The process blocks until the user scans the QR code
-        or interrupts with Ctrl+C.
-        """
+        async def wait_connected():
+            while not self._connected:
+                await asyncio.sleep(0.5)
+            connected.set()
+
+        watcher = asyncio.create_task(wait_connected())
         try:
-            bridge_dir = _ensure_bridge_setup()
-        except RuntimeError as e:
-            logger.error("{}", e)
-            return False
-
-        env = {**os.environ}
-        env["BRIDGE_TOKEN"] = self._effective_bridge_token()
-        env["AUTH_DIR"] = str(_bridge_token_path().parent)
-
-        logger.info("Starting WhatsApp bridge for QR login...")
-        try:
-            subprocess.run(
-                [shutil.which("npm"), "start"], cwd=bridge_dir, check=True, env=env
-            )
-        except subprocess.CalledProcessError:
-            return False
-
-        return True
+            await client.connect()
+            try:
+                await asyncio.wait_for(connected.wait(), timeout=300.0)
+                logger.info("WhatsApp pairing complete")
+                return True
+            except asyncio.TimeoutError:
+                logger.error("WhatsApp pairing timed out — no QR scanned within 5 minutes")
+                return False
+        finally:
+            watcher.cancel()
+            await client.disconnect()
+            self._client = None
 
     async def start(self) -> None:
-        """Start the WhatsApp channel by connecting to the bridge."""
-        import websockets
-
-        # Load identity maps eagerly if identity resolution is enabled
+        """Start the channel by connecting to WhatsApp via neonize."""
         if self.config.identity_resolution:
             await self._ensure_maps_loaded()
 
-        bridge_url = self.config.bridge_url
-
-        logger.info("Connecting to WhatsApp bridge at {}...", bridge_url)
-
         self._running = True
+        backoff = 5
 
         while self._running:
+            client = self._build_client()
+            self._client = client
             try:
-                async with websockets.connect(bridge_url) as ws:
-                    self._ws = ws
-                    await ws.send(
-                        json.dumps({"type": "auth", "token": self._effective_bridge_token()})
-                    )
-                    self._connected = True
-                    logger.info("Connected to WhatsApp bridge")
-
-                    # Listen for messages
-                    async for message in ws:
-                        try:
-                            await self._handle_bridge_message(message)
-                        except Exception as e:
-                            logger.error("Error handling bridge message: {}", e)
-
+                await client.connect()
+                await client.wait_until_idle()
+                logger.info("WhatsApp idle loop ended; will reconnect in {}s", backoff)
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                logger.warning("WhatsApp client error: {}", e)
+            finally:
                 self._connected = False
-                self._ws = None
-                logger.warning("WhatsApp bridge connection error: {}", e)
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                self._client = None
 
-                if self._running:
-                    logger.info("Reconnecting in 5 seconds...")
-                    await asyncio.sleep(5)
+            if self._running:
+                await asyncio.sleep(backoff)
 
     async def stop(self) -> None:
-        """Stop the WhatsApp channel."""
         self._running = False
         self._connected = False
 
         for chat_id in list(self._typing_tasks):
             await self._stop_typing(chat_id)
 
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
+
+    # ----------------------------------------------------------- typing
 
     async def _start_typing(self, chat_id: str) -> None:
         await self._stop_typing(chat_id)
@@ -245,58 +167,34 @@ class WhatsAppChannel(BaseChannel):
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
-        # Send explicit paused so WhatsApp clears the indicator
-        if self._ws and self._connected:
+        if self._client is not None and self._connected:
             try:
-                await self._ws.send(json.dumps({"type": "typing", "to": chat_id, "composing": False}))
+                await self._client.send_typing(chat_id, composing=False)
             except Exception:
                 pass
 
     async def _typing_loop(self, chat_id: str) -> None:
-        """Send 'composing' presence every 10 seconds until cancelled."""
         try:
-            while self._ws and self._connected:
-                await self._ws.send(json.dumps({"type": "typing", "to": chat_id, "composing": True}))
+            while self._client is not None and self._connected:
+                await self._client.send_typing(chat_id, composing=True)
                 await asyncio.sleep(10)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.debug("WhatsApp typing indicator stopped for {}: {}", chat_id, e)
 
-    def _next_msg_id(self) -> str:
-        self._msg_id_counter += 1
-        return f"msg_{self._msg_id_counter}"
-
-    async def _send_and_await_ack(self, payload: dict, timeout: float = 30.0) -> None:
-        """Send a payload to the bridge and await acknowledgment."""
-        msg_id = self._next_msg_id()
-        payload["msg_id"] = msg_id
-
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[None] = loop.create_future()
-        self._pending_acks[msg_id] = fut
-
-        try:
-            await self._ws.send(json.dumps(payload, ensure_ascii=False))
-            await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.warning("WhatsApp bridge ack timeout for {}", msg_id)
-            # Don't raise — treat timeout as soft failure (bridge may have sent it)
-        finally:
-            self._pending_acks.pop(msg_id, None)
+    # ----------------------------------------------------------- outbound
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through WhatsApp."""
-        if not self._ws or not self._connected:
-            raise ConnectionError("WhatsApp bridge not connected")
+        if self._client is None or not self._connected:
+            raise ConnectionError("WhatsApp client not connected")
 
         chat_id = msg.chat_id
         await self._stop_typing(chat_id)
 
         if msg.content and not msg.media:
             try:
-                payload = {"type": "send", "to": chat_id, "text": msg.content}
-                await self._send_and_await_ack(payload)
+                await self._client.send_message(chat_id, msg.content)
             except Exception as e:
                 logger.error("Error sending WhatsApp message: {}", e)
                 raise
@@ -308,170 +206,147 @@ class WhatsAppChannel(BaseChannel):
                 continue
             try:
                 mime, _ = mimetypes.guess_type(media_path)
-                payload = {
-                    "type": "send_media",
-                    "to": chat_id,
-                    "filePath": media_path,
-                    "mimetype": mime or "application/octet-stream",
-                    "fileName": media_path.rsplit("/", 1)[-1],
-                }
-                if i == 0 and msg.content and not already_sent:
-                    payload["caption"] = msg.content
-                await self._send_and_await_ack(payload)
+                caption = msg.content if (i == 0 and msg.content and not already_sent) else None
+                await self._client.send_media(
+                    to=chat_id,
+                    file_path=media_path,
+                    mimetype=mime or "application/octet-stream",
+                    caption=caption,
+                    file_name=Path(media_path).name,
+                )
                 sent_media.append(media_path)
             except Exception as e:
-                # Record which media succeeded so retries can skip them
                 msg.metadata["_sent_media"] = sent_media
                 logger.error("Error sending WhatsApp media {}: {}", media_path, e)
                 raise
 
-    async def _handle_bridge_message(self, raw: str) -> None:
-        """Handle a message from the bridge."""
+    # ----------------------------------------------------------- inbound
+
+    async def _on_status(self, status: str) -> None:
+        logger.info("WhatsApp status: {}", status)
+        if status == "connected":
+            self._connected = True
+        elif status in ("disconnected", "logged_out"):
+            self._connected = False
+
+    async def _on_qr(self, qr: str) -> None:
+        # Print a terminal-friendly QR code. The qrcode library is small
+        # and pure-Python; we render to a tty so the user can scan it.
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            logger.warning("Invalid JSON from bridge: {}", raw[:100])
-            return
+            import qrcode
 
-        msg_type = data.get("type")
-
-        if msg_type == "message":
-            # Incoming message from WhatsApp
-            pn = data.get("pn", "")
-            sender = data.get("sender", "")
-            content = data.get("content", "")
-            message_id = data.get("id", "")
-
-            if message_id:
-                if message_id in self._processed_message_ids:
-                    return
-                self._processed_message_ids[message_id] = None
-                while len(self._processed_message_ids) > 1000:
-                    self._processed_message_ids.popitem(last=False)
-
-            is_group = data.get("isGroup", False)
-            was_mentioned = data.get("wasMentioned", False)
-
-            if is_group and getattr(self.config, "group_policy", "open") == "mention":
-                if not was_mentioned:
-                    return
-
-            # Classify by JID suffix: @s.whatsapp.net = phone, @lid.whatsapp.net = LID
-            # The bridge's pn/sender fields don't consistently map to phone/LID across versions.
-            raw_a = pn or ""
-            raw_b = sender or ""
-            id_a = raw_a.split("@")[0] if "@" in raw_a else raw_a
-            id_b = raw_b.split("@")[0] if "@" in raw_b else raw_b
-
-            phone_id = ""
-            lid_id = ""
-            for raw, extracted in [(raw_a, id_a), (raw_b, id_b)]:
-                if "@s.whatsapp.net" in raw:
-                    phone_id = extracted
-                elif "@lid.whatsapp.net" in raw:
-                    lid_id = extracted
-                elif extracted and not phone_id:
-                    phone_id = extracted  # best guess for bare values
-
-            if phone_id and lid_id:
-                self._lid_to_phone[lid_id] = phone_id
-            sender_id = phone_id or self._lid_to_phone.get(lid_id, "") or lid_id or id_a or id_b
-
-            logger.info("Sender phone={} lid={} → sender_id={}", phone_id or "(empty)", lid_id or "(empty)", sender_id)
-
-            # Load identity maps on first message (if identity_resolution enabled)
-            if self.config.identity_resolution:
-                await self._ensure_maps_loaded()
-                # Learn LID↔phone from inbound messages
-                if pn and sender and pn != sender:
-                    await self._save_lid_mapping(pn, sender)
-
-            # Extract media paths (images/documents/videos downloaded by the bridge)
-            media_paths = data.get("media") or []
-
-            # Handle voice transcription if it's a voice message
-            if content == "[Voice Message]":
-                if media_paths:
-                    logger.info("Transcribing voice message from {}...", sender_id)
-                    transcription = await self.transcribe_audio(media_paths[0])
-                    if transcription:
-                        content = transcription
-                        logger.info("Transcribed voice from {}: {}...", sender_id, transcription[:50])
-                    else:
-                        content = "[Voice Message: Transcription failed]"
-                else:
-                    content = "[Voice Message: Audio not available]"
-
-            # Build content tags matching Telegram's pattern: [image: /path] or [file: /path]
-            if media_paths:
-                for p in media_paths:
-                    mime, _ = mimetypes.guess_type(p)
-                    media_type = "image" if mime and mime.startswith("image/") else "file"
-                    media_tag = f"[{media_type}: {p}]"
-                    content = f"{content}\n{media_tag}" if content else media_tag
-
-            if self.is_allowed(sender_id):
-                await self._start_typing(sender)
-
-            # Resolve sender name and inject on first message in session.
-            # Skip for: media-only (empty content), slash commands (starts with /)
-            if self.config.identity_resolution and content and not content.startswith("/"):
-                session_key = f"whatsapp:{sender}"
-                sender_name = self._resolve_sender_name(sender_id, session_key)
-                if sender_name:
-                    content = f"[Sender: {sender_name}]\n{content}"
-
-            await self._handle_message(
-                sender_id=sender_id,
-                chat_id=sender,  # Use full LID for replies
-                content=content,
-                media=media_paths,
-                metadata={
-                    "message_id": message_id,
-                    "timestamp": data.get("timestamp"),
-                    "is_group": data.get("isGroup", False),
-                },
+            qr_obj = qrcode.QRCode(border=1)
+            qr_obj.add_data(qr)
+            qr_obj.make(fit=True)
+            print("\n📱 Scan this QR code with WhatsApp (Linked Devices):\n", flush=True)
+            qr_obj.print_ascii(invert=True)
+            print("", flush=True)
+        except ImportError:
+            logger.info(
+                "WhatsApp QR (paste into a QR generator to scan): {}", qr[:32] + "…"
             )
 
-        elif msg_type == "status":
-            # Connection status update
-            status = data.get("status")
-            logger.info("WhatsApp status: {}", status)
+    async def _on_inbound(self, msg: WAInboundMessage) -> None:
+        if msg.id and msg.id in self._processed_message_ids:
+            return
+        if msg.id:
+            self._processed_message_ids[msg.id] = None
+            while len(self._processed_message_ids) > 1000:
+                self._processed_message_ids.popitem(last=False)
 
-            if status == "connected":
-                self._connected = True
-            elif status == "disconnected":
-                self._connected = False
+        if msg.is_group and getattr(self.config, "group_policy", "open") == "mention":
+            if not msg.was_mentioned:
+                return
 
-        elif msg_type == "qr":
-            # QR code for authentication
-            logger.info("Scan QR code in the bridge terminal to connect WhatsApp")
+        # Classify by JID suffix: @s.whatsapp.net = phone, @lid.whatsapp.net = LID
+        raw_a = msg.pn or ""
+        raw_b = msg.sender or ""
+        id_a = raw_a.split("@")[0] if "@" in raw_a else raw_a
+        id_b = raw_b.split("@")[0] if "@" in raw_b else raw_b
 
-        elif msg_type == "sent":
-            msg_id = data.get("msg_id")
-            lid = data.get("lid", "")
-            to = data.get("to", "")
-            if self.config.identity_resolution and lid and to and lid != to:
-                await self._save_lid_mapping(to, lid)
-            if msg_id and msg_id in self._pending_acks:
-                self._pending_acks[msg_id].set_result(None)
+        phone_id = ""
+        lid_id = ""
+        for raw, extracted in [(raw_a, id_a), (raw_b, id_b)]:
+            if "@s.whatsapp.net" in raw:
+                phone_id = extracted
+            elif "@lid.whatsapp.net" in raw:
+                lid_id = extracted
+            elif extracted and not phone_id:
+                phone_id = extracted
 
-        elif msg_type == "error":
-            error_text = data.get("error", "Unknown bridge error")
-            logger.error("WhatsApp bridge error: {}", error_text)
-            msg_id = data.get("msg_id")
-            if msg_id and msg_id in self._pending_acks:
-                self._pending_acks[msg_id].set_exception(
-                    RuntimeError(f"WhatsApp bridge error: {error_text}")
-                )
+        if phone_id and lid_id:
+            self._lid_to_phone[lid_id] = phone_id
+        sender_id = phone_id or self._lid_to_phone.get(lid_id, "") or lid_id or id_a or id_b
+
+        logger.info(
+            "Sender phone={} lid={} → sender_id={}",
+            phone_id or "(empty)",
+            lid_id or "(empty)",
+            sender_id,
+        )
+
+        if self.config.identity_resolution:
+            await self._ensure_maps_loaded()
+            if msg.pn and msg.sender and msg.pn != msg.sender:
+                await self._save_lid_mapping(msg.pn, msg.sender)
+
+        media_paths = list(msg.media)
+        content = msg.content
+
+        # Voice message → transcribe via Whisper. The wrapper sets content
+        # to "[Voice Message]" sentinel for PTT/audio (see whatsapp_client).
+        if content == "[Voice Message]":
+            if media_paths:
+                logger.info("Transcribing voice message from {}...", sender_id)
+                transcription = await self.transcribe_audio(media_paths[0])
+                if transcription:
+                    content = transcription
+                    logger.info(
+                        "Transcribed voice from {}: {}...", sender_id, transcription[:50]
+                    )
+                else:
+                    content = "[Voice Message: Transcription failed]"
+            else:
+                content = "[Voice Message: Audio not available]"
+
+        # Tag remaining media paths in content (matches Telegram pattern).
+        # Voice messages flow through transcription above and intentionally
+        # skip tagging — the transcription replaces the audio path.
+        if media_paths and msg.content != "[Voice Message]":
+            for p in media_paths:
+                mime, _ = mimetypes.guess_type(p)
+                media_type = "image" if mime and mime.startswith("image/") else "file"
+                media_tag = f"[{media_type}: {p}]"
+                content = f"{content}\n{media_tag}" if content else media_tag
+
+        if self.is_allowed(sender_id):
+            await self._start_typing(msg.sender)
+
+        if (
+            self.config.identity_resolution
+            and content
+            and not content.startswith("/")
+        ):
+            session_key = f"whatsapp:{msg.sender}"
+            sender_name = self._resolve_sender_name(sender_id, session_key)
+            if sender_name:
+                content = f"[Sender: {sender_name}]\n{content}"
+
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=msg.sender,
+            content=content,
+            media=media_paths,
+            metadata={
+                "message_id": msg.id,
+                "timestamp": msg.timestamp,
+                "is_group": msg.is_group,
+            },
+        )
+
+    # ----------------------------------------------------------- identity resolution
 
     def is_allowed(self, sender_id: str) -> bool:
-        """Check if sender_id is permitted, including dynamic LID resolution.
-
-        Extends base is_allowed to also check the in-memory lid_map: if this
-        sender_id is a LID that maps to an authorized phone, allow it.
-        Evaluates allow_from on every call so config changes take effect.
-        """
         if super().is_allowed(sender_id):
             return True
         info = self._lid_map.get(sender_id)
@@ -482,22 +357,14 @@ class WhatsAppChannel(BaseChannel):
         return False
 
     def _resolve_sender_name(self, sender_id: str, session_key: str) -> str | None:
-        """Resolve sender_id to a guest name using sender_map + lid_map.
-
-        Only returns a name on the first message in a session to avoid the LLM
-        parroting the name in every response. Bounded to 500 sessions max.
-        Only marks session as greeted if a name is actually resolved.
-        """
         if session_key in self._greeted_sessions:
-            return None  # Already injected for this session
+            return None
 
         name: str | None = None
 
-        # Check sender_map (build-time: phone/LID → name)
         if sender_id in self._sender_map:
             name = self._sender_map[sender_id]
 
-        # Check lid_map (runtime: LID → {phone, name?})
         if not name:
             info = self._lid_map.get(sender_id)
             if isinstance(info, dict):
@@ -507,7 +374,6 @@ class WhatsAppChannel(BaseChannel):
                     if phone and phone in self._sender_map:
                         name = self._sender_map[phone]
 
-        # Only mark as greeted if we actually resolved a name
         if name:
             self._greeted_sessions[session_key] = None
             while len(self._greeted_sessions) > 500:
@@ -516,54 +382,47 @@ class WhatsAppChannel(BaseChannel):
         return name
 
     async def _ensure_maps_loaded(self) -> None:
-        """Load sender_map.json and lid_map.json into memory on first use."""
         if not self._lid_map_loaded:
             async with self._lid_map_lock:
                 if not self._lid_map_loaded:
                     lid_map, sender_map = await asyncio.to_thread(self._read_maps_from_disk)
-                    # Merge disk data with in-memory entries (preserve both sides)
                     for k, v in lid_map.items():
                         if k not in self._lid_map:
                             self._lid_map[k] = v
                         elif isinstance(v, dict) and isinstance(self._lid_map[k], dict):
-                            # Deep merge: disk fields fill in gaps in memory
                             for field, val in v.items():
                                 self._lid_map[k].setdefault(field, val)
                     self._sender_map = sender_map
                     self._lid_map_loaded = True
 
     def _read_maps_from_disk(self) -> tuple[dict, dict[str, str]]:
-        """Synchronous disk reads, called via asyncio.to_thread.
-
-        Returns (lid_map, sender_map) — does NOT mutate instance state
-        to avoid thread-safety issues.
-        """
         from nanobot.config.paths import get_persistent_data_dir
 
         lid_map: dict = {}
         sender_map: dict[str, str] = {}
 
-        # lid_map.json — persistent so bridge-learned LID↔phone mappings
-        # survive container recreation. Without persistence the bridge has
-        # to re-learn every mapping after a deploy, which in turn breaks
-        # homer's identity_map phone-form expansion.
         lid_map_path = get_persistent_data_dir() / "lid_map.json"
         if lid_map_path.exists():
             try:
                 raw = json.loads(lid_map_path.read_text(encoding="utf-8"))
-                lid_map = {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
+                lid_map = (
+                    {k: v for k, v in raw.items() if isinstance(v, dict)}
+                    if isinstance(raw, dict)
+                    else {}
+                )
                 logger.debug("Loaded lid_map with {} entries", len(lid_map))
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("Failed to load lid_map.json: {}", e)
 
-        # sender_map.json — check workspace paths
         for candidate in self._sender_map_paths():
             if candidate.exists():
                 try:
                     data = json.loads(candidate.read_text(encoding="utf-8"))
                     if isinstance(data, dict):
                         sender_map = {k: v for k, v in data.items() if isinstance(v, str)}
-                        logger.debug("Loaded sender_map with {} entries from {}", len(sender_map), candidate)
+                        logger.debug(
+                            "Loaded sender_map with {} entries from {}", len(sender_map), candidate
+                        )
                         break
                 except (json.JSONDecodeError, OSError) as e:
                     logger.warning("Failed to load sender_map from {}: {}", candidate, e)
@@ -572,30 +431,23 @@ class WhatsAppChannel(BaseChannel):
 
     @staticmethod
     def _sender_map_paths() -> list[Path]:
-        """Return candidate sender_map.json paths."""
         from nanobot.config.paths import get_data_dir
+
         return [get_data_dir() / "sender_map.json"]
 
     async def _save_lid_mapping(self, phone_jid: str, lid: str) -> None:
-        """Persist a phone→LID mapping learned from an outbound send ack.
-
-        Updates in-memory cache immediately and persists to disk asynchronously
-        under a lock to prevent concurrent write corruption.
-        """
         lid_prefix = lid.split("@")[0] if "@" in lid else lid
         phone_digits = phone_jid.split("@")[0] if "@" in phone_jid else phone_jid
 
         existing = self._lid_map.get(lid_prefix)
         if isinstance(existing, dict) and existing.get("phone") == phone_digits:
-            return  # Already mapped
+            return
 
-        # Update in-memory cache — merge to preserve existing fields (e.g. name)
         if not isinstance(existing, dict):
             self._lid_map[lid_prefix] = {"phone": phone_digits}
         else:
             existing["phone"] = phone_digits
 
-        # Deep copy under lock, disk write inside lock to strictly order writes
         async with self._lid_map_lock:
             snapshot = {k: dict(v) for k, v in self._lid_map.items()}
             await asyncio.to_thread(self._write_lid_map, snapshot)
@@ -603,14 +455,13 @@ class WhatsAppChannel(BaseChannel):
 
     @staticmethod
     def _write_lid_map(data: dict) -> None:
-        """Synchronous atomic disk write, called via asyncio.to_thread under lock."""
-        import tempfile
         from nanobot.config.paths import get_persistent_data_dir
+
         map_path = get_persistent_data_dir() / "lid_map.json"
         map_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             fd, tmp_path = tempfile.mkstemp(dir=map_path.parent, suffix=".tmp")
-            os.close(fd)  # Close fd immediately; reopen with standard open
+            os.close(fd)
             try:
                 with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
@@ -623,4 +474,3 @@ class WhatsAppChannel(BaseChannel):
                 raise
         except OSError as e:
             logger.warning("Failed to save LID mapping: {}", e)
-

@@ -91,7 +91,7 @@ jobs:
           This is a FORK of the open-source nanobot-ai framework (github.com/HKUDS/nanobot), maintained
           on the `homer-patches` branch. It powers Homer, a personal life agent for the Anjorin household.
           The fork adds Homer-specific runtime features (heartbeat improvements, guest agent isolation,
-          WhatsApp bridge enhancements, model routing, etc.) that are too specialized for upstream.
+          WhatsApp client integration, model routing, etc.) that are too specialized for upstream.
 
           This fork is the CORE ENGINE — it handles message routing, LLM calls, tool execution, heartbeat
           scheduling, and session management. Bugs here break everything.
@@ -104,7 +104,7 @@ jobs:
           - LLM error responses: raw API errors must NOT be forwarded to end users
           - Session isolation: guest agent cannot access main agent sessions or workspace
           - Tool execution sandboxing: blocked_tools enforcement, workspace restrictions
-          - Input validation on all external boundaries (channel messages, bridge payloads, webhook data)
+          - Input validation on all external boundaries (channel messages, webhook data)
 
           ### 2. BACKWARD COMPATIBILITY WITH UPSTREAM NANOBOT
           - Can upstream changes still be merged cleanly? Avoid restructuring files that upstream actively maintains.
@@ -121,7 +121,7 @@ jobs:
 
           ### 4. HOMER FIT (consistency with Homer's use case)
           - Heartbeat changes: compatible with Homer's HEARTBEAT.md format (### tasks, Schedule/Recur/Type/Model fields)?
-          - Channel changes: works for both Telegram AND WhatsApp (Baileys bridge)?
+          - Channel changes: works for both Telegram AND WhatsApp (neonize / whatsmeow)?
           - Guest agent: respects workspace isolation, blocked_tools, scoped context?
           - Memory/session: fits Homer's consolidation and session retention patterns?
           - Error handling: errors are logged with enough detail to debug via `journalctl -u homer`, but user-facing messages stay friendly.
