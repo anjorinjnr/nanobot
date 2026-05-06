@@ -39,6 +39,24 @@ class WhatsAppConfig(Base):
 
 
 def _whatsapp_auth_dir() -> Path:
+    """Resolve the WhatsApp session storage directory.
+
+    The neonize sqlite DB held here represents a full WhatsApp Web pairing —
+    losing it on a redeploy means re-scanning the QR. Containerized
+    deployments must put it on a bind-mounted volume.
+
+    Resolution order:
+        1. ``NANOBOT_WHATSAPP_AUTH_DIR`` env var (explicit override). Set this
+           in the container/host entrypoint to point at a persistent volume
+           (e.g. ``/data/whatsapp-auth`` in homer's container layout).
+        2. ``get_runtime_subdir("whatsapp-auth")`` — the per-config-instance
+           subdir under the active nanobot data directory (good for local dev,
+           ephemeral inside a stock container).
+    """
+    override = os.environ.get("NANOBOT_WHATSAPP_AUTH_DIR")
+    if override:
+        return Path(override).expanduser()
+
     from nanobot.config.paths import get_runtime_subdir
 
     return get_runtime_subdir("whatsapp-auth")

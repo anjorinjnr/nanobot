@@ -8,6 +8,7 @@ indirectly via the wrapper module's own smoke checks.
 """
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -528,6 +529,38 @@ async def test_image_path_tagged_in_content():
     content = ch._handle_message.await_args.kwargs["content"]
     assert "[image: /tmp/wa_x.jpg]" in content
     assert content.startswith("check this")
+
+
+def test_whatsapp_auth_dir_honors_env_override(monkeypatch, tmp_path):
+    """NANOBOT_WHATSAPP_AUTH_DIR should override the default runtime subdir."""
+    from nanobot.channels.whatsapp import _whatsapp_auth_dir
+
+    target = tmp_path / "persistent" / "whatsapp-auth"
+    monkeypatch.setenv("NANOBOT_WHATSAPP_AUTH_DIR", str(target))
+
+    assert _whatsapp_auth_dir() == target
+
+
+def test_whatsapp_auth_dir_falls_back_to_runtime_subdir(monkeypatch, tmp_path):
+    """Without the override, fall back to get_runtime_subdir('whatsapp-auth')."""
+    from nanobot.channels.whatsapp import _whatsapp_auth_dir
+
+    monkeypatch.delenv("NANOBOT_WHATSAPP_AUTH_DIR", raising=False)
+    monkeypatch.setattr(
+        "nanobot.config.paths.get_config_path", lambda: tmp_path / "config.json"
+    )
+
+    result = _whatsapp_auth_dir()
+    assert result == tmp_path / "whatsapp-auth"
+
+
+def test_whatsapp_auth_dir_expands_user_in_override(monkeypatch):
+    """Support `~` expansion in the env var so users can write `~/wa-auth`."""
+    from nanobot.channels.whatsapp import _whatsapp_auth_dir
+
+    monkeypatch.setenv("NANOBOT_WHATSAPP_AUTH_DIR", "~/wa-test-auth")
+
+    assert _whatsapp_auth_dir() == Path.home() / "wa-test-auth"
 
 
 @pytest.mark.asyncio
