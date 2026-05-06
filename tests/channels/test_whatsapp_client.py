@@ -64,18 +64,18 @@ def test_jid_string_without_at_treated_as_user() -> None:
 # ── _extract_text_and_media_kind ─────────────────────────────────────────────
 
 
-def _wrap(client: WhatsAppClient | None = None) -> WhatsAppClient:
-    """Build a wrapper instance without invoking neonize.connect()."""
-    if client is None:
-        client = WhatsAppClient(
-            WhatsAppClientOptions(
-                auth_dir=__import__("pathlib").Path("/tmp/_wa_test"),
-                on_message=lambda _: None,  # type: ignore[arg-type]
-                on_qr=lambda _: None,  # type: ignore[arg-type]
-                on_status=lambda _: None,  # type: ignore[arg-type]
-            )
+def _wrap() -> WhatsAppClient:
+    """Build a WhatsAppClient instance without invoking neonize.connect()."""
+    from pathlib import Path
+
+    return WhatsAppClient(
+        WhatsAppClientOptions(
+            auth_dir=Path("/tmp/_wa_test"),
+            on_message=lambda _: None,  # type: ignore[arg-type]
+            on_qr=lambda _: None,  # type: ignore[arg-type]
+            on_status=lambda _: None,  # type: ignore[arg-type]
         )
-    return client
+    )
 
 
 def test_extract_plain_text() -> None:

@@ -173,13 +173,20 @@ async def test_send_records_partial_media_for_retry():
 
 
 def _inbound(**overrides) -> WAInboundMessage:
-    """Build a default InboundMessage; overrides replace fields."""
+    """Build a default InboundMessage; overrides replace fields.
+
+    Default ``timestamp`` is now() so a future age-based filter (history-sync
+    drop, stale-message rejection) wouldn't silently invalidate every test.
+    Tests targeting freshness-based logic should pass an explicit value.
+    """
+    import time
+
     base = dict(
         id="m1",
         sender="12345@s.whatsapp.net",
         pn="",
         content="hi",
-        timestamp=1,
+        timestamp=int(time.time()),
         is_group=False,
         was_mentioned=False,
         media=[],

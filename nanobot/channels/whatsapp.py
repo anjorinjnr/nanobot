@@ -79,6 +79,11 @@ class WhatsAppChannel(BaseChannel):
         self.config: WhatsAppConfig = config
         self._client: WhatsAppClient | None = None
         self._connected = False
+        # Set by _on_status when neonize fires ConnectedEv. Reset per-iteration
+        # in start()/login() so the reconnect loop can tell whether the current
+        # connection attempt actually reached "connected" (used to decide
+        # whether to reset the backoff floor).
+        self._connected_event: asyncio.Event = asyncio.Event()
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
         self._typing_tasks: dict[str, asyncio.Task] = {}
         # LID identity resolution state
@@ -105,25 +110,17 @@ class WhatsAppChannel(BaseChannel):
         """Pair the WhatsApp account interactively (QR scan)."""
         client = self._build_client()
         self._client = client
-        connected = asyncio.Event()
-
-        async def wait_connected():
-            while not self._connected:
-                await asyncio.sleep(0.5)
-            connected.set()
-
-        watcher = asyncio.create_task(wait_connected())
+        self._connected_event.clear()
         try:
             await client.connect()
             try:
-                await asyncio.wait_for(connected.wait(), timeout=300.0)
+                await asyncio.wait_for(self._connected_event.wait(), timeout=300.0)
                 logger.info("WhatsApp pairing complete")
                 return True
             except asyncio.TimeoutError:
                 logger.error("WhatsApp pairing timed out — no QR scanned within 5 minutes")
                 return False
         finally:
-            watcher.cancel()
             await client.disconnect()
             self._client = None
 
@@ -144,28 +141,12 @@ class WhatsAppChannel(BaseChannel):
         while self._running:
             client = self._build_client()
             self._client = client
-            connected_once = False
+            # Reset the per-iteration connected signal — _on_status will set it
+            # if neonize fires ConnectedEv this cycle.
+            self._connected_event.clear()
             try:
                 await client.connect()
-                # Track whether we ever reached "connected" so we can reset
-                # backoff after a stable session ends.
-                async def _watch():
-                    nonlocal connected_once
-                    while self._running and not connected_once:
-                        if self._connected:
-                            connected_once = True
-                            return
-                        await asyncio.sleep(0.5)
-
-                watcher = asyncio.create_task(_watch())
-                try:
-                    await client.wait_until_idle()
-                finally:
-                    watcher.cancel()
-                    try:
-                        await watcher
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                await client.wait_until_idle()
                 logger.info("WhatsApp idle loop ended")
             except asyncio.CancelledError:
                 break
@@ -182,7 +163,10 @@ class WhatsAppChannel(BaseChannel):
             if not self._running:
                 break
 
-            if connected_once:
+            # Reset backoff to floor only if this iteration reached "connected"
+            # at least once — transient blips after a stable session shouldn't
+            # pay the long delay; persistent failures should keep escalating.
+            if self._connected_event.is_set():
                 backoff = self._RECONNECT_MIN_SECONDS
             logger.info("Reconnecting WhatsApp in {}s", backoff)
             await asyncio.sleep(backoff)
@@ -275,8 +259,13 @@ class WhatsAppChannel(BaseChannel):
         logger.info("WhatsApp status: {}", status)
         if status == "connected":
             self._connected = True
+            self._connected_event.set()
         elif status in ("disconnected", "logged_out"):
             self._connected = False
+            # Don't clear the event here — start()/login() reset it per-cycle.
+            # Holding it set across a disconnect lets the reconnect loop know
+            # this iteration *did* connect, which is the signal it needs to
+            # reset the backoff floor.
 
     async def _on_qr(self, qr: str) -> None:
         # Print a terminal-friendly QR code. The qrcode library is small
