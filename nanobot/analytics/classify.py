@@ -118,6 +118,23 @@ async def classify_message_async(text: str) -> str:
     return tag
 
 
+def _resolve_api_key() -> str:
+    """Pick the API key for the analytics classifier.
+
+    Hosted tenants set tenant-owned ``GEMINI_API_KEY`` for chat. We don't
+    want to charge tenants for Homer's classifier, and not every tenant
+    even uses Gemini for chat — when they don't, the classifier silently
+    fails and every event ships as ``unclassified``. Prefer the
+    Homer-owned ``HOMER_ANALYTICS_GEMINI_API_KEY`` injected by the portal,
+    fall back to ``GEMINI_API_KEY`` so dev/local with a single key still
+    works.
+    """
+    return (
+        os.environ.get("HOMER_ANALYTICS_GEMINI_API_KEY", "").strip()
+        or os.environ.get("GEMINI_API_KEY", "").strip()
+    )
+
+
 async def _call_gemini_async(text: str) -> str:
     """Call Gemini Flash and return a validated tag.
 
@@ -126,7 +143,7 @@ async def _call_gemini_async(text: str) -> str:
     dashboards. This path bypasses :class:`LLMProvider`, so we wire
     telemetry in directly. (#55)
     """
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    api_key = _resolve_api_key()
     if not api_key:
         return _FALLBACK
     start = time.monotonic()
