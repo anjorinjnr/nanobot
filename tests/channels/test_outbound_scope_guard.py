@@ -164,6 +164,60 @@ def test_inbound_suppression_lookup_error_fails_open() -> None:
     assert scope_guard.check_inbound_suppressed("whatsapp", "x") is False
 
 
+# --- Phase 2: is_allowed consults the lookup --------------------------------
+
+def test_is_allowed_authorized_by_scope_even_when_not_in_allow_from() -> None:
+    """A sender with an active scope is allowed even if absent from allow_from.
+
+    This is the core Phase 2 invariant — the scope lookup is the canonical
+    inbound ACL; the static config list is bootstrap-only.
+    """
+    _install(lambda ch, sid: ScopeLookupResult(authorized=True, reason="active_scope"))
+    # Empty allow_from would normally deny everyone.
+    channel = _RecordingChannel()
+    channel.config = {"allow_from": []}
+    assert channel.is_allowed("14129739891@s.whatsapp.net") is True
+
+
+def test_is_allowed_falls_back_to_allow_from_when_no_lookup() -> None:
+    """No lookup installed → behave exactly like the pre-Phase-2 static check."""
+    channel = _RecordingChannel()
+    channel.config = {"allow_from": ["alice"]}
+    assert channel.is_allowed("alice") is True
+    assert channel.is_allowed("eve") is False
+
+
+def test_is_allowed_falls_back_when_lookup_says_no() -> None:
+    """Lookup refuses → the static list still gets a chance to allow."""
+    _install(lambda ch, sid: ScopeLookupResult(authorized=False, reason="no_scope"))
+    channel = _RecordingChannel()
+    channel.config = {"allow_from": ["alice"]}
+    assert channel.is_allowed("alice") is True   # static fallback wins
+    assert channel.is_allowed("eve") is False    # neither scope nor static
+
+
+def test_is_allowed_lookup_exception_falls_back_to_static() -> None:
+    """A broken lookup must not silently lock out senders who are in the static list."""
+    def boom(ch, sid):
+        raise RuntimeError("scope_store crashed")
+    _install(boom)
+    channel = _RecordingChannel()
+    channel.config = {"allow_from": ["alice"]}
+    assert channel.is_allowed("alice") is True
+
+
+def test_is_allowed_no_reply_scope_still_allowed_for_inbound_acl() -> None:
+    """A no-reply scope authorizes the sender at the ACL level. The actual
+    suppression of the reply happens further up the inbound path via
+    check_inbound_suppressed — is_allowed isn't where that gate lives."""
+    _install(lambda ch, sid: ScopeLookupResult(
+        authorized=True, reason="no_reply_scope", suppress_inbound=True,
+    ))
+    channel = _RecordingChannel()
+    channel.config = {"allow_from": []}
+    assert channel.is_allowed("14129739891@s.whatsapp.net") is True
+
+
 # --- _send_with_retry behavior -----------------------------------------------
 
 @pytest.mark.asyncio
