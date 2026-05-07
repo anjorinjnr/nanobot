@@ -64,6 +64,13 @@ class EmailConfig(Base):
     from_address: str = ""
 
     auto_reply_enabled: bool = True
+    # Comma-separated literal addresses and/or `@domain` patterns
+    # (case-insensitive). Empty = deny all proactive outbound (replies and
+    # force_send still go through). Same syntax as Homer's
+    # HOMER_INTERNAL_EMAILS so operators can reuse the mental model.
+    # Read once in EmailChannel.__init__; runtime mutation will not refresh
+    # the cached parse — restart the channel to pick up changes.
+    outbound_allowlist: str = ""
     # Use IMAP IDLE for push notifications (falls back to polling on error)
     use_idle: bool = False
     poll_interval_seconds: int = 30
@@ -152,6 +159,21 @@ class EmailChannel(BaseChannel):
         self._oauth2_creds: Any = None  # Cached google.oauth2.credentials.Credentials
         self._known_senders_cache: set[str] | None = None
         self._known_senders_mtime: float = 0.0
+        # Pre-parse outbound allowlist once; config is static after init.
+        # Each entry is (is_domain_pattern, lowercased_value).
+        self._outbound_allowlist: list[tuple[bool, str]] = self._parse_outbound_allowlist(
+            self.config.outbound_allowlist
+        )
+
+    @staticmethod
+    def _parse_outbound_allowlist(raw: str) -> list[tuple[bool, str]]:
+        out: list[tuple[bool, str]] = []
+        for entry in (raw or "").split(","):
+            pattern = entry.strip().lower()
+            if not pattern:
+                continue
+            out.append((pattern.startswith("@"), pattern))
+        return out
 
     async def start(self) -> None:
         """Start listening for inbound emails (IDLE or polling)."""
@@ -272,11 +294,26 @@ class EmailChannel(BaseChannel):
 
         # Determine if this is a reply (recipient has sent us an email before)
         is_reply = to_addr in self._last_subject_by_chat
+        # ``force_send`` is a dispatcher-only escape hatch — never set by
+        # the LLM, since MessageTool's tool schema does not expose
+        # ``metadata``. Any new code path that sets it must do its own
+        # authorization first.
         force_send = bool((msg.metadata or {}).get("force_send"))
 
         # autoReplyEnabled only controls automatic replies, not proactive sends
         if is_reply and not self.config.auto_reply_enabled and not force_send:
             logger.info("Skip automatic email reply to {}: auto_reply_enabled is false", to_addr)
+            return
+
+        # Operator's kill-switch against rogue LLM tool calls: deny
+        # proactive sends unless explicitly allowlisted.
+        if not is_reply and not force_send and not self._matches_outbound_allowlist(to_addr):
+            logger.warning(
+                "Refusing proactive email to {}: add the recipient to "
+                "channels.email.outboundAllowlist (or set metadata.force_send "
+                "from a dispatcher that has authorized this send)",
+                to_addr,
+            )
             return
 
         base_subject = self._last_subject_by_chat.get(to_addr, "nanobot reply")
@@ -574,6 +611,26 @@ class EmailChannel(BaseChannel):
     # ------------------------------------------------------------------
     # Known-sender pre-filter
     # ------------------------------------------------------------------
+
+    def _matches_outbound_allowlist(self, addr: str) -> bool:
+        """True if ``addr`` matches a pre-parsed allowlist entry.
+
+        ``parseaddr`` strips display-name wrappers (``"Name <a@b>"``) so
+        callers don't have to.
+        """
+        if not self._outbound_allowlist:
+            return False
+        _, parsed = parseaddr(addr)
+        normalized = parsed.strip().lower()
+        if not normalized:
+            return False
+        for is_domain, pattern in self._outbound_allowlist:
+            if is_domain:
+                if normalized.endswith(pattern):
+                    return True
+            elif normalized == pattern:
+                return True
+        return False
 
     def _is_known_sender(self, sender: str) -> bool:
         """Check if sender is in the known-senders list.

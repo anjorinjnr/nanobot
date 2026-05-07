@@ -456,54 +456,191 @@ async def test_send_skips_reply_when_auto_reply_disabled(monkeypatch) -> None:
     assert len(fake_instances[0].sent_messages) == 1
 
 
+class _FakeSMTP:
+    def __init__(self, _host: str, _port: int, timeout: int = 30) -> None:
+        self.sent_messages: list[EmailMessage] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def starttls(self, context=None):
+        return None
+
+    def login(self, _user: str, _pw: str):
+        return None
+
+    def send_message(self, msg: EmailMessage):
+        self.sent_messages.append(msg)
+
+
+def _install_fake_smtp(monkeypatch) -> list[_FakeSMTP]:
+    instances: list[_FakeSMTP] = []
+
+    def _factory(host: str, port: int, timeout: int = 30):
+        inst = _FakeSMTP(host, port, timeout=timeout)
+        instances.append(inst)
+        return inst
+
+    monkeypatch.setattr("nanobot.channels.email.smtplib.SMTP", _factory)
+    return instances
+
+
 @pytest.mark.asyncio
-async def test_send_proactive_email_when_auto_reply_disabled(monkeypatch) -> None:
-    """Proactive emails (not replies) should be sent even when auto_reply_enabled=False."""
-    class FakeSMTP:
-        def __init__(self, _host: str, _port: int, timeout: int = 30) -> None:
-            self.sent_messages: list[EmailMessage] = []
+async def test_send_proactive_dropped_when_allowlist_empty(monkeypatch) -> None:
+    instances = _install_fake_smtp(monkeypatch)
+    channel = EmailChannel(_make_config(), MessageBus())
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def starttls(self, context=None):
-            return None
-
-        def login(self, _user: str, _pw: str):
-            return None
-
-        def send_message(self, msg: EmailMessage):
-            self.sent_messages.append(msg)
-
-    fake_instances: list[FakeSMTP] = []
-
-    def _smtp_factory(host: str, port: int, timeout: int = 30):
-        instance = FakeSMTP(host, port, timeout=timeout)
-        fake_instances.append(instance)
-        return instance
-
-    monkeypatch.setattr("nanobot.channels.email.smtplib.SMTP", _smtp_factory)
-
-    cfg = _make_config()
-    cfg.auto_reply_enabled = False
-    channel = EmailChannel(cfg, MessageBus())
-
-    # bob@example.com has never sent us an email (proactive send)
-    # This should be sent even with auto_reply_enabled=False
     await channel.send(
         OutboundMessage(
             channel="email",
             chat_id="bob@example.com",
-            content="Hello, this is a proactive email.",
+            content="Should not go out.",
         )
     )
-    assert len(fake_instances) == 1
-    assert len(fake_instances[0].sent_messages) == 1
-    sent = fake_instances[0].sent_messages[0]
-    assert sent["To"] == "bob@example.com"
+
+    assert instances == []
+
+
+@pytest.mark.asyncio
+async def test_send_proactive_allowed_when_recipient_in_allowlist(monkeypatch) -> None:
+    instances = _install_fake_smtp(monkeypatch)
+    cfg = _make_config()
+    cfg.outbound_allowlist = "bob@example.com,carol@example.com"
+    channel = EmailChannel(cfg, MessageBus())
+
+    await channel.send(
+        OutboundMessage(
+            channel="email",
+            chat_id="bob@example.com",
+            content="OK to send.",
+        )
+    )
+
+    assert len(instances) == 1
+    assert len(instances[0].sent_messages) == 1
+    assert instances[0].sent_messages[0]["To"] == "bob@example.com"
+
+
+@pytest.mark.asyncio
+async def test_send_proactive_allowed_via_domain_pattern(monkeypatch) -> None:
+    instances = _install_fake_smtp(monkeypatch)
+    cfg = _make_config()
+    cfg.outbound_allowlist = "@household.org"
+    channel = EmailChannel(cfg, MessageBus())
+
+    await channel.send(
+        OutboundMessage(
+            channel="email",
+            chat_id="anyone@household.org",
+            content="OK to send.",
+        )
+    )
+    await channel.send(
+        OutboundMessage(
+            channel="email",
+            chat_id="stranger@example.com",
+            content="Should not go out.",
+        )
+    )
+
+    assert len(instances) == 1
+    assert instances[0].sent_messages[0]["To"] == "anyone@household.org"
+
+
+@pytest.mark.asyncio
+async def test_send_proactive_allowed_with_force_send(monkeypatch) -> None:
+    # ``force_send`` is the escape hatch for dispatcher-authorized sends;
+    # LLM-emitted ``message`` tool calls cannot set this field.
+    instances = _install_fake_smtp(monkeypatch)
+    channel = EmailChannel(_make_config(), MessageBus())  # empty allowlist
+
+    await channel.send(
+        OutboundMessage(
+            channel="email",
+            chat_id="bob@example.com",
+            content="Force me through.",
+            metadata={"force_send": True},
+        )
+    )
+
+    assert len(instances) == 1
+    assert instances[0].sent_messages[0]["To"] == "bob@example.com"
+
+
+@pytest.mark.asyncio
+async def test_send_allowlist_match_is_case_insensitive(monkeypatch) -> None:
+    instances = _install_fake_smtp(monkeypatch)
+    cfg = _make_config()
+    cfg.outbound_allowlist = "Bob@Example.com,@HOUSEHOLD.org"
+    channel = EmailChannel(cfg, MessageBus())
+
+    await channel.send(
+        OutboundMessage(channel="email", chat_id="BOB@example.COM", content="x")
+    )
+    await channel.send(
+        OutboundMessage(channel="email", chat_id="someone@household.org", content="y")
+    )
+
+    assert len(instances) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_allowlist_strips_display_name_wrapper(monkeypatch) -> None:
+    # ``"Name <addr>"`` wrappers are common on outbound; parseaddr unwraps
+    # them so the allowlist match looks at the bare address.
+    instances = _install_fake_smtp(monkeypatch)
+    cfg = _make_config()
+    cfg.outbound_allowlist = "alice@example.com"
+    channel = EmailChannel(cfg, MessageBus())
+
+    await channel.send(
+        OutboundMessage(
+            channel="email",
+            chat_id="Alice Example <alice@example.com>",
+            content="Hi.",
+        )
+    )
+
+    assert len(instances) == 1
+    assert len(instances[0].sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_domain_pattern_rejects_confusable_suffix(monkeypatch) -> None:
+    # The leading ``@`` anchors the domain so ``@example.com`` cannot be
+    # impersonated by ``@evil-example.com`` (no ``@`` boundary, endswith fails).
+    instances = _install_fake_smtp(monkeypatch)
+    cfg = _make_config()
+    cfg.outbound_allowlist = "@example.com"
+    channel = EmailChannel(cfg, MessageBus())
+
+    await channel.send(
+        OutboundMessage(channel="email", chat_id="alice@evil-example.com", content="x")
+    )
+
+    assert instances == []
+
+
+@pytest.mark.asyncio
+async def test_send_reply_path_unchanged_by_allowlist(monkeypatch) -> None:
+    # Empty outbound_allowlist must not regress the inbound→reply flow.
+    instances = _install_fake_smtp(monkeypatch)
+    channel = EmailChannel(_make_config(), MessageBus())  # empty allowlist
+    channel._last_subject_by_chat["alice@example.com"] = "Original subject"
+
+    await channel.send(
+        OutboundMessage(
+            channel="email",
+            chat_id="alice@example.com",
+            content="Replying to your note.",
+        )
+    )
+
+    assert len(instances) == 1
+    assert instances[0].sent_messages[0]["To"] == "alice@example.com"
 
 
 @pytest.mark.asyncio
