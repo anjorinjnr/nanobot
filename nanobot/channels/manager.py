@@ -28,13 +28,15 @@ _NONALNUM_PAT = re.compile(r"[^a-z0-9]+")
 def _check_outbound_authorized(channel: BaseChannel, msg: OutboundMessage) -> None:
     """Raise OutboundScopeError when the host's scope guard refuses this send.
 
-    Streaming continuations (``_stream_delta`` / ``_stream_end``) inherit the
-    decision made on the initial send, since the chat_id and channel are the
-    same — re-checking would just duplicate the lookup. The initial send is
-    the gate.
+    Every event for a (channel, chat_id) is checked, including ``_stream_delta``
+    and ``_stream_end``. The earlier optimization that skipped stream
+    continuations defeated the guard entirely for streaming-enabled channels:
+    the actual content arrives in delta chunks, and skipping them let the
+    full reply through while the (separate) ``_streamed`` finalizer was the
+    only event that got refused — purely cosmetic. Looking up scope state
+    is microseconds (mtime stat + cached members + small SQLite query), so
+    re-checking each event has negligible cost and matches user expectations.
     """
-    if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
-        return
     if not msg.chat_id:
         return
     result = check_outbound(channel.name, msg.chat_id)
