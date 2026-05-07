@@ -68,6 +68,8 @@ class EmailConfig(Base):
     # (case-insensitive). Empty = deny all proactive outbound (replies and
     # force_send still go through). Same syntax as Homer's
     # HOMER_INTERNAL_EMAILS so operators can reuse the mental model.
+    # Read once in EmailChannel.__init__; runtime mutation will not refresh
+    # the cached parse — restart the channel to pick up changes.
     outbound_allowlist: str = ""
     # Use IMAP IDLE for push notifications (falls back to polling on error)
     use_idle: bool = False
@@ -292,6 +294,10 @@ class EmailChannel(BaseChannel):
 
         # Determine if this is a reply (recipient has sent us an email before)
         is_reply = to_addr in self._last_subject_by_chat
+        # ``force_send`` is a dispatcher-only escape hatch — never set by
+        # the LLM, since MessageTool's tool schema does not expose
+        # ``metadata``. Any new code path that sets it must do its own
+        # authorization first.
         force_send = bool((msg.metadata or {}).get("force_send"))
 
         # autoReplyEnabled only controls automatic replies, not proactive sends
@@ -303,8 +309,9 @@ class EmailChannel(BaseChannel):
         # proactive sends unless explicitly allowlisted.
         if not is_reply and not force_send and not self._matches_outbound_allowlist(to_addr):
             logger.warning(
-                "Refusing proactive email to {}: not a reply, no force_send, "
-                "not in outbound_allowlist",
+                "Refusing proactive email to {}: add the recipient to "
+                "channels.email.outboundAllowlist (or set metadata.force_send "
+                "from a dispatcher that has authorized this send)",
                 to_addr,
             )
             return

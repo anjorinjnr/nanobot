@@ -588,6 +588,43 @@ async def test_send_allowlist_match_is_case_insensitive(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_allowlist_strips_display_name_wrapper(monkeypatch) -> None:
+    # ``"Name <addr>"`` wrappers are common on outbound; parseaddr unwraps
+    # them so the allowlist match looks at the bare address.
+    instances = _install_fake_smtp(monkeypatch)
+    cfg = _make_config()
+    cfg.outbound_allowlist = "alice@example.com"
+    channel = EmailChannel(cfg, MessageBus())
+
+    await channel.send(
+        OutboundMessage(
+            channel="email",
+            chat_id="Alice Example <alice@example.com>",
+            content="Hi.",
+        )
+    )
+
+    assert len(instances) == 1
+    assert len(instances[0].sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_domain_pattern_rejects_confusable_suffix(monkeypatch) -> None:
+    # The leading ``@`` anchors the domain so ``@example.com`` cannot be
+    # impersonated by ``@evil-example.com`` (no ``@`` boundary, endswith fails).
+    instances = _install_fake_smtp(monkeypatch)
+    cfg = _make_config()
+    cfg.outbound_allowlist = "@example.com"
+    channel = EmailChannel(cfg, MessageBus())
+
+    await channel.send(
+        OutboundMessage(channel="email", chat_id="alice@evil-example.com", content="x")
+    )
+
+    assert instances == []
+
+
+@pytest.mark.asyncio
 async def test_send_reply_path_unchanged_by_allowlist(monkeypatch) -> None:
     # Empty outbound_allowlist must not regress the inbound→reply flow.
     instances = _install_fake_smtp(monkeypatch)
