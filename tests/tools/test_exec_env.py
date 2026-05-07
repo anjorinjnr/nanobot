@@ -87,7 +87,7 @@ async def test_exec_allowed_env_keys_missing_var_ignored(monkeypatch):
 @pytest.mark.asyncio
 async def test_exec_injects_sender_env_when_context_set():
     tool = ExecTool()
-    tool.set_context(channel="telegram", chat_id="123", sender_id="user-42")
+    tool.set_context(channel="telegram", sender_id="user-42")
     result = await tool.execute(command="printenv NANOBOT_SENDER_ID")
     assert "user-42" in result
     result = await tool.execute(command="printenv NANOBOT_SENDER_CHANNEL")
@@ -129,7 +129,7 @@ async def test_exec_sender_env_overrides_allowed_env_key(monkeypatch):
     runtime-injected value still wins (and absence still means absence)."""
     monkeypatch.setenv("NANOBOT_SENDER_ID", "spoofed-admin")
     tool = ExecTool(allowed_env_keys=["NANOBOT_SENDER_ID"])
-    tool.set_context(channel="telegram", chat_id="1", sender_id="real-user")
+    tool.set_context(channel="telegram", sender_id="real-user")
     result = await tool.execute(command="printenv NANOBOT_SENDER_ID")
     assert "real-user" in result
     assert "spoofed-admin" not in result
@@ -141,8 +141,74 @@ async def test_exec_set_context_clears_sender_when_none():
     """A subsequent turn with sender_id=None must clear the stamp from the
     previous turn, never carry it over."""
     tool = ExecTool()
-    tool.set_context(channel="telegram", chat_id="1", sender_id="user-1")
-    tool.set_context(channel="cli", chat_id="direct", sender_id=None)
+    tool.set_context(channel="telegram", sender_id="user-1")
+    tool.set_context(channel="cli", sender_id=None)
     result = await tool.execute(command="printenv NANOBOT_SENDER_ID")
+    assert "user-1" not in result
+    assert "Exit code: 1" in result
+
+
+# ── Loop integration ─────────────────────────────────────────────────────────
+# The unit tests above verify ExecTool in isolation. This integration test
+# verifies the loop wiring: that AgentLoop._set_tool_context actually calls
+# ExecTool.set_context with the runtime sender_id. If a future refactor
+# silently stops wiring exec, the unit tests would still pass while the
+# security gate breaks.
+
+
+@_UNIX_ONLY
+@pytest.mark.asyncio
+async def test_loop_set_tool_context_propagates_sender_to_exec():
+    """End-to-end: AgentLoop._set_tool_context → ExecTool.set_context →
+    NANOBOT_SENDER_ID lands in the subprocess env."""
+    from types import SimpleNamespace
+
+    exec_tool = ExecTool()
+
+    # Minimal AgentLoop stand-in: only the bits _set_tool_context touches.
+    fake_loop = SimpleNamespace(
+        tools={"exec": exec_tool},
+        _unified_session=False,
+    )
+
+    from nanobot.agent.loop import AgentLoop
+    AgentLoop._set_tool_context(
+        fake_loop,
+        channel="telegram",
+        chat_id="abc",
+        message_id="m1",
+        sender_id="user-from-loop",
+    )
+
+    result = await exec_tool.execute(command="printenv NANOBOT_SENDER_ID")
+    assert "user-from-loop" in result
+    result = await exec_tool.execute(command="printenv NANOBOT_SENDER_CHANNEL")
+    assert "telegram" in result
+
+
+@_UNIX_ONLY
+@pytest.mark.asyncio
+async def test_loop_set_tool_context_clears_sender_between_turns():
+    """A turn with sender_id=None must clear identity from the previous
+    turn — verifies the loop-driven path, not just direct set_context."""
+    from types import SimpleNamespace
+
+    exec_tool = ExecTool()
+    fake_loop = SimpleNamespace(
+        tools={"exec": exec_tool},
+        _unified_session=False,
+    )
+
+    from nanobot.agent.loop import AgentLoop
+    AgentLoop._set_tool_context(
+        fake_loop, channel="telegram", chat_id="abc",
+        message_id="m1", sender_id="user-1",
+    )
+    AgentLoop._set_tool_context(
+        fake_loop, channel="cli", chat_id="direct",
+        message_id=None, sender_id=None,
+    )
+
+    result = await exec_tool.execute(command="printenv NANOBOT_SENDER_ID")
     assert "user-1" not in result
     assert "Exit code: 1" in result

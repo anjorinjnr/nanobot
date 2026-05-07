@@ -84,14 +84,19 @@ class ExecTool(Tool):
     def set_context(
         self,
         channel: str | None = None,
-        chat_id: str | None = None,
         sender_id: str | None = None,
     ) -> None:
         """Update per-turn identity that gets injected into subprocess env.
 
-        Called by the agent loop before each turn. The runtime is the only
-        source for these values — they are never read from os.environ — so
-        prompt injection cannot spoof them.
+        Called by the agent loop before each turn (see _set_tool_context).
+        The runtime is the only source for these values — they are never read
+        from os.environ — so prompt injection cannot spoof them.
+
+        Concurrency: relies on _set_tool_context being invoked serially per
+        turn against a single ExecTool instance. ExecTool.exclusive=True
+        already serializes parallel exec calls within a turn; if the loop
+        is ever refactored to interleave messages from different senders
+        against the same instance, this state would race.
         """
         self._sender_channel = channel
         self._sender_id = sender_id

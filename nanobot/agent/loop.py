@@ -637,7 +637,7 @@ class AgentLoop:
         # authenticate the requester from the runtime, not from LLM args.
         if exec_tool := self.tools.get("exec"):
             if hasattr(exec_tool, "set_context"):
-                exec_tool.set_context(channel, chat_id, sender_id=sender_id)
+                exec_tool.set_context(channel=channel, sender_id=sender_id)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
