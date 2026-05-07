@@ -170,6 +170,17 @@ class BaseChannel(ABC):
             )
             return
 
+        # Suppress inbound from participants in a no-reply scope — the host
+        # explicitly opted out of routing replies to the agent. Logged loudly
+        # (not silently dropped) so /status surfaces it.
+        from nanobot.channels.scope_guard import check_inbound_suppressed
+        if check_inbound_suppressed(self.name, sender_id):
+            logger.info(
+                "Inbound suppressed: {} on channel {} is in a no-reply scope; reply not routed.",
+                sender_id, self.name,
+            )
+            return
+
         meta = metadata or {}
         if self.supports_streaming:
             meta = {**meta, "_wants_stream": True}

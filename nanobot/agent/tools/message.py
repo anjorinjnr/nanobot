@@ -197,4 +197,9 @@ class MessageTool(Tool):
                 self._sent_in_turn = True
             return f"Message delivery timed out for {channel}:{chat_id} — it may not have been delivered"
         except Exception as e:
+            from nanobot.channels.scope_guard import OutboundScopeError
+            if isinstance(e, OutboundScopeError):
+                # Surface the structured remediation so the LLM creates a scope
+                # before retrying instead of looping or fabricating a purpose.
+                return str(e)
             return f"Error sending message: {str(e)}"
