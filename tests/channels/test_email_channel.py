@@ -457,8 +457,6 @@ async def test_send_skips_reply_when_auto_reply_disabled(monkeypatch) -> None:
 
 
 class _FakeSMTP:
-    """Shared fake SMTP that records send_message calls for allowlist tests."""
-
     def __init__(self, _host: str, _port: int, timeout: int = 30) -> None:
         self.sent_messages: list[EmailMessage] = []
 
@@ -492,13 +490,6 @@ def _install_fake_smtp(monkeypatch) -> list[_FakeSMTP]:
 
 @pytest.mark.asyncio
 async def test_send_proactive_dropped_when_allowlist_empty(monkeypatch) -> None:
-    """Default behaviour: proactive sends to non-replies are denied.
-
-    The empty outbound_allowlist is the operator's deny-by-default
-    posture against rogue LLM tool calls. Replies (handled in the
-    auto_reply test above) and force_send (covered separately) keep
-    working.
-    """
     instances = _install_fake_smtp(monkeypatch)
     channel = EmailChannel(_make_config(), MessageBus())
 
@@ -515,7 +506,6 @@ async def test_send_proactive_dropped_when_allowlist_empty(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_send_proactive_allowed_when_recipient_in_allowlist(monkeypatch) -> None:
-    """Literal address in outbound_allowlist permits proactive send."""
     instances = _install_fake_smtp(monkeypatch)
     cfg = _make_config()
     cfg.outbound_allowlist = "bob@example.com,carol@example.com"
@@ -536,7 +526,6 @@ async def test_send_proactive_allowed_when_recipient_in_allowlist(monkeypatch) -
 
 @pytest.mark.asyncio
 async def test_send_proactive_allowed_via_domain_pattern(monkeypatch) -> None:
-    """``@domain`` patterns match any local-part on that domain."""
     instances = _install_fake_smtp(monkeypatch)
     cfg = _make_config()
     cfg.outbound_allowlist = "@household.org"
@@ -563,13 +552,8 @@ async def test_send_proactive_allowed_via_domain_pattern(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_send_proactive_allowed_with_force_send(monkeypatch) -> None:
-    """``metadata.force_send=True`` bypasses the allowlist entirely.
-
-    This is the escape hatch for code paths that have already done
-    their own authorization (e.g. operator-initiated sends from a
-    portal API). LLM-emitted ``message`` tool calls cannot set this
-    field — it is dispatcher-only.
-    """
+    # ``force_send`` is the escape hatch for dispatcher-authorized sends;
+    # LLM-emitted ``message`` tool calls cannot set this field.
     instances = _install_fake_smtp(monkeypatch)
     channel = EmailChannel(_make_config(), MessageBus())  # empty allowlist
 
@@ -605,10 +589,7 @@ async def test_send_allowlist_match_is_case_insensitive(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_send_reply_path_unchanged_by_allowlist(monkeypatch) -> None:
-    """Replies (sender previously emailed in) bypass the allowlist.
-
-    Empty outbound_allowlist must not regress the inbound→reply flow.
-    """
+    # Empty outbound_allowlist must not regress the inbound→reply flow.
     instances = _install_fake_smtp(monkeypatch)
     channel = EmailChannel(_make_config(), MessageBus())  # empty allowlist
     channel._last_subject_by_chat["alice@example.com"] = "Original subject"
