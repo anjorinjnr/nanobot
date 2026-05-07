@@ -39,6 +39,7 @@ class ChannelsConfig(Base):
     spam_guard: SpamGuardConfig = Field(default_factory=SpamGuardConfig)
     transcription_provider: str = "groq"  # Voice transcription backend: "groq" or "openai"
     transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # Optional ISO-639-1 hint for audio transcription
+    scope_outbound_lookup: str = ""  # "module:function" returning ScopeLookupResult — gates outbound sends. Empty = no guard (vanilla behavior).
 
 
 class DreamConfig(Base):

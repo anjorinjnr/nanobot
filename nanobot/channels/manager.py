@@ -91,6 +91,38 @@ class ChannelManager:
         self._dedup_last_cleanup: float = 0.0
 
         self._init_channels()
+        self._install_scope_outbound_lookup()
+
+    def _install_scope_outbound_lookup(self) -> None:
+        """Install the host's outbound scope lookup (if configured).
+
+        The config field is a "module:function" string. The callable receives
+        ``(channel_name, chat_id)`` and returns ``ScopeLookupResult``.
+        Failure to resolve the callable is logged but never fatal — the
+        guard simply stays disabled (vanilla allow-all behavior).
+        """
+        spec = getattr(self.config.channels, "scope_outbound_lookup", "") or ""
+        if not spec:
+            return
+        try:
+            mod_name, fn_name = spec.split(":", 1)
+        except ValueError:
+            logger.error("scope_outbound_lookup {!r} is not 'module:function'", spec)
+            return
+        try:
+            import importlib
+
+            module = importlib.import_module(mod_name)
+            fn = getattr(module, fn_name)
+        except Exception as e:
+            logger.error(
+                "scope_outbound_lookup {!r} not importable: {}: {}",
+                spec, type(e).__name__, e,
+            )
+            return
+        from nanobot.channels.scope_guard import set_scope_lookup
+        set_scope_lookup(fn)
+        logger.info("scope_outbound_lookup installed: {}", spec)
 
     def _init_channels(self) -> None:
         """Initialize channels discovered via pkgutil scan + entry_points plugins."""
