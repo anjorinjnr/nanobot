@@ -110,13 +110,26 @@ def test_no_reply_scope_outbound_allowed() -> None:
     _check_outbound_authorized(channel, _msg())
 
 
-def test_stream_continuation_skips_re_check() -> None:
-    """Stream deltas/end-frames inherit the initial decision — don't re-check."""
+def test_stream_events_are_checked_too() -> None:
+    """Stream deltas + end-frames must be checked, not skipped.
+
+    Earlier behaviour skipped stream continuations on the assumption that
+    an "initial send" had already been authorized. For streaming-enabled
+    channels (e.g. WhatsApp), the actual content arrives in delta chunks
+    and there is no separate non-streaming initial — the skip silently
+    let the entire reply through while only the cosmetic _streamed
+    finalizer was refused. Regression coverage for the 2026-05-07 incident
+    where Adam's reply via LID JID was 5x-warning'd but still delivered.
+    """
     refused = lambda ch, cid: ScopeLookupResult(authorized=False, reason="no_scope")
     _install(refused)
     channel = _RecordingChannel()
-    _check_outbound_authorized(channel, _msg(_stream_delta=True))
-    _check_outbound_authorized(channel, _msg(_stream_end=True))
+    with pytest.raises(OutboundScopeError):
+        _check_outbound_authorized(channel, _msg(_stream_delta=True))
+    with pytest.raises(OutboundScopeError):
+        _check_outbound_authorized(channel, _msg(_stream_end=True))
+    with pytest.raises(OutboundScopeError):
+        _check_outbound_authorized(channel, _msg(_streamed=True))
 
 
 def test_empty_chat_id_skips_check() -> None:
