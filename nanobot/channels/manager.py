@@ -120,6 +120,11 @@ class ChannelManager:
                 spec, type(e).__name__, e,
             )
             return
+        if not callable(fn):
+            logger.error(
+                "scope_outbound_lookup {!r} is not callable (got {})", spec, type(fn).__name__,
+            )
+            return
         from nanobot.channels.scope_guard import set_scope_lookup
         set_scope_lookup(fn)
         logger.info("scope_outbound_lookup installed: {}", spec)

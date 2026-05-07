@@ -10,6 +10,7 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.channels.scope_guard import check_inbound_suppressed
 
 
 class BaseChannel(ABC):
@@ -173,7 +174,6 @@ class BaseChannel(ABC):
         # Suppress inbound from participants in a no-reply scope — the host
         # explicitly opted out of routing replies to the agent. Logged loudly
         # (not silently dropped) so /status surfaces it.
-        from nanobot.channels.scope_guard import check_inbound_suppressed
         if check_inbound_suppressed(self.name, sender_id):
             logger.info(
                 "Inbound suppressed: {} on channel {} is in a no-reply scope; reply not routed.",

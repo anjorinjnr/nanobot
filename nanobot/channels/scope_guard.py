@@ -75,10 +75,14 @@ class OutboundScopeError(Exception):
         super().__init__(self._format())
 
     def _format(self) -> str:
-        msg = f"Send refused on {self.channel} to {self.chat_id}: {self.reason}."
-        if self.remediation:
-            msg = f"{msg}\n{self.remediation}"
-        return msg
+        header = f"Send refused on {self.channel} to {self.chat_id}: {self.reason}."
+        if not self.remediation:
+            return header
+        # Avoid double-prefixing when the host's remediation already starts
+        # with its own "Send refused..." line.
+        if self.remediation.lstrip().startswith("Send refused"):
+            return self.remediation
+        return f"{header}\n{self.remediation}"
 
 
 def check_outbound(channel: str, chat_id: str) -> ScopeLookupResult | None:
