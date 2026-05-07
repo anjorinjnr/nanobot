@@ -1127,6 +1127,8 @@ class AgentLoop:
         from nanobot.analytics.hook import get_analytics_hook
         _analytics = get_analytics_hook()
         _synthetic = bool(msg.metadata.get("synthetic"))
+        _synthetic_trigger_kind = str(msg.metadata.get("trigger_kind") or "synthetic")
+        _synthetic_start = time.monotonic() if _synthetic else 0.0
 
         # Pre-turn quota gate (default-tier weekly token budget). Bails fast
         # for synthetic / byok / managed turns; on a hard cap-hit we send
@@ -1352,8 +1354,11 @@ class AgentLoop:
             preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
             logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        # PostHog analytics — fire events after response is built. Skipped
-        # entirely for synthetic calls (see _analytics_ctx assignment above).
+        # PostHog analytics — fire events after response is built. The
+        # user-facing path emits message_sent / agent_responded; the
+        # synthetic path emits a single agent_initiated_action so
+        # proactive work (briefings, reminder fires, scheduled tasks)
+        # is visible without polluting the user-message funnel.
         if _analytics_ctx is not None:
             _tools = tools_used or []
             escalation_used = "escalate" in _tools or "resolve_escalation" in _tools
@@ -1367,6 +1372,23 @@ class AgentLoop:
                 )
             except Exception:
                 logger.debug("Analytics hook error (non-fatal)", exc_info=True)
+        elif _synthetic:
+            # The empty-final placeholder isn't a "real" response — drop it
+            # before reporting so had_outbound stays accurate.
+            _final = (
+                None
+                if stop_reason in (STOP_EMPTY_FINAL, STOP_INTENTIONAL_SILENCE)
+                else final_content
+            )
+            try:
+                _analytics.track_agent_initiated_action(
+                    trigger_kind=_synthetic_trigger_kind,
+                    response_content=_final,
+                    tools_used=tools_used or [],
+                    latency_ms=int((time.monotonic() - _synthetic_start) * 1000),
+                )
+            except Exception:
+                logger.debug("agent_initiated_action emit failed", exc_info=True)
 
         # Persist assistant reply to hist_chat_messages. _chat_ctx is None
         # when persistence is disabled, the channel is unsupported, or the
@@ -1661,22 +1683,30 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         model_override: str | None = None,
         is_synthetic: bool = False,
+        trigger_kind: str = "synthetic",
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload.
 
         *is_synthetic* flags messages that were not initiated by a user —
         heartbeat ticks, cron reminders, internal self-sends. These bypass
-        the analytics hook so they don't pollute the `message_sent` funnel
-        with agent-initiated work.
+        the user-facing analytics hooks (``message_sent`` /
+        ``agent_responded``) and instead emit a single
+        ``agent_initiated_action`` event tagged with *trigger_kind*
+        (``"heartbeat"``, ``"cron"``, ``"scheduled"``, …) so dashboards
+        can answer "what is Homer doing on its own?" without polluting
+        the user-message funnel.
         """
         await self._connect_mcp()
+        synthetic_meta: dict[str, Any] = {}
+        if is_synthetic:
+            synthetic_meta = {"synthetic": True, "trigger_kind": trigger_kind}
         msg = InboundMessage(
             channel=channel,
             sender_id=sender_id,
             chat_id=chat_id,
             content=content,
             media=media or [],
-            metadata={"synthetic": True} if is_synthetic else {},
+            metadata=synthetic_meta,
         )
         return await self._process_message(
             msg,

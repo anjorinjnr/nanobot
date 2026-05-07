@@ -308,6 +308,49 @@ class AnalyticsHook:
         else:
             asyncio.create_task(coro)
 
+    def track_agent_initiated_action(
+        self,
+        *,
+        trigger_kind: str,
+        response_content: str | None,
+        tools_used: list[str] | set[str],
+        latency_ms: int,
+    ) -> None:
+        """Fire ``agent_initiated_action`` for synthetic (non-user) turns.
+
+        Heartbeat ticks, cron reminders, and other proactive entry points
+        process through the same agent loop as user turns but bypass
+        ``message_sent`` / ``agent_responded`` to keep those funnels clean.
+        This event captures the proactive work separately so dashboards
+        can answer "what is Homer doing on its own?" without polluting
+        the user-facing metrics.
+
+        ``had_outbound`` is the most useful filter: True when the agent
+        produced visible work (non-empty response OR sent via the
+        ``message`` tool to a channel). False for silent ticks (heartbeat
+        ran, nothing to do) — still emitted so the absolute count of
+        synthetic activity is visible.
+        """
+        if not self._ensure_init():
+            return
+        hid = self._household_id or get_household_id()
+        if not hid:
+            return
+        tools_list = sorted(tools_used) if tools_used else []
+        had_outbound = bool(response_content) or "message" in tools_list
+        distinct_id = get_distinct_id(hid, "household")
+        self._client.capture(distinct_id, "agent_initiated_action", {
+            **self._base_props(),
+            "trigger_kind": trigger_kind or "synthetic",
+            "had_outbound": had_outbound,
+            "latency_ms": latency_ms,
+            "tool_calls_count": len(tools_list),
+            "tools_used": tools_list,
+            "response_length": len(response_content) if response_content else 0,
+        })
+        if hid:
+            self._client.group_identify("household", hid, {})
+
     def _check_followup(self, distinct_id: str, now: float) -> bool:
         last = self._last_message.get(distinct_id)
         self._last_message[distinct_id] = now
