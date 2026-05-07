@@ -684,6 +684,29 @@ def test_reply_state_truncates_to_recent_entries(monkeypatch, tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_reply_state_tracks_empty_subject_sender(monkeypatch, tmp_path) -> None:
+    # Empty subjects are valid email — the sender must still register
+    # for is_reply, and the message_id dict can't grow past the cap
+    # just because the subject was blank.
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", str(tmp_path))
+    instances = _install_fake_smtp(monkeypatch)
+    channel = EmailChannel(_make_config(), MessageBus())
+
+    inbound = [{"sender": "blank@example.com", "subject": "", "message_id": "<x>", "content": "hi"}]
+    channel._fetch_new_messages = lambda: inbound  # type: ignore[assignment]
+    channel._is_known_sender = lambda _s: False  # type: ignore[assignment]
+    await channel._fetch_and_dispatch()
+
+    assert "blank@example.com" in channel._last_subject_by_chat
+    assert channel._last_subject_by_chat["blank@example.com"] == ""
+    # is_reply must be True so the empty-allowlist guard does not drop the reply.
+    await channel.send(
+        OutboundMessage(channel="email", chat_id="blank@example.com", content="reply")
+    )
+    assert len(instances) == 1
+
+
+@pytest.mark.asyncio
 async def test_reply_state_lru_keeps_recently_active_sender(monkeypatch, tmp_path) -> None:
     # Updating an existing sender right before truncation must keep them
     # alive — plain dict assignment doesn't move the key, so the

@@ -210,9 +210,11 @@ class EmailChannel(BaseChannel):
                 continue
             subject = entry.get("subject")
             message_id = entry.get("message_id")
-            if isinstance(subject, str) and subject:
+            # Empty strings are valid (see _fetch_and_dispatch) — preserve
+            # them on hydrate so is_reply stays correct after restart.
+            if isinstance(subject, str):
                 self._last_subject_by_chat[addr] = subject
-            if isinstance(message_id, str) and message_id:
+            if isinstance(message_id, str):
                 self._last_message_id_by_chat[addr] = message_id
 
     def _persist_reply_state(self) -> None:
@@ -319,17 +321,18 @@ class EmailChannel(BaseChannel):
             subject = item.get("subject", "")
             message_id = item.get("message_id", "")
 
-            if subject:
-                # pop+reinsert keeps most-recent at the dict tail so the
-                # truncation in _persist_reply_state evicts cold senders,
-                # not active ones (plain assignment doesn't move the key).
-                self._last_subject_by_chat.pop(sender, None)
-                self._last_subject_by_chat[sender] = subject
-                reply_state_dirty = True
-            if message_id:
-                self._last_message_id_by_chat.pop(sender, None)
-                self._last_message_id_by_chat[sender] = message_id
-                reply_state_dirty = True
+            # Unconditionally track the sender — even an empty subject
+            # / message_id needs to participate in is_reply and LRU
+            # ordering, otherwise a stream of empty-subject emails can
+            # leak into _last_message_id_by_chat without being capped
+            # (the cap is keyed on the subject dict's size) and replies
+            # to those threads get misclassified as proactive sends.
+            # pop+reinsert keeps most-recent at the dict tail.
+            self._last_subject_by_chat.pop(sender, None)
+            self._last_subject_by_chat[sender] = subject
+            self._last_message_id_by_chat.pop(sender, None)
+            self._last_message_id_by_chat[sender] = message_id
+            reply_state_dirty = True
 
             # Pre-LLM filter: if known_senders_file is configured, only
             # route emails from listed addresses to the agent.  Unknown
