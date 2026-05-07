@@ -49,10 +49,11 @@ _PROMPT_TEMPLATE = (
     'Message: "{text}"'
 )
 
-# Accept any snake_case token starting with a letter. Upper bound keeps
-# pathological LLM output (prompt injections, run-on sentences) out of the
-# analytics stream.
-_TAG_RE = re.compile(r"^[a-z][a-z0-9_]{1,29}$")
+# Accept any snake_case token starting with a letter. Min length 3 rejects
+# truncated outputs ("ch" from "chitchat" when max_tokens cuts mid-token).
+# Upper bound keeps pathological LLM output (prompt injections, run-on
+# sentences) out of the analytics stream.
+_TAG_RE = re.compile(r"^[a-z][a-z0-9_]{2,29}$")
 _FALLBACK = "unclassified"
 
 
@@ -140,6 +141,11 @@ async def _call_gemini_async(text: str) -> str:
             preferred=", ".join(PREFERRED_TAGS),
             text=text[:500],
         )
+        # Gemini 2.5 Flash uses extended thinking by default. In OpenAI-compat
+        # mode the thinking tokens count against `max_tokens`, so a low cap
+        # eats the actual answer. `reasoning_effort: "none"` disables thinking
+        # for this call (we don't need it for a one-tag classification), and
+        # max_tokens is bumped to a comfortable margin for the longest tag.
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -147,8 +153,9 @@ async def _call_gemini_async(text: str) -> str:
                 json={
                     "model": "gemini-2.5-flash",
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 15,
+                    "max_tokens": 100,
                     "temperature": 0,
+                    "reasoning_effort": "none",
                 },
                 timeout=5.0,
             )
