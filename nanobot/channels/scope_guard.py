@@ -18,20 +18,23 @@ from typing import Callable
 
 from loguru import logger
 
+# Stable reason codes — included on ScopeLookupResult and OutboundScopeError so
+# callers (e.g., metrics, /status, agent tool error handlers) can branch on
+# them without string-comparing the human-readable remediation text.
+REASON_HOUSEHOLD_MEMBER = "household_member"
+REASON_ACTIVE_SCOPE = "active_scope"
+REASON_NO_REPLY_SCOPE = "no_reply_scope"
+REASON_NO_SCOPE = "no_scope"
+REASON_SCOPE_NO_CONTEXT = "scope_no_context"
+REASON_SCOPE_INACTIVE = "scope_inactive"
+REASON_LOOKUP_ERROR = "lookup_error"
+
 
 @dataclass
 class ScopeLookupResult:
     """Result of resolving (channel, participant_id) → authorization.
 
-    ``reason`` is one of:
-      household_member  — recipient is a household member; bypass.
-      active_scope      — active scope with non-empty context exists.
-      no_reply_scope    — active scope with mode='no_reply'; outbound allowed,
-                          inbound suppressed.
-      no_scope          — no scope found.
-      scope_no_context  — scope exists but has no purpose / event envelope.
-      scope_inactive    — scope exists but status != 'active'.
-      lookup_error      — host lookup raised; failed open.
+    ``reason`` is one of the REASON_* constants above.
     """
 
     authorized: bool
@@ -44,6 +47,9 @@ class ScopeLookupResult:
 ScopeLookup = Callable[[str, str], ScopeLookupResult]
 
 
+# Single-writer-at-startup, many-readers-at-runtime. set_scope_lookup is
+# expected to fire once during host wiring (ChannelManager init) before any
+# channel is started. Reads happen per send/receive — no lock needed.
 _lookup: ScopeLookup | None = None
 
 
@@ -93,7 +99,7 @@ def check_outbound(channel: str, chat_id: str) -> ScopeLookupResult | None:
             channel, chat_id, type(e).__name__, e,
         )
         return ScopeLookupResult(
-            authorized=True, reason="lookup_error"
+            authorized=True, reason=REASON_LOOKUP_ERROR
         )
 
 
