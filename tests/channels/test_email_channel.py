@@ -683,6 +683,18 @@ def test_reply_state_truncates_to_recent_entries(monkeypatch, tmp_path) -> None:
     assert f"u{cap + 49}@example.com" in channel._last_subject_by_chat
 
 
+def test_reply_state_path_namespaced_per_imap_account(monkeypatch, tmp_path) -> None:
+    # Two channels with different IMAP accounts must not share state files.
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", str(tmp_path))
+    cfg_a = _make_config(imap_username="alice@example.com")
+    cfg_b = _make_config(imap_username="bob@example.com")
+    chan_a = EmailChannel(cfg_a, MessageBus())
+    chan_b = EmailChannel(cfg_b, MessageBus())
+    assert chan_a._reply_state_path != chan_b._reply_state_path
+    assert "alice" in chan_a._reply_state_path.name
+    assert "bob" in chan_b._reply_state_path.name
+
+
 @pytest.mark.asyncio
 async def test_reply_state_tracks_empty_subject_sender(monkeypatch, tmp_path) -> None:
     # Empty subjects are valid email — the sender must still register

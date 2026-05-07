@@ -156,8 +156,12 @@ class EmailChannel(BaseChannel):
         # Reply state is persisted across restarts (see _hydrate_reply_state) —
         # without this, an inbound that arrives just before a container restart
         # would be classified as "proactive" by the outbound_allowlist guard
-        # and dropped.
-        self._reply_state_path = get_persistent_data_dir() / "email_reply_state.json"
+        # and dropped. Filename is namespaced by IMAP username so multiple
+        # email channels (e.g. personal + work) don't trample each other.
+        ident = self.config.imap_username or self.config.from_address or "default"
+        self._reply_state_path = (
+            get_persistent_data_dir() / f"email_reply_state_{safe_filename(ident)}.json"
+        )
         self._last_subject_by_chat: dict[str, str] = {}
         self._last_message_id_by_chat: dict[str, str] = {}
         self._hydrate_reply_state()
@@ -217,9 +221,12 @@ class EmailChannel(BaseChannel):
             if isinstance(message_id, str):
                 self._last_message_id_by_chat[addr] = message_id
 
-    def _persist_reply_state(self) -> None:
-        # Trim to the most-recent N senders. dict preserves insertion
-        # order, so the tail is what we just touched.
+    def _trim_and_snapshot_reply_state(self) -> dict[str, dict[str, str]]:
+        """Trim in-memory state to the cap and return a serializable snapshot.
+
+        Runs on the asyncio loop (mutates instance dicts), so the
+        worker-thread writer only needs the snapshot — no shared state.
+        """
         if len(self._last_subject_by_chat) > self._REPLY_STATE_MAX_ENTRIES:
             keep = list(self._last_subject_by_chat)[-self._REPLY_STATE_MAX_ENTRIES:]
             self._last_subject_by_chat = {k: self._last_subject_by_chat[k] for k in keep}
@@ -231,16 +238,24 @@ class EmailChannel(BaseChannel):
             merged[addr] = {"subject": subject}
         for addr, mid in self._last_message_id_by_chat.items():
             merged.setdefault(addr, {})["message_id"] = mid
+        return merged
+
+    def _write_reply_state(self, snapshot: dict[str, dict[str, str]]) -> None:
+        """Pure I/O — atomic write of the snapshot. Safe to run on a worker thread."""
         try:
             self._reply_state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._reply_state_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(merged), encoding="utf-8")
+            tmp.write_text(json.dumps(snapshot), encoding="utf-8")
             tmp.replace(self._reply_state_path)
         except OSError as exc:
             logger.warning(
                 "Email channel: failed to persist reply state to {}: {}",
                 self._reply_state_path, exc,
             )
+
+    def _persist_reply_state(self) -> None:
+        """Sync entry point used by tests; production uses the split form."""
+        self._write_reply_state(self._trim_and_snapshot_reply_state())
 
     async def start(self) -> None:
         """Start listening for inbound emails (IDLE or polling)."""
@@ -350,10 +365,12 @@ class EmailChannel(BaseChannel):
             )
 
         # Persist once per batch (not per item) to keep disk I/O off the
-        # hot path, and run it on a worker thread so a slow disk does not
-        # stall the asyncio loop.
+        # hot path. Trim+snapshot runs here (asyncio loop, mutates instance
+        # state); the actual write goes to a worker thread on a snapshot
+        # so the worker never touches shared state.
         if reply_state_dirty:
-            await asyncio.to_thread(self._persist_reply_state)
+            snapshot = self._trim_and_snapshot_reply_state()
+            await asyncio.to_thread(self._write_reply_state, snapshot)
 
     async def stop(self) -> None:
         """Stop polling loop."""
