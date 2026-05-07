@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, Iterable, Iterator
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
 from nanobot.bus.events import TASK_TAG_META_KEY, OutboundMessage
+from nanobot.channels.scope_guard import OutboundScopeError
 
 
 @tool_parameters(
@@ -196,5 +197,9 @@ class MessageTool(Tool):
             if channel == default_channel and chat_id == default_chat_id:
                 self._sent_in_turn = True
             return f"Message delivery timed out for {channel}:{chat_id} — it may not have been delivered"
+        except OutboundScopeError as e:
+            # Surface the structured remediation so the LLM creates a scope
+            # before retrying instead of looping or fabricating a purpose.
+            return str(e)
         except Exception as e:
             return f"Error sending message: {str(e)}"

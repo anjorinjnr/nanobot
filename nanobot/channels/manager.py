@@ -14,11 +14,33 @@ from loguru import logger
 from nanobot.bus.events import TASK_TAG_META_KEY, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.scope_guard import (
+    OutboundScopeError,
+    check_outbound,
+)
 from nanobot.config.schema import Config
 from nanobot.utils.restart import consume_restart_notice_from_env, format_restart_completed_message
 
 _DIGIT_PAT = re.compile(r"\d+")
 _NONALNUM_PAT = re.compile(r"[^a-z0-9]+")
+
+
+def _check_outbound_authorized(channel: BaseChannel, msg: OutboundMessage) -> None:
+    """Raise OutboundScopeError when the host's scope guard refuses this send.
+
+    Streaming continuations (``_stream_delta`` / ``_stream_end``) inherit the
+    decision made on the initial send, since the chat_id and channel are the
+    same — re-checking would just duplicate the lookup. The initial send is
+    the gate.
+    """
+    if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
+        return
+    if not msg.chat_id:
+        return
+    result = check_outbound(channel.name, msg.chat_id)
+    if result is None or result.authorized:
+        return
+    raise OutboundScopeError(channel.name, msg.chat_id, result)
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
@@ -69,6 +91,43 @@ class ChannelManager:
         self._dedup_last_cleanup: float = 0.0
 
         self._init_channels()
+        self._install_scope_outbound_lookup()
+
+    def _install_scope_outbound_lookup(self) -> None:
+        """Install the host's outbound scope lookup (if configured).
+
+        The config field is a "module:function" string. The callable receives
+        ``(channel_name, chat_id)`` and returns ``ScopeLookupResult``.
+        Failure to resolve the callable is logged but never fatal — the
+        guard simply stays disabled (vanilla allow-all behavior).
+        """
+        spec = getattr(self.config.channels, "scope_outbound_lookup", "") or ""
+        if not spec:
+            return
+        try:
+            mod_name, fn_name = spec.split(":", 1)
+        except ValueError:
+            logger.error("scope_outbound_lookup {!r} is not 'module:function'", spec)
+            return
+        try:
+            import importlib
+
+            module = importlib.import_module(mod_name)
+            fn = getattr(module, fn_name)
+        except Exception as e:
+            logger.error(
+                "scope_outbound_lookup {!r} not importable: {}: {}",
+                spec, type(e).__name__, e,
+            )
+            return
+        if not callable(fn):
+            logger.error(
+                "scope_outbound_lookup {!r} is not callable (got {})", spec, type(fn).__name__,
+            )
+            return
+        from nanobot.channels.scope_guard import set_scope_lookup
+        set_scope_lookup(fn)
+        logger.info("scope_outbound_lookup installed: {}", spec)
 
     def _init_channels(self) -> None:
         """Initialize channels discovered via pkgutil scan + entry_points plugins."""
@@ -371,6 +430,7 @@ class ChannelManager:
     @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send one outbound message without retry policy."""
+        _check_outbound_authorized(channel, msg)
         if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
             await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
         elif not msg.metadata.get("_streamed"):
@@ -444,6 +504,17 @@ class ChannelManager:
                 return  # Send succeeded
             except asyncio.CancelledError:
                 raise  # Propagate cancellation for graceful shutdown
+            except OutboundScopeError as e:
+                # Refusal is permanent — retrying won't help. Surface the error
+                # to the caller (typically the agent's MessageTool) so it can
+                # show structured remediation to the LLM.
+                logger.warning(
+                    "scope_guard: refused send to {}:{} ({}): {}",
+                    msg.channel, msg.chat_id, e.reason, e.remediation or "",
+                )
+                if msg._delivery_future and not msg._delivery_future.done():
+                    msg._delivery_future.set_exception(e)
+                return
             except Exception as e:
                 _ = e
                 if attempt == max_attempts - 1:
