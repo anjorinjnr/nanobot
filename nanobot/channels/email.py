@@ -313,17 +313,23 @@ class EmailChannel(BaseChannel):
         logged to ``unknown_sender_log`` (if configured) and skipped.
         """
         inbound_items = await asyncio.to_thread(self._fetch_new_messages)
+        reply_state_dirty = False
         for item in inbound_items:
             sender = item["sender"]
             subject = item.get("subject", "")
             message_id = item.get("message_id", "")
 
             if subject:
+                # pop+reinsert keeps most-recent at the dict tail so the
+                # truncation in _persist_reply_state evicts cold senders,
+                # not active ones (plain assignment doesn't move the key).
+                self._last_subject_by_chat.pop(sender, None)
                 self._last_subject_by_chat[sender] = subject
+                reply_state_dirty = True
             if message_id:
+                self._last_message_id_by_chat.pop(sender, None)
                 self._last_message_id_by_chat[sender] = message_id
-            if subject or message_id:
-                self._persist_reply_state()
+                reply_state_dirty = True
 
             # Pre-LLM filter: if known_senders_file is configured, only
             # route emails from listed addresses to the agent.  Unknown
@@ -339,6 +345,12 @@ class EmailChannel(BaseChannel):
                 media=item.get("media") or None,
                 metadata=item.get("metadata", {}),
             )
+
+        # Persist once per batch (not per item) to keep disk I/O off the
+        # hot path, and run it on a worker thread so a slow disk does not
+        # stall the asyncio loop.
+        if reply_state_dirty:
+            await asyncio.to_thread(self._persist_reply_state)
 
     async def stop(self) -> None:
         """Stop polling loop."""

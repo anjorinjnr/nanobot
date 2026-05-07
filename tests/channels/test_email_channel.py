@@ -684,6 +684,42 @@ def test_reply_state_truncates_to_recent_entries(monkeypatch, tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_reply_state_lru_keeps_recently_active_sender(monkeypatch, tmp_path) -> None:
+    # Updating an existing sender right before truncation must keep them
+    # alive — plain dict assignment doesn't move the key, so the
+    # _fetch_and_dispatch loop pops+reinserts to refresh ordering.
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", str(tmp_path))
+    channel = EmailChannel(_make_config(), MessageBus())
+    cap = channel._REPLY_STATE_MAX_ENTRIES
+
+    # Seed an old sender, then fill the dict with newer ones.
+    inbound_alice = [{"sender": "alice@example.com", "subject": "first", "message_id": "<a1>", "content": "hi"}]
+    channel._fetch_new_messages = lambda: inbound_alice  # type: ignore[assignment]
+    channel._is_known_sender = lambda _s: False  # type: ignore[assignment]
+    await channel._fetch_and_dispatch()
+
+    for i in range(cap):
+        sender = f"u{i}@example.com"
+        channel._fetch_new_messages = lambda items=[{"sender": sender, "subject": "x", "message_id": "<x>", "content": "y"}]: items  # type: ignore[assignment]
+        await channel._fetch_and_dispatch()
+
+    # Right before alice would be evicted on the next insert, she emails
+    # again — that should bump her to the tail and protect her from the
+    # truncation that follows.
+    refreshed = [{"sender": "alice@example.com", "subject": "second", "message_id": "<a2>", "content": "hi again"}]
+    channel._fetch_new_messages = lambda: refreshed  # type: ignore[assignment]
+    await channel._fetch_and_dispatch()
+
+    # Push one more new sender past the cap to trigger eviction.
+    extra = [{"sender": "newcomer@example.com", "subject": "x", "message_id": "<n>", "content": "y"}]
+    channel._fetch_new_messages = lambda: extra  # type: ignore[assignment]
+    await channel._fetch_and_dispatch()
+
+    assert "alice@example.com" in channel._last_subject_by_chat
+    assert channel._last_subject_by_chat["alice@example.com"] == "second"
+
+
+@pytest.mark.asyncio
 async def test_send_reply_path_unchanged_by_allowlist(monkeypatch) -> None:
     # Empty outbound_allowlist must not regress the inbound→reply flow.
     instances = _install_fake_smtp(monkeypatch)
