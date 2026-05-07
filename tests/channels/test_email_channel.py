@@ -625,6 +625,136 @@ async def test_send_domain_pattern_rejects_confusable_suffix(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_send_allowlist_wildcard_permits_any_recipient(monkeypatch) -> None:
+    # ``*`` is the explicit allow-all sentinel — operator escape hatch
+    # for callers that want pre-PR behaviour back.
+    instances = _install_fake_smtp(monkeypatch)
+    cfg = _make_config()
+    cfg.outbound_allowlist = "*"
+    channel = EmailChannel(cfg, MessageBus())
+
+    await channel.send(
+        OutboundMessage(channel="email", chat_id="anyone@anywhere.org", content="x")
+    )
+
+    assert len(instances) == 1
+
+
+@pytest.mark.asyncio
+async def test_reply_state_survives_channel_restart(monkeypatch, tmp_path) -> None:
+    # Inbound→reply state is persisted so a container restart between an
+    # inbound arriving and the agent responding does not flip is_reply
+    # to False and trip the allowlist guard.
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", str(tmp_path))
+    instances = _install_fake_smtp(monkeypatch)
+
+    # First channel instance: seed the reply state the way
+    # _fetch_and_dispatch would, then go away.
+    channel1 = EmailChannel(_make_config(), MessageBus())
+    channel1._last_subject_by_chat["alice@example.com"] = "Original"
+    channel1._last_message_id_by_chat["alice@example.com"] = "<m1@example.com>"
+    channel1._persist_reply_state()
+
+    # New channel instance picks up where the old one left off.
+    channel2 = EmailChannel(_make_config(), MessageBus())
+    assert channel2._last_subject_by_chat.get("alice@example.com") == "Original"
+    assert channel2._last_message_id_by_chat.get("alice@example.com") == "<m1@example.com>"
+
+    # Empty outbound_allowlist: the reply still goes out because is_reply=True.
+    await channel2.send(
+        OutboundMessage(channel="email", chat_id="alice@example.com", content="reply")
+    )
+    assert len(instances) == 1
+    assert instances[0].sent_messages[0]["Subject"] == "Re: Original"
+
+
+def test_reply_state_truncates_to_recent_entries(monkeypatch, tmp_path) -> None:
+    # Long-running channel with many distinct senders should not let the
+    # JSON file grow without bound.
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", str(tmp_path))
+    channel = EmailChannel(_make_config(), MessageBus())
+    cap = channel._REPLY_STATE_MAX_ENTRIES
+    for i in range(cap + 50):
+        channel._last_subject_by_chat[f"u{i}@example.com"] = "subj"
+        channel._last_message_id_by_chat[f"u{i}@example.com"] = "<id>"
+    channel._persist_reply_state()
+    assert len(channel._last_subject_by_chat) == cap
+    assert "u0@example.com" not in channel._last_subject_by_chat
+    assert f"u{cap + 49}@example.com" in channel._last_subject_by_chat
+
+
+def test_reply_state_path_namespaced_per_imap_account(monkeypatch, tmp_path) -> None:
+    # Two channels with different IMAP accounts must not share state files.
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", str(tmp_path))
+    cfg_a = _make_config(imap_username="alice@example.com")
+    cfg_b = _make_config(imap_username="bob@example.com")
+    chan_a = EmailChannel(cfg_a, MessageBus())
+    chan_b = EmailChannel(cfg_b, MessageBus())
+    assert chan_a._reply_state_path != chan_b._reply_state_path
+    assert "alice" in chan_a._reply_state_path.name
+    assert "bob" in chan_b._reply_state_path.name
+
+
+@pytest.mark.asyncio
+async def test_reply_state_tracks_empty_subject_sender(monkeypatch, tmp_path) -> None:
+    # Empty subjects are valid email — the sender must still register
+    # for is_reply, and the message_id dict can't grow past the cap
+    # just because the subject was blank.
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", str(tmp_path))
+    instances = _install_fake_smtp(monkeypatch)
+    channel = EmailChannel(_make_config(), MessageBus())
+
+    inbound = [{"sender": "blank@example.com", "subject": "", "message_id": "<x>", "content": "hi"}]
+    channel._fetch_new_messages = lambda: inbound  # type: ignore[assignment]
+    channel._is_known_sender = lambda _s: False  # type: ignore[assignment]
+    await channel._fetch_and_dispatch()
+
+    assert "blank@example.com" in channel._last_subject_by_chat
+    assert channel._last_subject_by_chat["blank@example.com"] == ""
+    # is_reply must be True so the empty-allowlist guard does not drop the reply.
+    await channel.send(
+        OutboundMessage(channel="email", chat_id="blank@example.com", content="reply")
+    )
+    assert len(instances) == 1
+
+
+@pytest.mark.asyncio
+async def test_reply_state_lru_keeps_recently_active_sender(monkeypatch, tmp_path) -> None:
+    # Updating an existing sender right before truncation must keep them
+    # alive — plain dict assignment doesn't move the key, so the
+    # _fetch_and_dispatch loop pops+reinserts to refresh ordering.
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", str(tmp_path))
+    channel = EmailChannel(_make_config(), MessageBus())
+    cap = channel._REPLY_STATE_MAX_ENTRIES
+
+    # Seed an old sender, then fill the dict with newer ones.
+    inbound_alice = [{"sender": "alice@example.com", "subject": "first", "message_id": "<a1>", "content": "hi"}]
+    channel._fetch_new_messages = lambda: inbound_alice  # type: ignore[assignment]
+    channel._is_known_sender = lambda _s: False  # type: ignore[assignment]
+    await channel._fetch_and_dispatch()
+
+    for i in range(cap):
+        sender = f"u{i}@example.com"
+        channel._fetch_new_messages = lambda items=[{"sender": sender, "subject": "x", "message_id": "<x>", "content": "y"}]: items  # type: ignore[assignment]
+        await channel._fetch_and_dispatch()
+
+    # Right before alice would be evicted on the next insert, she emails
+    # again — that should bump her to the tail and protect her from the
+    # truncation that follows.
+    refreshed = [{"sender": "alice@example.com", "subject": "second", "message_id": "<a2>", "content": "hi again"}]
+    channel._fetch_new_messages = lambda: refreshed  # type: ignore[assignment]
+    await channel._fetch_and_dispatch()
+
+    # Push one more new sender past the cap to trigger eviction.
+    extra = [{"sender": "newcomer@example.com", "subject": "x", "message_id": "<n>", "content": "y"}]
+    channel._fetch_new_messages = lambda: extra  # type: ignore[assignment]
+    await channel._fetch_and_dispatch()
+
+    assert "alice@example.com" in channel._last_subject_by_chat
+    assert channel._last_subject_by_chat["alice@example.com"] == "second"
+
+
+@pytest.mark.asyncio
 async def test_send_reply_path_unchanged_by_allowlist(monkeypatch) -> None:
     # Empty outbound_allowlist must not regress the inbound→reply flow.
     instances = _install_fake_smtp(monkeypatch)

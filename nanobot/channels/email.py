@@ -11,6 +11,7 @@ import asyncio
 import base64
 import html
 import imaplib
+import json
 import os
 import pickle
 import re
@@ -32,7 +33,7 @@ from pydantic import Field
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.paths import get_media_dir
+from nanobot.config.paths import get_media_dir, get_persistent_data_dir
 from nanobot.config.schema import Base
 from nanobot.utils.helpers import safe_filename
 
@@ -152,8 +153,18 @@ class EmailChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: EmailConfig = config
         self._self_addresses = self._collect_self_addresses()
+        # Reply state is persisted across restarts (see _hydrate_reply_state) —
+        # without this, an inbound that arrives just before a container restart
+        # would be classified as "proactive" by the outbound_allowlist guard
+        # and dropped. Filename is namespaced by IMAP username so multiple
+        # email channels (e.g. personal + work) don't trample each other.
+        ident = self.config.imap_username or self.config.from_address or "default"
+        self._reply_state_path = (
+            get_persistent_data_dir() / f"email_reply_state_{safe_filename(ident)}.json"
+        )
         self._last_subject_by_chat: dict[str, str] = {}
         self._last_message_id_by_chat: dict[str, str] = {}
+        self._hydrate_reply_state()
         self._processed_uids: set[str] = set()  # Capped to prevent unbounded growth
         self._MAX_PROCESSED_UIDS = 100000
         self._oauth2_creds: Any = None  # Cached google.oauth2.credentials.Credentials
@@ -172,8 +183,79 @@ class EmailChannel(BaseChannel):
             pattern = entry.strip().lower()
             if not pattern:
                 continue
+            # ``*`` is the explicit allow-all sentinel — preferable to
+            # toggling the deny-by-default behaviour off via a separate
+            # flag, since operators see the intent in one place.
+            if pattern == "*":
+                out.append((False, "*"))
+                continue
             out.append((pattern.startswith("@"), pattern))
         return out
+
+    # Cap reply-state persistence so the JSON file can't grow without bound
+    # in the face of a long-lived spam stream.
+    _REPLY_STATE_MAX_ENTRIES = 500
+
+    def _hydrate_reply_state(self) -> None:
+        try:
+            data = json.loads(self._reply_state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Email channel: failed to load reply state from {}: {}",
+                self._reply_state_path, exc,
+            )
+            return
+        if not isinstance(data, dict):
+            return
+        for addr, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            subject = entry.get("subject")
+            message_id = entry.get("message_id")
+            # Empty strings are valid (see _fetch_and_dispatch) — preserve
+            # them on hydrate so is_reply stays correct after restart.
+            if isinstance(subject, str):
+                self._last_subject_by_chat[addr] = subject
+            if isinstance(message_id, str):
+                self._last_message_id_by_chat[addr] = message_id
+
+    def _trim_and_snapshot_reply_state(self) -> dict[str, dict[str, str]]:
+        """Trim in-memory state to the cap and return a serializable snapshot.
+
+        Runs on the asyncio loop (mutates instance dicts), so the
+        worker-thread writer only needs the snapshot — no shared state.
+        """
+        if len(self._last_subject_by_chat) > self._REPLY_STATE_MAX_ENTRIES:
+            keep = list(self._last_subject_by_chat)[-self._REPLY_STATE_MAX_ENTRIES:]
+            self._last_subject_by_chat = {k: self._last_subject_by_chat[k] for k in keep}
+            self._last_message_id_by_chat = {
+                k: v for k, v in self._last_message_id_by_chat.items() if k in self._last_subject_by_chat
+            }
+        merged: dict[str, dict[str, str]] = {}
+        for addr, subject in self._last_subject_by_chat.items():
+            merged[addr] = {"subject": subject}
+        for addr, mid in self._last_message_id_by_chat.items():
+            merged.setdefault(addr, {})["message_id"] = mid
+        return merged
+
+    def _write_reply_state(self, snapshot: dict[str, dict[str, str]]) -> None:
+        """Pure I/O — atomic write of the snapshot. Safe to run on a worker thread."""
+        try:
+            self._reply_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._reply_state_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(snapshot), encoding="utf-8")
+            tmp.replace(self._reply_state_path)
+        except OSError as exc:
+            logger.warning(
+                "Email channel: failed to persist reply state to {}: {}",
+                self._reply_state_path, exc,
+            )
+
+    def _persist_reply_state(self) -> None:
+        """Sync entry point used by tests; production uses the split form."""
+        self._write_reply_state(self._trim_and_snapshot_reply_state())
 
     async def start(self) -> None:
         """Start listening for inbound emails (IDLE or polling)."""
@@ -248,15 +330,24 @@ class EmailChannel(BaseChannel):
         logged to ``unknown_sender_log`` (if configured) and skipped.
         """
         inbound_items = await asyncio.to_thread(self._fetch_new_messages)
+        reply_state_dirty = False
         for item in inbound_items:
             sender = item["sender"]
             subject = item.get("subject", "")
             message_id = item.get("message_id", "")
 
-            if subject:
-                self._last_subject_by_chat[sender] = subject
-            if message_id:
-                self._last_message_id_by_chat[sender] = message_id
+            # Unconditionally track the sender — even an empty subject
+            # / message_id needs to participate in is_reply and LRU
+            # ordering, otherwise a stream of empty-subject emails can
+            # leak into _last_message_id_by_chat without being capped
+            # (the cap is keyed on the subject dict's size) and replies
+            # to those threads get misclassified as proactive sends.
+            # pop+reinsert keeps most-recent at the dict tail.
+            self._last_subject_by_chat.pop(sender, None)
+            self._last_subject_by_chat[sender] = subject
+            self._last_message_id_by_chat.pop(sender, None)
+            self._last_message_id_by_chat[sender] = message_id
+            reply_state_dirty = True
 
             # Pre-LLM filter: if known_senders_file is configured, only
             # route emails from listed addresses to the agent.  Unknown
@@ -272,6 +363,14 @@ class EmailChannel(BaseChannel):
                 media=item.get("media") or None,
                 metadata=item.get("metadata", {}),
             )
+
+        # Persist once per batch (not per item) to keep disk I/O off the
+        # hot path. Trim+snapshot runs here (asyncio loop, mutates instance
+        # state); the actual write goes to a worker thread on a snapshot
+        # so the worker never touches shared state.
+        if reply_state_dirty:
+            snapshot = self._trim_and_snapshot_reply_state()
+            await asyncio.to_thread(self._write_reply_state, snapshot)
 
     async def stop(self) -> None:
         """Stop polling loop."""
@@ -616,10 +715,15 @@ class EmailChannel(BaseChannel):
         """True if ``addr`` matches a pre-parsed allowlist entry.
 
         ``parseaddr`` strips display-name wrappers (``"Name <a@b>"``) so
-        callers don't have to.
+        callers don't have to. A bare ``*`` entry is the explicit
+        allow-all escape hatch.
         """
         if not self._outbound_allowlist:
             return False
+        # Wildcard short-circuit before parseaddr — even a malformed
+        # address should pass when the operator opted into allow-all.
+        if any(p == "*" for _, p in self._outbound_allowlist):
+            return True
         _, parsed = parseaddr(addr)
         normalized = parsed.strip().lower()
         if not normalized:
