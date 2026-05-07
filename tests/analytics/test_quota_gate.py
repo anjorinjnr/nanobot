@@ -390,7 +390,7 @@ def test_format_cap_hit_reply_one_day_says_tomorrow():
     out = format_cap_hit_reply(_iso_in_days(1.05))
     assert "tomorrow" in out
     assert "free Homer budget" in out
-    assert "https://homer.joybuild.ai/settings/ai-provider" in out
+    assert "https://homer.help/settings/ai-provider" in out
 
 
 def test_format_cap_hit_reply_three_days_says_on_weekday():
