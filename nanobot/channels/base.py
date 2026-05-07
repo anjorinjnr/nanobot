@@ -10,7 +10,10 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.scope_guard import check_inbound_suppressed
+from nanobot.channels.scope_guard import (
+    check_inbound_authorized,
+    check_inbound_suppressed,
+)
 
 
 class BaseChannel(ABC):
@@ -126,7 +129,17 @@ class BaseChannel(ABC):
         return bool(streaming) and type(self).send_delta is not BaseChannel.send_delta
 
     def is_allowed(self, sender_id: str) -> bool:
-        """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all."""
+        """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all.
+
+        Phase 2 ACL convergence: the host's scope lookup (when installed) is
+        consulted first — a household member or any sender with an active
+        scope is allowed even if their id isn't in the static ``allow_from``
+        list. The static list still serves as a fallback for bootstrap (the
+        primary user before any scope exists), wildcards, and vanilla nanobot
+        (no lookup).
+        """
+        if check_inbound_authorized(self.name, str(sender_id)):
+            return True
         if isinstance(self.config, dict):
             if "allow_from" in self.config:
                 allow_list = self.config.get("allow_from")

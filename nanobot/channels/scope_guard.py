@@ -117,3 +117,29 @@ def check_inbound_suppressed(channel: str, sender_id: str) -> bool:
     except Exception:
         return False
     return result.authorized and result.suppress_inbound
+
+
+def check_inbound_authorized(channel: str, sender_id: str) -> bool:
+    """Return True if inbound from this sender is authorized by the host's scope lookup.
+
+    Used by ``BaseChannel.is_allowed`` to consult the same source of truth that
+    governs outbound. The intent is to retire the static ``allow_from`` config
+    list as the canonical inbound ACL — once every legitimate sender has a
+    scope, ``allow_from`` becomes a bootstrap-only fallback.
+
+    Returns ``False`` when:
+      - no lookup is installed (vanilla nanobot — let the static check decide),
+      - the lookup raises (fail closed for inbound; loud log so we notice).
+    """
+    fn = _lookup
+    if fn is None:
+        return False
+    try:
+        result = fn(channel, sender_id)
+    except Exception as e:
+        logger.warning(
+            "scope_guard: inbound lookup failed for {}:{} ({}: {}); deferring to static allow_from",
+            channel, sender_id, type(e).__name__, e,
+        )
+        return False
+    return result.authorized
