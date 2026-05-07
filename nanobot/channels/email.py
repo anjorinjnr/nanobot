@@ -71,6 +71,16 @@ class EmailConfig(Base):
     max_body_chars: int = 12000
     subject_prefix: str = "Re: "
     allow_from: list[str] = Field(default_factory=list)
+    # Outbound proactive-send allowlist. Comma-separated literal addresses
+    # (case-insensitive) and/or @domain patterns (e.g. "@example.com").
+    # Replies to recipients who have emailed in (tracked in
+    # ``_last_subject_by_chat``) and messages with metadata.force_send=True
+    # are always permitted. Everything else is dropped with a warning when
+    # the recipient does not match this list. Empty (the default) means
+    # proactive outbound is fully denied — only replies and explicit
+    # force_send go out. This is the operator's kill-switch independent of
+    # whatever an LLM tool call requests.
+    outbound_allowlist: str = ""
     # Pre-LLM sender filter: only route emails from known senders to the
     # agent.  Unknown senders are logged (no LLM cost).
     # Path to a JSON file listing known email addresses (e.g. household +
@@ -277,6 +287,18 @@ class EmailChannel(BaseChannel):
         # autoReplyEnabled only controls automatic replies, not proactive sends
         if is_reply and not self.config.auto_reply_enabled and not force_send:
             logger.info("Skip automatic email reply to {}: auto_reply_enabled is false", to_addr)
+            return
+
+        # Proactive sends (not replies, no force_send) require an explicit
+        # allowlist match — the operator's kill-switch against rogue LLM
+        # tool calls and any future code path that bypasses heartbeat-level
+        # routing checks. Replies and force_send keep the existing behaviour.
+        if not is_reply and not force_send and not self._matches_outbound_allowlist(to_addr):
+            logger.warning(
+                "Refusing proactive email to {}: not a reply, no force_send, "
+                "not in outbound_allowlist",
+                to_addr,
+            )
             return
 
         base_subject = self._last_subject_by_chat.get(to_addr, "nanobot reply")
@@ -574,6 +596,34 @@ class EmailChannel(BaseChannel):
     # ------------------------------------------------------------------
     # Known-sender pre-filter
     # ------------------------------------------------------------------
+
+    def _matches_outbound_allowlist(self, addr: str) -> bool:
+        """True if ``addr`` matches an entry in ``outbound_allowlist``.
+
+        Patterns are comma-separated, case-insensitive. Each entry is
+        either a full address (``user@example.com``) or a domain prefix
+        (``@example.com``, matching any local-part). Empty allowlist
+        matches nothing — the deny-by-default contract on proactive
+        sends. Mirrors the syntax of Homer's ``HOMER_INTERNAL_EMAILS``
+        so operators can reuse the same mental model.
+        """
+        raw = (self.config.outbound_allowlist or "").strip()
+        if not raw:
+            return False
+        _, parsed = parseaddr(addr)
+        normalized = parsed.strip().lower()
+        if not normalized:
+            return False
+        for entry in raw.split(","):
+            pattern = entry.strip().lower()
+            if not pattern:
+                continue
+            if pattern.startswith("@"):
+                if normalized.endswith(pattern):
+                    return True
+            elif normalized == pattern:
+                return True
+        return False
 
     def _is_known_sender(self, sender: str) -> bool:
         """Check if sender is in the known-senders list.
