@@ -261,6 +261,41 @@ async def test_per_config_state_isolation(tmp_path, monkeypatch):
         config_loader.set_config_path(None)  # type: ignore[arg-type]
 
 
+def test_override_path_namespaces_by_config_stem(tmp_path, monkeypatch):
+    """When HOMER_ANALYTICS_STATE_DIR is set, the override must still
+    namespace by config stem so main and guest don't clobber each other.
+
+    Regression: prior to fix, the override path returned
+    `<override>/seen_users.json` directly — both processes wrote to the
+    same file, doubling user_onboarded fires per onboarded user.
+    """
+    from nanobot.analytics.hook import _resolve_state_path
+    from nanobot.config import loader as config_loader
+
+    state_dir = tmp_path / "persisted"
+    main_config = tmp_path / "config.json"
+    guest_config = tmp_path / "guest_config.json"
+    main_config.write_text("{}")
+    guest_config.write_text("{}")
+
+    monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(state_dir))
+
+    try:
+        config_loader.set_config_path(main_config)
+        main_path = _resolve_state_path()
+
+        config_loader.set_config_path(guest_config)
+        guest_path = _resolve_state_path()
+
+        assert main_path is not None and guest_path is not None
+        assert main_path != guest_path
+        # Both must live under the override root, namespaced by stem.
+        assert main_path == state_dir / "config" / "seen_users.json"
+        assert guest_path == state_dir / "guest_config" / "seen_users.json"
+    finally:
+        config_loader.set_config_path(None)  # type: ignore[arg-type]
+
+
 # ── canonical identity migration ─────────────────────────────────────────
 
 

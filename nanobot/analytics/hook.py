@@ -46,24 +46,39 @@ def _resolve_state_path() -> Path | None:
     config filename's stem so they don't race on a shared state file —
     e.g. `~/.nanobot/analytics/config/seen_users.json` for main,
     `~/.nanobot/analytics/guest_config/seen_users.json` for guest.
+
+    The ``HOMER_ANALYTICS_STATE_DIR`` env var redirects the parent dir
+    (typically to a persisted volume in container deployments). When the
+    nanobot config is loaded, we still namespace by config stem under the
+    override so main and guest don't clobber each other. Without a loaded
+    config (CLI / test scaffolding), the override dir is used directly.
     """
+    config_stem: str | None = None
+    try:
+        from nanobot.config.loader import get_config_path
+        config_stem = get_config_path().stem
+    except (ImportError, RuntimeError):
+        config_stem = None
+
     override = os.environ.get("HOMER_ANALYTICS_STATE_DIR", "").strip()
     if override:
+        base = Path(override).expanduser()
+        subdir = base / config_stem if config_stem else base
         try:
-            path = Path(override).expanduser()
-            path.mkdir(parents=True, exist_ok=True)
-            return path / _STATE_FILENAME
+            subdir.mkdir(parents=True, exist_ok=True)
+            return subdir / _STATE_FILENAME
         except OSError:
             logger.debug("HOMER_ANALYTICS_STATE_DIR unwritable: %s", override)
             return None
+
+    if config_stem is None:
+        return None
     try:
-        from nanobot.config.loader import get_config_path
         from nanobot.config.paths import get_runtime_subdir
-        subdir = get_runtime_subdir("analytics") / get_config_path().stem
+        subdir = get_runtime_subdir("analytics") / config_stem
         subdir.mkdir(parents=True, exist_ok=True)
         return subdir / _STATE_FILENAME
     except (ImportError, RuntimeError, OSError):
-        # No config loaded yet — defer persistence to a later call.
         return None
 
 
@@ -95,7 +110,10 @@ class AnalyticsHook:
         """Load seen_users and first_user_ts from disk. Safe on every call."""
         if self._state_loaded:
             return
-        self._state_path = _resolve_state_path()
+        # Respect a pre-set state path (test fixtures, future explicit
+        # callers); resolve from env / config only when nothing is set.
+        if self._state_path is None:
+            self._state_path = _resolve_state_path()
         if self._state_path is None:
             self._state_loaded = True
             return
