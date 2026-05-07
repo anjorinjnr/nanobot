@@ -625,6 +625,65 @@ async def test_send_domain_pattern_rejects_confusable_suffix(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_send_allowlist_wildcard_permits_any_recipient(monkeypatch) -> None:
+    # ``*`` is the explicit allow-all sentinel — operator escape hatch
+    # for callers that want pre-PR behaviour back.
+    instances = _install_fake_smtp(monkeypatch)
+    cfg = _make_config()
+    cfg.outbound_allowlist = "*"
+    channel = EmailChannel(cfg, MessageBus())
+
+    await channel.send(
+        OutboundMessage(channel="email", chat_id="anyone@anywhere.org", content="x")
+    )
+
+    assert len(instances) == 1
+
+
+@pytest.mark.asyncio
+async def test_reply_state_survives_channel_restart(monkeypatch, tmp_path) -> None:
+    # Inbound→reply state is persisted so a container restart between an
+    # inbound arriving and the agent responding does not flip is_reply
+    # to False and trip the allowlist guard.
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", str(tmp_path))
+    instances = _install_fake_smtp(monkeypatch)
+
+    # First channel instance: seed the reply state the way
+    # _fetch_and_dispatch would, then go away.
+    channel1 = EmailChannel(_make_config(), MessageBus())
+    channel1._last_subject_by_chat["alice@example.com"] = "Original"
+    channel1._last_message_id_by_chat["alice@example.com"] = "<m1@example.com>"
+    channel1._persist_reply_state()
+
+    # New channel instance picks up where the old one left off.
+    channel2 = EmailChannel(_make_config(), MessageBus())
+    assert channel2._last_subject_by_chat.get("alice@example.com") == "Original"
+    assert channel2._last_message_id_by_chat.get("alice@example.com") == "<m1@example.com>"
+
+    # Empty outbound_allowlist: the reply still goes out because is_reply=True.
+    await channel2.send(
+        OutboundMessage(channel="email", chat_id="alice@example.com", content="reply")
+    )
+    assert len(instances) == 1
+    assert instances[0].sent_messages[0]["Subject"] == "Re: Original"
+
+
+def test_reply_state_truncates_to_recent_entries(monkeypatch, tmp_path) -> None:
+    # Long-running channel with many distinct senders should not let the
+    # JSON file grow without bound.
+    monkeypatch.setenv("NANOBOT_PERSISTENT_DATA_DIR", str(tmp_path))
+    channel = EmailChannel(_make_config(), MessageBus())
+    cap = channel._REPLY_STATE_MAX_ENTRIES
+    for i in range(cap + 50):
+        channel._last_subject_by_chat[f"u{i}@example.com"] = "subj"
+        channel._last_message_id_by_chat[f"u{i}@example.com"] = "<id>"
+    channel._persist_reply_state()
+    assert len(channel._last_subject_by_chat) == cap
+    assert "u0@example.com" not in channel._last_subject_by_chat
+    assert f"u{cap + 49}@example.com" in channel._last_subject_by_chat
+
+
+@pytest.mark.asyncio
 async def test_send_reply_path_unchanged_by_allowlist(monkeypatch) -> None:
     # Empty outbound_allowlist must not regress the inbound→reply flow.
     instances = _install_fake_smtp(monkeypatch)

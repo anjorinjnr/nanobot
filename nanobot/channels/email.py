@@ -11,6 +11,7 @@ import asyncio
 import base64
 import html
 import imaplib
+import json
 import os
 import pickle
 import re
@@ -32,7 +33,7 @@ from pydantic import Field
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.paths import get_media_dir
+from nanobot.config.paths import get_media_dir, get_persistent_data_dir
 from nanobot.config.schema import Base
 from nanobot.utils.helpers import safe_filename
 
@@ -152,8 +153,14 @@ class EmailChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: EmailConfig = config
         self._self_addresses = self._collect_self_addresses()
+        # Reply state is persisted across restarts (see _hydrate_reply_state) —
+        # without this, an inbound that arrives just before a container restart
+        # would be classified as "proactive" by the outbound_allowlist guard
+        # and dropped.
+        self._reply_state_path = get_persistent_data_dir() / "email_reply_state.json"
         self._last_subject_by_chat: dict[str, str] = {}
         self._last_message_id_by_chat: dict[str, str] = {}
+        self._hydrate_reply_state()
         self._processed_uids: set[str] = set()  # Capped to prevent unbounded growth
         self._MAX_PROCESSED_UIDS = 100000
         self._oauth2_creds: Any = None  # Cached google.oauth2.credentials.Credentials
@@ -172,8 +179,66 @@ class EmailChannel(BaseChannel):
             pattern = entry.strip().lower()
             if not pattern:
                 continue
+            # ``*`` is the explicit allow-all sentinel — preferable to
+            # toggling the deny-by-default behaviour off via a separate
+            # flag, since operators see the intent in one place.
+            if pattern == "*":
+                out.append((False, "*"))
+                continue
             out.append((pattern.startswith("@"), pattern))
         return out
+
+    # Cap reply-state persistence so the JSON file can't grow without bound
+    # in the face of a long-lived spam stream.
+    _REPLY_STATE_MAX_ENTRIES = 500
+
+    def _hydrate_reply_state(self) -> None:
+        try:
+            data = json.loads(self._reply_state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Email channel: failed to load reply state from {}: {}",
+                self._reply_state_path, exc,
+            )
+            return
+        if not isinstance(data, dict):
+            return
+        for addr, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            subject = entry.get("subject")
+            message_id = entry.get("message_id")
+            if isinstance(subject, str) and subject:
+                self._last_subject_by_chat[addr] = subject
+            if isinstance(message_id, str) and message_id:
+                self._last_message_id_by_chat[addr] = message_id
+
+    def _persist_reply_state(self) -> None:
+        # Trim to the most-recent N senders. dict preserves insertion
+        # order, so the tail is what we just touched.
+        if len(self._last_subject_by_chat) > self._REPLY_STATE_MAX_ENTRIES:
+            keep = list(self._last_subject_by_chat)[-self._REPLY_STATE_MAX_ENTRIES:]
+            self._last_subject_by_chat = {k: self._last_subject_by_chat[k] for k in keep}
+            self._last_message_id_by_chat = {
+                k: v for k, v in self._last_message_id_by_chat.items() if k in self._last_subject_by_chat
+            }
+        merged: dict[str, dict[str, str]] = {}
+        for addr, subject in self._last_subject_by_chat.items():
+            merged[addr] = {"subject": subject}
+        for addr, mid in self._last_message_id_by_chat.items():
+            merged.setdefault(addr, {})["message_id"] = mid
+        try:
+            self._reply_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._reply_state_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(merged), encoding="utf-8")
+            tmp.replace(self._reply_state_path)
+        except OSError as exc:
+            logger.warning(
+                "Email channel: failed to persist reply state to {}: {}",
+                self._reply_state_path, exc,
+            )
 
     async def start(self) -> None:
         """Start listening for inbound emails (IDLE or polling)."""
@@ -257,6 +322,8 @@ class EmailChannel(BaseChannel):
                 self._last_subject_by_chat[sender] = subject
             if message_id:
                 self._last_message_id_by_chat[sender] = message_id
+            if subject or message_id:
+                self._persist_reply_state()
 
             # Pre-LLM filter: if known_senders_file is configured, only
             # route emails from listed addresses to the agent.  Unknown
@@ -616,10 +683,15 @@ class EmailChannel(BaseChannel):
         """True if ``addr`` matches a pre-parsed allowlist entry.
 
         ``parseaddr`` strips display-name wrappers (``"Name <a@b>"``) so
-        callers don't have to.
+        callers don't have to. A bare ``*`` entry is the explicit
+        allow-all escape hatch.
         """
         if not self._outbound_allowlist:
             return False
+        # Wildcard short-circuit before parseaddr — even a malformed
+        # address should pass when the operator opted into allow-all.
+        if any(p == "*" for _, p in self._outbound_allowlist):
+            return True
         _, parsed = parseaddr(addr)
         normalized = parsed.strip().lower()
         if not normalized:
