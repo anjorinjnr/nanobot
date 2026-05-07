@@ -511,3 +511,76 @@ def test_capture_helper_no_op_when_uninitialized():
     hook.capture("custom_event", {"k": "v"})
     # No client was assigned, so nothing to assert beyond "no crash".
     assert hook._client is None
+
+
+# ── agent_initiated_action ───────────────────────────────────────────────
+
+
+def test_agent_initiated_action_fires_with_outbound(tmp_path, monkeypatch):
+    """A heartbeat tick that produces a non-empty response should emit
+    agent_initiated_action with had_outbound=True and the right trigger."""
+    monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(tmp_path))
+    hook = _make_hook(tmp_path)
+    hook.track_agent_initiated_action(
+        trigger_kind="heartbeat",
+        response_content="Morning briefing: 3 items",
+        tools_used=["calendar_fetch", "message"],
+        latency_ms=1234,
+    )
+    events = _captured_events(hook._client, "agent_initiated_action")
+    assert len(events) == 1
+    props = events[0]
+    assert props["trigger_kind"] == "heartbeat"
+    assert props["had_outbound"] is True
+    assert props["latency_ms"] == 1234
+    assert props["tool_calls_count"] == 2
+    assert props["tools_used"] == ["calendar_fetch", "message"]
+    assert props["response_length"] == len("Morning briefing: 3 items")
+    assert props["household_id"] == "hh-1"
+
+
+def test_agent_initiated_action_marks_message_tool_as_outbound(tmp_path, monkeypatch):
+    """Empty final_content but the agent invoked the message tool — count
+    that as had_outbound=True (the user-visible work went via MessageTool)."""
+    monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(tmp_path))
+    hook = _make_hook(tmp_path)
+    hook.track_agent_initiated_action(
+        trigger_kind="heartbeat",
+        response_content=None,
+        tools_used=["message"],
+        latency_ms=500,
+    )
+    [props] = _captured_events(hook._client, "agent_initiated_action")
+    assert props["had_outbound"] is True
+    assert props["response_length"] == 0
+
+
+def test_agent_initiated_action_silent_tick(tmp_path, monkeypatch):
+    """A heartbeat that did nothing useful (no response, no message tool)
+    still fires the event with had_outbound=False — gives us a count of
+    raw heartbeat activity for ops dashboards."""
+    monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(tmp_path))
+    hook = _make_hook(tmp_path)
+    hook.track_agent_initiated_action(
+        trigger_kind="heartbeat",
+        response_content=None,
+        tools_used=[],
+        latency_ms=42,
+    )
+    [props] = _captured_events(hook._client, "agent_initiated_action")
+    assert props["had_outbound"] is False
+    assert props["tool_calls_count"] == 0
+
+
+def test_agent_initiated_action_skipped_without_household(tmp_path, monkeypatch):
+    """No household_id → can't tag the event to a tenant; skip rather than
+    creating an orphan distinct_id that collapses every tenant together."""
+    monkeypatch.setenv("HOMER_ANALYTICS_STATE_DIR", str(tmp_path))
+    hook = _make_hook(tmp_path, household_id="")
+    hook.track_agent_initiated_action(
+        trigger_kind="cron",
+        response_content="anything",
+        tools_used=[],
+        latency_ms=10,
+    )
+    assert _captured_events(hook._client, "agent_initiated_action") == []

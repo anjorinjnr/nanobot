@@ -757,6 +757,7 @@ def _run_gateway(
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to or "direct",
                     is_synthetic=True,
+                    trigger_kind="cron",
                     on_progress=_silent,
                 )
         finally:
@@ -842,6 +843,7 @@ def _run_gateway(
             on_progress=_silent,
             model_override=model_override,
             is_synthetic=True,
+            trigger_kind="heartbeat",
         )
 
         session = agent.sessions.get_or_create("heartbeat")
