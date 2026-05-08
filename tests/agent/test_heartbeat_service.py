@@ -1738,3 +1738,246 @@ class TestFilterHeartbeatResponse:
         assert any("silent turn (by design)" in m for m in messages)
         # Empty-final is worth seeing in default logs — logged as "suppressed empty response"
         assert any("suppressed empty response" in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# Stable task IDs (Id: t_xxxxxxxx) — pairs with homer's tasks_update.py PR
+# ---------------------------------------------------------------------------
+
+def test_compute_due_tasks_carries_id_when_present() -> None:
+    """DueTask carries id from a block with `Id: t_xxxxxxxx`."""
+    now = datetime(2026, 5, 8, 9, 0)
+    content = _make_heartbeat(
+        "\n### Remind: Piedmont doctor appointment\n"
+        "Id: t_a2b3c4d5\n"
+        "Schedule: 2026-05-08 09:00\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now)
+    assert len(due) == 1
+    assert due[0].id == "t_a2b3c4d5"
+
+
+def test_compute_due_tasks_id_none_for_legacy_block() -> None:
+    """Backward compat: blocks without Id line yield id=None."""
+    now = datetime(2026, 5, 8, 9, 0)
+    content = _make_heartbeat(
+        "\n### Legacy reminder\n"
+        "Schedule: 2026-05-08 09:00\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now)
+    assert len(due) == 1
+    assert due[0].id is None
+
+
+def test_compute_due_tasks_rejects_malformed_id() -> None:
+    """Id values that don't match t_<8 base32 chars> are ignored (id=None)."""
+    now = datetime(2026, 5, 8, 9, 0)
+    content = _make_heartbeat(
+        "\n### Malformed id\n"
+        "Id: not-a-real-id\n"
+        "Schedule: 2026-05-08 09:00\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now)
+    assert len(due) == 1
+    assert due[0].id is None
+
+
+def test_compute_task_statuses_includes_id_when_present() -> None:
+    """Status string surfaces [id=t_xxx] so the LLM can pass it to tasks_update.py."""
+    now = datetime(2026, 5, 8, 9, 0)
+    content = _make_heartbeat(
+        "\n### Remind: Piedmont doctor appointment\n"
+        "Id: t_a2b3c4d5\n"
+        "Schedule: 2026-05-08 09:00\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    status = HeartbeatService._compute_task_statuses(content, now)
+    assert "[id=t_a2b3c4d5]" in status
+    assert "IS DUE NOW" in status
+    # Instruction text steers the LLM toward id-based ticking — phrased
+    # generically (no Homer-specific tool name).
+    assert "id=" in status
+    assert "task management tool" in status
+    assert "tasks_update.py" not in status
+
+
+def test_compute_task_statuses_omits_id_chunk_for_legacy_block() -> None:
+    """Legacy blocks (no Id) produce a status line without `[id=...]`."""
+    now = datetime(2026, 5, 8, 9, 0)
+    content = _make_heartbeat(
+        "\n### Legacy reminder\n"
+        "Schedule: 2026-05-08 09:00\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    status = HeartbeatService._compute_task_statuses(content, now)
+    assert "[id=" not in status
+    assert "[id=None]" not in status
+    assert "Legacy reminder" in status
+
+
+def test_advance_schedules_finds_block_by_id_when_name_wrong(advance_service) -> None:
+    """The Piedmont scenario: LLM calls --tick with a hallucinated title.
+    The id lookup must still find the right block. This is the core bug fix."""
+    now = datetime(2026, 5, 8, 9, 0)
+    heartbeat = _make_heartbeat(
+        "\n### Remind: Piedmont doctor appointment\n"
+        "Id: t_a2b3c4d5\n"
+        "Schedule: 2026-05-08 08:00\n"
+        "Recur: every 1 day\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    service = advance_service(heartbeat)
+    # LLM-augmented name that won't substring-match the real heading.
+    tasks = [DueTask(
+        name="Remind: Piedmont doctor appointment today at 9:00 AM",
+        task_type="reminder",
+        schedule="2026-05-08 08:00",
+        id="t_a2b3c4d5",
+    )]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    assert "Schedule: 2026-05-09 08:00" in updated
+    assert "Last-run: 2026-05-08 09:00" in updated
+    # Id line must survive the rewrite.
+    assert "Id: t_a2b3c4d5" in updated
+
+
+def test_advance_schedules_falls_back_to_name_match_when_id_missing(advance_service) -> None:
+    """Legacy block path: when id is None, name-based regex still works."""
+    now = datetime(2026, 3, 12, 10, 30)
+    heartbeat = _make_heartbeat(
+        "\n### Gmail scan\n"
+        "Type: system\n"
+        "Schedule: 2026-03-12 09:00\n"
+        "Recur: every 1 hour\n"
+    )
+    service = advance_service(heartbeat)
+    tasks = [DueTask(
+        name="Gmail scan", task_type="system",
+        schedule="2026-03-12 09:00", id=None,
+    )]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    assert "Schedule: 2026-03-12 11:00" in updated
+
+
+def test_advance_schedules_two_blocks_same_title_different_ids(advance_service) -> None:
+    """Regression: two reminders with identical titles but distinct ids
+    must advance independently. This is the Piedmont scenario at scale —
+    two pending reminders for the same recurring event."""
+    now = datetime(2026, 5, 8, 9, 0)
+    heartbeat = _make_heartbeat(
+        "\n### Remind: Piedmont visit\n"
+        "Id: t_aaaaaaaa\n"
+        "Schedule: 2026-05-08 08:00\n"
+        "Recur: every 1 day\n"
+        "Recipients: primary:whatsapp\n"
+        "\n### Remind: Piedmont visit\n"
+        "Id: t_bbbbbbbb\n"
+        "Schedule: 2026-05-08 08:30\n"
+        "Recur: every 2 days\n"
+        "Recipients: primary:whatsapp\n"
+    )
+    service = advance_service(heartbeat)
+    # Only tick the first one — the second must remain at its original schedule.
+    tasks = [DueTask(
+        name="Remind: Piedmont visit", task_type="reminder",
+        schedule="2026-05-08 08:00", id="t_aaaaaaaa",
+    )]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    # First block (t_aaaaaaaa) advanced; second (t_bbbbbbbb) untouched.
+    block_a = updated.split("Id: t_aaaaaaaa")[1].split("###")[0]
+    block_b = updated.split("Id: t_bbbbbbbb")[1].split("##")[0]
+    assert "Schedule: 2026-05-09 08:00" in block_a
+    assert "Last-run: 2026-05-08 09:00" in block_a
+    assert "Schedule: 2026-05-08 08:30" in block_b
+    assert "Last-run:" not in block_b
+
+
+def test_advance_schedules_finds_block_in_section_between_user_tasks_and_completed(
+    advance_service,
+) -> None:
+    """Regression: a downstream user (or future Homer template) may insert
+    an extra section like ## System Tasks between ## User Tasks and ##
+    Completed. The id-based block lookup must still find blocks in those
+    intermediate sections — anything before ## Completed is in scope."""
+    now = datetime(2026, 5, 8, 9, 0)
+    # Hand-build the heartbeat to interleave a System Tasks section
+    # between ## User Tasks and ## Completed.
+    content = (
+        "# Heartbeat Tasks\n"
+        "\n"
+        "## Announcements\n"
+        "\n"
+        "## User Tasks\n"
+        "\n### Some user task\n"
+        "Id: t_userrrrr\n"
+        "Schedule: 2026-06-01 08:00\n"
+        "Recur: every 1 day\n"
+        "\n"
+        "## System Tasks\n"
+        "\n### Nightly cleanup\n"
+        "Id: t_systemmm\n"
+        "Schedule: 2026-05-08 08:00\n"
+        "Recur: every 1 day\n"
+        "\n"
+        "## Completed\n"
+    )
+    service = advance_service(content)
+
+    tasks = [DueTask(
+        name="Nightly cleanup", task_type="system",
+        schedule="2026-05-08 08:00", id="t_systemmm",
+    )]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    # The System Tasks block must have been found and rewritten.
+    assert "Schedule: 2026-05-09 08:00" in updated
+    assert "Last-run: 2026-05-08 09:00" in updated
+    # The User Tasks block (untouched task) must still have its original schedule.
+    assert "Schedule: 2026-06-01 08:00" in updated
+    # Section structure preserved.
+    assert "## System Tasks" in updated
+    assert "## Completed" in updated
+
+
+def test_advance_schedules_id_lookup_logs_id_on_miss(advance_service, caplog) -> None:
+    """When the block is gone (e.g. --complete already ran), the warning
+    line must include the id alongside the name for debuggability."""
+    import logging
+    from loguru import logger as loguru_logger
+
+    now = datetime(2026, 5, 8, 9, 0)
+    # No matching block in HEARTBEAT.md — task was already removed.
+    heartbeat = _make_heartbeat("\n### Other task\nSchedule: 2026-05-08 09:00\nRecur: every 1 day\n")
+    service = advance_service(heartbeat)
+    tasks = [DueTask(
+        name="Vanished task", task_type="reminder",
+        schedule="2026-05-08 08:00", id="t_deadbeef",
+    )]
+
+    handler_id = loguru_logger.add(caplog.handler, level="DEBUG", format="{message}")
+    try:
+        with caplog.at_level(logging.DEBUG), _fixed_now(now):
+            service._advance_schedules(tasks)
+    finally:
+        loguru_logger.remove(handler_id)
+
+    messages = [rec.message for rec in caplog.records]
+    assert any("Vanished task" in m and "t_deadbeef" in m for m in messages)
