@@ -83,7 +83,7 @@ def _request_quota(
 _CAP_HIT_TEMPLATE = (
     "You've used this week's free Homer budget 🏠 It resets {friendly_reset}.\n"
     "To keep going now, add your own AI provider key — settings:\n"
-    "https://homer.joybuild.ai/settings/ai-provider"
+    "https://homer.help/settings/ai-provider"
 )
 
 WARN_APPENDIX = (
