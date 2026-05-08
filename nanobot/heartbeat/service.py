@@ -408,9 +408,9 @@ class HeartbeatService:
 
         return (
             "Python-computed task due status (authoritative — trust this over "
-            "your own date math). When ticking or completing a task, pass the "
-            "`id=` value (e.g. `t_a2b3c4d5`) to tasks_update.py, not the title "
-            "— matching by title breaks if you paraphrase it:\n"
+            "your own date math). When ticking or completing a task via your "
+            "task management tool, pass the `id=` value (e.g. `t_a2b3c4d5`) "
+            "— not the title (matching by title breaks if you paraphrase it):\n"
             + "\n".join(lines)
         )
 
@@ -608,13 +608,15 @@ class HeartbeatService:
             # Recompute section bounds each iteration: a previous task in
             # this loop may have mutated content (Schedule/Last-run rewrite),
             # which shifts offsets within the file.
-            user_match = re.search(r"^## User Tasks\s*$", content, re.MULTILINE)
-            if user_match:
-                section_start = user_match.end()
-                next_sec = re.search(r"^## ", content[section_start:], re.MULTILINE)
-                section_end = section_start + next_sec.start() if next_sec else len(content)
-            else:
-                section_start, section_end = 0, len(content)
+            #
+            # Scope: everything up to ## Completed (exclusive). The only
+            # section we MUST exclude is Completed — a task re-added after
+            # being ticked could share an Id with a leftover entry there.
+            # Including any other intermediate sections (e.g. ## System
+            # Tasks) is safe because Ids are unique per active block.
+            completed_match = re.search(r"^## Completed\s*$", content, re.MULTILINE)
+            section_start = 0
+            section_end = completed_match.start() if completed_match else len(content)
 
             # Resolve the block as (block_start, block_end) within content.
             # Prefer id-based lookup — it survives LLM-paraphrased task names
@@ -629,12 +631,17 @@ class HeartbeatService:
                 )
                 id_m = id_line_pat.search(content, section_start, section_end)
                 if id_m:
+                    # Constrain walk-back to the enclosing ## section so
+                    # we don't latch onto a `### ` heading from a previous
+                    # section (e.g. preamble notes above ## User Tasks).
+                    sec_nl = content.rfind("\n## ", section_start, id_m.start())
+                    walk_start = sec_nl + 1 if sec_nl != -1 else section_start
                     # Walk back to the enclosing `### ` heading.
-                    nl = content.rfind("\n### ", section_start, id_m.start())
+                    nl = content.rfind("\n### ", walk_start, id_m.start())
                     if nl != -1:
                         block_start = nl + 1  # skip the leading newline
-                    elif content.startswith("### ", section_start):
-                        block_start = section_start
+                    elif content.startswith("### ", walk_start):
+                        block_start = walk_start
                     if block_start != -1:
                         rest = content[block_start:section_end]
                         end_m = re.search(r"\n###\s|\n##\s", rest)

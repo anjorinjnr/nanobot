@@ -1797,8 +1797,11 @@ def test_compute_task_statuses_includes_id_when_present() -> None:
     status = HeartbeatService._compute_task_statuses(content, now)
     assert "[id=t_a2b3c4d5]" in status
     assert "IS DUE NOW" in status
-    # Instruction text steers the LLM toward id-based ticking.
-    assert "id=" in status and "tasks_update.py" in status
+    # Instruction text steers the LLM toward id-based ticking — phrased
+    # generically (no Homer-specific tool name).
+    assert "id=" in status
+    assert "task management tool" in status
+    assert "tasks_update.py" not in status
 
 
 def test_compute_task_statuses_omits_id_chunk_for_legacy_block() -> None:
@@ -1902,6 +1905,56 @@ def test_advance_schedules_two_blocks_same_title_different_ids(advance_service) 
     assert "Last-run: 2026-05-08 09:00" in block_a
     assert "Schedule: 2026-05-08 08:30" in block_b
     assert "Last-run:" not in block_b
+
+
+def test_advance_schedules_finds_block_in_section_between_user_tasks_and_completed(
+    advance_service,
+) -> None:
+    """Regression: a downstream user (or future Homer template) may insert
+    an extra section like ## System Tasks between ## User Tasks and ##
+    Completed. The id-based block lookup must still find blocks in those
+    intermediate sections — anything before ## Completed is in scope."""
+    now = datetime(2026, 5, 8, 9, 0)
+    # Hand-build the heartbeat to interleave a System Tasks section
+    # between ## User Tasks and ## Completed.
+    content = (
+        "# Heartbeat Tasks\n"
+        "\n"
+        "## Announcements\n"
+        "\n"
+        "## User Tasks\n"
+        "\n### Some user task\n"
+        "Id: t_userrrrr\n"
+        "Schedule: 2026-06-01 08:00\n"
+        "Recur: every 1 day\n"
+        "\n"
+        "## System Tasks\n"
+        "\n### Nightly cleanup\n"
+        "Id: t_systemmm\n"
+        "Schedule: 2026-05-08 08:00\n"
+        "Recur: every 1 day\n"
+        "\n"
+        "## Completed\n"
+    )
+    service = advance_service(content)
+
+    tasks = [DueTask(
+        name="Nightly cleanup", task_type="system",
+        schedule="2026-05-08 08:00", id="t_systemmm",
+    )]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    # The System Tasks block must have been found and rewritten.
+    assert "Schedule: 2026-05-09 08:00" in updated
+    assert "Last-run: 2026-05-08 09:00" in updated
+    # The User Tasks block (untouched task) must still have its original schedule.
+    assert "Schedule: 2026-06-01 08:00" in updated
+    # Section structure preserved.
+    assert "## System Tasks" in updated
+    assert "## Completed" in updated
 
 
 def test_advance_schedules_id_lookup_logs_id_on_miss(advance_service, caplog) -> None:
