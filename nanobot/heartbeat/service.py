@@ -31,6 +31,11 @@ _LASTRUN_VALUE_PAT = re.compile(
     r"^Last-run:\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)", re.MULTILINE
 )
 _RECIPIENTS_PAT = re.compile(r"^Recipients:\s*(.+)", re.MULTILINE)
+# Stable task IDs emitted by homer's tasks_update.py: literal `t_` + 8 lowercase
+# base32 chars. Anchored on its own line so we don't accidentally match
+# `Id:` substrings inside free-form fields. Blocks predating the rollout
+# may not have an Id line — callers must handle None gracefully.
+_ID_PAT = re.compile(r"^Id:\s*(t_[a-z2-7]{8})\s*$", re.MULTILINE)
 
 
 def _effective_due(
@@ -132,6 +137,9 @@ class DueTask:
     model: str | None = None  # Optional per-task model override
     pre_check: str | None = None  # Optional command to run before LLM dispatch
     recipients: str | None = None  # Raw Recipients line, e.g. "primary:whatsapp,seun:whatsapp"
+    # Stable identifier from HEARTBEAT.md `Id: t_xxxxxxxx`. None for legacy
+    # blocks that predate the ID rollout — fall back to name-based matching.
+    id: str | None = None
 
     def recipient_channels(self) -> set[str]:
         """Channel suffixes parsed from Recipients (e.g. {"whatsapp"}).
@@ -304,11 +312,15 @@ class HeartbeatService:
             recipients_match = _RECIPIENTS_PAT.search(block)
             recipients = recipients_match.group(1).strip() if recipients_match else None
 
+            id_match = _ID_PAT.search(block)
+            task_id = id_match.group(1) if id_match else None
+
             effective_due, _ = _effective_due(block, schedule_dt, schedule_str)
             if now >= effective_due:
                 due.append(DueTask(
                     name=task_name, task_type=task_type, schedule=schedule_str,
                     model=model, pre_check=pre_check, recipients=recipients,
+                    id=task_id,
                 ))
 
         return due
@@ -376,22 +388,29 @@ class HeartbeatService:
 
             effective_due, effective_due_str = _effective_due(block, schedule_dt, schedule_str)
 
+            id_match = _ID_PAT.search(block)
+            task_id = id_match.group(1) if id_match else None
+            id_chunk = f" [id={task_id}]" if task_id else ""
+
             now_str = now.strftime("%Y-%m-%d %H:%M")
             if now >= effective_due:
                 lines.append(
-                    f"  - '{task_name}' IS DUE NOW "
+                    f"  - '{task_name}'{id_chunk} IS DUE NOW "
                     f"(scheduled {effective_due_str}, now is {now_str})"
                 )
             else:
                 lines.append(
-                    f"  - '{task_name}' is NOT due until {effective_due_str}"
+                    f"  - '{task_name}'{id_chunk} is NOT due until {effective_due_str}"
                 )
 
         if not lines:
             return ""
 
         return (
-            "Python-computed task due status (authoritative — trust this over your own date math):\n"
+            "Python-computed task due status (authoritative — trust this over "
+            "your own date math). When ticking or completing a task, pass the "
+            "`id=` value (e.g. `t_a2b3c4d5`) to tasks_update.py, not the title "
+            "— matching by title breaks if you paraphrase it:\n"
             + "\n".join(lines)
         )
 
@@ -420,7 +439,15 @@ class HeartbeatService:
             if not due:
                 return "skip", "", []
             summary = ", ".join(f"{t.name} ({t.task_type})" for t in due)
-            logger.debug("Heartbeat: {} due task(s) — {}", len(due), summary)
+            # Decision-log line keeps a grep-friendly id alongside the type so
+            # we can correlate execution with the originating block in
+            # HEARTBEAT.md (the Piedmont reminder bug was hard to debug
+            # because logs only had the LLM-paraphrased title).
+            log_summary = ", ".join(
+                f"{t.name} [{t.task_type}{',' + t.id if t.id else ''}]"
+                for t in due
+            )
+            logger.debug("Heartbeat: {} due task(s) — {}", len(due), log_summary)
             return "run", summary, due
 
         # LLM fallback when last_run_tracking is disabled
@@ -578,17 +605,65 @@ class HeartbeatService:
             if task.task_type == "announcement" or not task.schedule:
                 continue
 
-            escaped = re.escape(task.name)
-            block_pat = re.compile(
-                rf"(###\s+{escaped}\s*\n)(.*?)(?=\n###\s|\n##\s|\Z)",
-                re.DOTALL,
-            )
-            m = block_pat.search(content)
-            if not m:
-                logger.warning("Heartbeat: could not find block for '{}' to advance schedule", task.name)
+            # Recompute section bounds each iteration: a previous task in
+            # this loop may have mutated content (Schedule/Last-run rewrite),
+            # which shifts offsets within the file.
+            user_match = re.search(r"^## User Tasks\s*$", content, re.MULTILINE)
+            if user_match:
+                section_start = user_match.end()
+                next_sec = re.search(r"^## ", content[section_start:], re.MULTILINE)
+                section_end = section_start + next_sec.start() if next_sec else len(content)
+            else:
+                section_start, section_end = 0, len(content)
+
+            # Resolve the block as (block_start, block_end) within content.
+            # Prefer id-based lookup — it survives LLM-paraphrased task names
+            # (the original Piedmont reminder bug). Fall back to name match
+            # for legacy blocks rolled out before tasks_update.py started
+            # writing Id lines.
+            block_start = block_end = -1
+
+            if task.id:
+                id_line_pat = re.compile(
+                    rf"^Id:\s*{re.escape(task.id)}\s*$", re.MULTILINE,
+                )
+                id_m = id_line_pat.search(content, section_start, section_end)
+                if id_m:
+                    # Walk back to the enclosing `### ` heading.
+                    nl = content.rfind("\n### ", section_start, id_m.start())
+                    if nl != -1:
+                        block_start = nl + 1  # skip the leading newline
+                    elif content.startswith("### ", section_start):
+                        block_start = section_start
+                    if block_start != -1:
+                        rest = content[block_start:section_end]
+                        end_m = re.search(r"\n###\s|\n##\s", rest)
+                        block_end = block_start + (end_m.start() if end_m else len(rest))
+
+            if block_start == -1 and not task.id:
+                escaped = re.escape(task.name)
+                block_pat = re.compile(
+                    rf"(###\s+{escaped}\s*\n)(.*?)(?=\n###\s|\n##\s|\Z)",
+                    re.DOTALL,
+                )
+                m = block_pat.search(content, section_start, section_end)
+                if m:
+                    block_start, block_end = m.start(), m.end()
+
+            if block_start == -1:
+                if task.id:
+                    logger.warning(
+                        "Heartbeat: could not find block for '{}' [id={}] to advance schedule",
+                        task.name, task.id,
+                    )
+                else:
+                    logger.warning(
+                        "Heartbeat: could not find block for '{}' to advance schedule",
+                        task.name,
+                    )
                 continue
 
-            block = m.group(0)
+            block = content[block_start:block_end]
 
             recur_m = _RECUR_PAT.search(block)
             if not recur_m:
@@ -627,7 +702,7 @@ class HeartbeatService:
                         count=1,
                     )
                 if updated_block != block:
-                    content = content[:m.start()] + updated_block + content[m.end():]
+                    content = content[:block_start] + updated_block + content[block_end:]
                     changed = True
                 continue
 
@@ -670,9 +745,13 @@ class HeartbeatService:
                     count=1,
                 )
 
-            content = content[:m.start()] + updated_block + content[m.end():]
+            content = content[:block_start] + updated_block + content[block_end:]
             changed = True
-            logger.info("Heartbeat: advanced '{}' schedule to {}", task.name, next_str)
+            id_chunk = f" [id={task.id}]" if task.id else ""
+            logger.info(
+                "Heartbeat: advanced '{}'{} schedule to {}",
+                task.name, id_chunk, next_str,
+            )
 
         if changed:
             write_text_atomic(self.heartbeat_file, content)
