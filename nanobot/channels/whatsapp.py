@@ -263,6 +263,11 @@ class WhatsAppChannel(BaseChannel):
                     logger.debug("WhatsApp watchdog send failed for {}: {}", chat_id, e)
         except asyncio.CancelledError:
             pass
+        finally:
+            # Self-evict so chats that fire once and never receive another
+            # inbound don't leak a completed-task entry forever.
+            if self._watchdog_tasks.get(chat_id) is asyncio.current_task():
+                self._watchdog_tasks.pop(chat_id, None)
 
     # ----------------------------------------------------------- outbound
 

@@ -399,6 +399,21 @@ async def test_watchdog_silent_when_client_disconnected(monkeypatch):
     await asyncio.sleep(0.15)
 
     assert ch._client.send_message.await_count == 0
+    assert "chat1@lid" not in ch._watchdog_tasks
+
+
+@pytest.mark.asyncio
+async def test_watchdog_self_evicts_after_firing(monkeypatch):
+    """After the watchdog runs to completion, its dict entry must be cleared
+    so a chat that fires once and goes quiet doesn't leak a completed task."""
+    ch = _make_channel()
+    monkeypatch.setattr(WhatsAppChannel, "_WATCHDOG_DELAY_S", 0.05)
+
+    await ch._start_watchdog("chat1@lid")
+    await asyncio.sleep(0.15)
+
+    assert ch._client.send_message.await_count == 1
+    assert "chat1@lid" not in ch._watchdog_tasks
 
 
 # ── Identity resolution ───────────────────────────────────────────────────────
