@@ -45,9 +45,18 @@ def ensure_nonempty_tool_result(tool_name: str, content: Any) -> Any:
     return content
 
 
+# Zero-width and invisible code points models occasionally emit as "content"
+# but that render as nothing in messaging UIs. .strip() does not remove these,
+# so a reply of just "​" otherwise passes blank-text checks and gets sent
+# as an invisible message (see 2026-05-12 incident).
+_INVISIBLE_TRANSLATION = str.maketrans("", "", "​‌‍⁠﻿᠎")
+
+
 def is_blank_text(content: str | None) -> bool:
-    """True when *content* is missing or only whitespace."""
-    return content is None or not content.strip()
+    """True when *content* is missing, only whitespace, or only invisible characters."""
+    if content is None:
+        return True
+    return not content.translate(_INVISIBLE_TRANSLATION).strip()
 
 
 def build_finalization_retry_message() -> dict[str, str]:
