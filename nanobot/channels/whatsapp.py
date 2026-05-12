@@ -10,6 +10,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
@@ -27,6 +28,40 @@ from nanobot.channels.whatsapp_client import (
     WhatsAppClientOptions,
 )
 from nanobot.config.schema import Base
+
+
+# Markdown link in source text: `[label](url)`. We strip the wrapper on
+# outbound because WhatsApp doesn't render `[…](…)` — clients show the
+# raw text and the auto-linker greedily includes the trailing `)` as part
+# of the URL, producing 404s on the receiver side. Replacing with the bare
+# URL keeps the link clickable (WhatsApp auto-links bare http(s) URLs).
+# Negative lookbehind on `!` so we don't mangle `![alt](url)` image-syntax
+# into a stray `!url` — images aren't sent through this path today but
+# the guard costs nothing.
+_MD_LINK_RE = re.compile(r"(?<!\!)\[([^\]]+)\]\(([^)]+)\)")
+
+
+def _render_for_whatsapp(text: str) -> str:
+    """Transform LLM-emitted markdown into WhatsApp-renderable text.
+
+    Today: collapse `[label](url)` → `url`. WhatsApp's auto-linker turns
+    the bare URL back into a tappable link, and dropping the label avoids
+    the `Click here)` 404 class of bug. The label is almost always
+    redundant with the surrounding sentence ("RSVP here: <url>") so the
+    information loss is minimal in practice.
+
+    Future scope (intentionally out of this pass):
+      - `**bold**` → `*bold*` (WhatsApp's bold syntax)
+      - `__italic__` / `_italic_` → `_italic_`
+      - strip ATX headings, blockquotes, table syntax
+
+    Kept narrow on purpose: this is the fix for a real production
+    "Link expired" bug; wider markdown normalization deserves its own
+    PR with broader test coverage and a side-by-side render comparison.
+    """
+    if not text:
+        return text
+    return _MD_LINK_RE.sub(r"\2", text)
 
 
 class WhatsAppConfig(Base):
@@ -285,9 +320,11 @@ class WhatsAppChannel(BaseChannel):
         await self._stop_typing(chat_id)
         await self._stop_watchdog(chat_id)
 
-        if msg.content and not msg.media:
+        content = _render_for_whatsapp(msg.content) if msg.content else msg.content
+
+        if content and not msg.media:
             try:
-                await self._client.send_message(chat_id, msg.content)
+                await self._client.send_message(chat_id, content)
             except Exception as e:
                 logger.error("Error sending WhatsApp message: {}", e)
                 raise
@@ -299,7 +336,7 @@ class WhatsAppChannel(BaseChannel):
                 continue
             try:
                 mime, _ = mimetypes.guess_type(media_path)
-                caption = msg.content if (i == 0 and msg.content and not already_sent) else None
+                caption = content if (i == 0 and content and not already_sent) else None
                 await self._client.send_media(
                     to=chat_id,
                     file_path=media_path,
