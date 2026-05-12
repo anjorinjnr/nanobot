@@ -255,6 +255,12 @@ class WhatsAppChannel(BaseChannel):
     async def _watchdog_loop(self, chat_id: str) -> None:
         try:
             await asyncio.sleep(self._WATCHDOG_DELAY_S)
+            # _stop_watchdog pops the dict entry BEFORE calling cancel — so if
+            # the cancel signal hasn't yet propagated through the sleep we
+            # still have a final bail-out: an entry that's no longer "us"
+            # means a concurrent send() already raced to take over.
+            if self._watchdog_tasks.get(chat_id) is not asyncio.current_task():
+                return
             if self._client is not None and self._connected:
                 try:
                     await self._client.send_message(chat_id, self._WATCHDOG_INTERIM_MESSAGE)

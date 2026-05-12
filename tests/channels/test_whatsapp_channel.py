@@ -403,6 +403,25 @@ async def test_watchdog_silent_when_client_disconnected(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_watchdog_does_not_send_when_entry_already_popped(monkeypatch):
+    """The dict pop happens BEFORE cancel in _stop_watchdog, so a watchdog
+    whose sleep returned but hasn't yet hit send_message must bail out
+    when it sees its dict entry is gone — otherwise a concurrent send()
+    race can produce a duplicate interim message."""
+    ch = _make_channel()
+    monkeypatch.setattr(WhatsAppChannel, "_WATCHDOG_DELAY_S", 0.05)
+
+    await ch._start_watchdog("chat1@lid")
+    # Simulate the race: pop the entry between sleep-returns and send.
+    # We do it from outside without cancelling so the task continues into
+    # its ownership check and self-aborts.
+    ch._watchdog_tasks.pop("chat1@lid", None)
+    await asyncio.sleep(0.15)
+
+    assert ch._client.send_message.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_watchdog_self_evicts_after_firing(monkeypatch):
     """After the watchdog runs to completion, its dict entry must be cleared
     so a chat that fires once and goes quiet doesn't leak a completed task."""
