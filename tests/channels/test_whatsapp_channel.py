@@ -643,3 +643,98 @@ async def test_dedupe_processed_message_ids():
     await ch._on_inbound(inbound)
 
     assert ch._handle_message.await_count == 1
+
+
+# ── _render_for_whatsapp -------------------------------------------------------
+# Outbound rendering. WhatsApp doesn't parse `[text](url)` markdown syntax,
+# so the channel strips it down to the bare URL before sending. Tests below
+# pin the regex against the failure mode that triggered the rewrite: short
+# links wrapped in `[Click here](…)` getting auto-linked with the trailing
+# `)` and 404ing on the receiver side.
+
+
+class TestRenderForWhatsApp:
+    def test_collapses_markdown_link_to_bare_url(self):
+        from nanobot.channels.whatsapp import _render_for_whatsapp
+
+        out = _render_for_whatsapp("RSVP: [Click here](https://homer.help/s/YRW229SB)")
+        assert out == "RSVP: https://homer.help/s/YRW229SB"
+
+    def test_multiple_links_in_one_message(self):
+        from nanobot.channels.whatsapp import _render_for_whatsapp
+
+        text = "See [event](https://a.example) and [map](https://b.example/x?y=1)"
+        assert _render_for_whatsapp(text) == "See https://a.example and https://b.example/x?y=1"
+
+    def test_leaves_bare_url_alone(self):
+        from nanobot.channels.whatsapp import _render_for_whatsapp
+
+        # Bare URLs are already what WhatsApp's auto-linker wants — leave alone.
+        assert _render_for_whatsapp("Go to https://homer.help/s/ABC") == \
+            "Go to https://homer.help/s/ABC"
+
+    def test_preserves_surrounding_text(self):
+        from nanobot.channels.whatsapp import _render_for_whatsapp
+
+        # The non-link text on either side of the markdown must survive verbatim,
+        # including whitespace and trailing punctuation.
+        text = "Tap to RSVP: [here](https://homer.help/s/X)."
+        assert _render_for_whatsapp(text) == "Tap to RSVP: https://homer.help/s/X."
+
+    def test_does_not_mangle_image_syntax(self):
+        from nanobot.channels.whatsapp import _render_for_whatsapp
+
+        # `![alt](url)` is markdown image syntax; the negative lookbehind on `!`
+        # leaves it intact so we don't produce a stray `!url`.
+        assert _render_for_whatsapp("![alt](https://x.example/img.png)") == \
+            "![alt](https://x.example/img.png)"
+
+    def test_empty_string_passthrough(self):
+        from nanobot.channels.whatsapp import _render_for_whatsapp
+
+        assert _render_for_whatsapp("") == ""
+
+    def test_none_passthrough(self):
+        from nanobot.channels.whatsapp import _render_for_whatsapp
+
+        # send() guards on `msg.content` being truthy before calling, but the
+        # helper itself should tolerate None to keep callers from having to
+        # branch.
+        assert _render_for_whatsapp(None) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_send_applies_markdown_link_transform():
+    """End-to-end: a message with `[label](url)` reaches send_message as
+    just the URL — pins the bug fix at the integration boundary."""
+    ch = _make_channel()
+    msg = OutboundMessage(
+        channel="whatsapp",
+        chat_id="123@s.whatsapp.net",
+        content="RSVP: [Click here](https://homer.help/s/YRW229SB)",
+    )
+
+    await ch.send(msg)
+
+    ch._client.send_message.assert_awaited_once_with(
+        "123@s.whatsapp.net",
+        "RSVP: https://homer.help/s/YRW229SB",
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_media_caption_applies_markdown_link_transform():
+    """Same transform applies when the text rides as a media caption."""
+    ch = _make_channel()
+    msg = OutboundMessage(
+        channel="whatsapp",
+        chat_id="123@s.whatsapp.net",
+        content="Photo from [the event](https://homer.help/e/abc)",
+        media=["/tmp/photo.jpg"],
+    )
+
+    await ch.send(msg)
+
+    ch._client.send_media.assert_awaited_once()
+    kwargs = ch._client.send_media.await_args.kwargs
+    assert kwargs["caption"] == "Photo from https://homer.help/e/abc"
