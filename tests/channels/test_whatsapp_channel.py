@@ -323,6 +323,84 @@ async def test_typing_task_cancelled_on_stop_typing():
     assert "chat1@lid" not in ch._typing_tasks
 
 
+# ── Watchdog: interim message on long silences ───────────────────────────────
+#
+# The watchdog fires a single "still working on this" message after
+# _WATCHDOG_DELAY_S of no outbound, so the user is never left hanging during
+# long tool loops. Tests use a monkey-patched short delay to keep them fast.
+
+
+@pytest.mark.asyncio
+async def test_watchdog_fires_interim_message_after_delay(monkeypatch):
+    ch = _make_channel()
+    monkeypatch.setattr(WhatsAppChannel, "_WATCHDOG_DELAY_S", 0.05)
+
+    await ch._start_watchdog("chat1@lid")
+    await asyncio.sleep(0.15)
+
+    sent_messages = [c.args for c in ch._client.send_message.await_args_list]
+    assert any(args[0] == "chat1@lid" and "Still working" in args[1] for args in sent_messages), (
+        f"expected interim message; got {sent_messages}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_watchdog_cancelled_before_delay_does_not_fire(monkeypatch):
+    ch = _make_channel()
+    monkeypatch.setattr(WhatsAppChannel, "_WATCHDOG_DELAY_S", 0.2)
+
+    await ch._start_watchdog("chat1@lid")
+    await asyncio.sleep(0.05)
+    await ch._stop_watchdog("chat1@lid")
+    await asyncio.sleep(0.3)
+
+    assert ch._client.send_message.await_count == 0
+    assert "chat1@lid" not in ch._watchdog_tasks
+
+
+@pytest.mark.asyncio
+async def test_send_cancels_watchdog(monkeypatch):
+    ch = _make_channel()
+    monkeypatch.setattr(WhatsAppChannel, "_WATCHDOG_DELAY_S", 0.2)
+
+    await ch._start_watchdog("chat1@lid")
+    msg = OutboundMessage(channel="whatsapp", chat_id="chat1@lid", content="real reply")
+    await ch.send(msg)
+    await asyncio.sleep(0.3)
+
+    # Only the real reply should have gone out; the watchdog must have been
+    # cancelled before its interim message fired.
+    sent = [c.args[1] for c in ch._client.send_message.await_args_list]
+    assert sent == ["real reply"], f"watchdog leaked; got {sent}"
+    assert "chat1@lid" not in ch._watchdog_tasks
+
+
+@pytest.mark.asyncio
+async def test_start_watchdog_resets_previous(monkeypatch):
+    ch = _make_channel()
+    monkeypatch.setattr(WhatsAppChannel, "_WATCHDOG_DELAY_S", 0.1)
+
+    await ch._start_watchdog("chat1@lid")
+    first_task = ch._watchdog_tasks["chat1@lid"]
+    await ch._start_watchdog("chat1@lid")
+    second_task = ch._watchdog_tasks["chat1@lid"]
+
+    assert first_task is not second_task
+    assert first_task.cancelled() or first_task.done()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_silent_when_client_disconnected(monkeypatch):
+    ch = _make_channel()
+    monkeypatch.setattr(WhatsAppChannel, "_WATCHDOG_DELAY_S", 0.05)
+    ch._connected = False
+
+    await ch._start_watchdog("chat1@lid")
+    await asyncio.sleep(0.15)
+
+    assert ch._client.send_message.await_count == 0
+
+
 # ── Identity resolution ───────────────────────────────────────────────────────
 
 
