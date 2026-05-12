@@ -93,6 +93,7 @@ class WhatsAppChannel(BaseChannel):
         self._connected_event: asyncio.Event = asyncio.Event()
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
         self._typing_tasks: dict[str, asyncio.Task] = {}
+        self._watchdog_tasks: dict[str, asyncio.Task] = {}
         # LID identity resolution state
         self._lid_map: dict[str, dict] = {}
         self._lid_map_lock = asyncio.Lock()
@@ -186,6 +187,9 @@ class WhatsAppChannel(BaseChannel):
         for chat_id in list(self._typing_tasks):
             await self._stop_typing(chat_id)
 
+        for chat_id in list(self._watchdog_tasks):
+            await self._stop_watchdog(chat_id)
+
         if self._client is not None:
             try:
                 await self._client.disconnect()
@@ -223,6 +227,54 @@ class WhatsAppChannel(BaseChannel):
         except Exception as e:
             logger.debug("WhatsApp typing indicator stopped for {}: {}", chat_id, e)
 
+    # ----------------------------------------------------------- watchdog
+    #
+    # WhatsApp has no streaming, and our typing indicator is unreliable in
+    # practice. A long tool-research loop can leave the user staring at no
+    # output for many minutes (see 2026-05-12 22-minute silence incident).
+    # The watchdog fires a single interim message at WATCHDOG_DELAY_S if the
+    # agent hasn't sent anything yet, then exits — the user always hears back
+    # within that window, even when the model is grinding.
+
+    _WATCHDOG_DELAY_S = 90
+    _WATCHDOG_INTERIM_MESSAGE = "Still working on this — give me a moment."
+
+    async def _start_watchdog(self, chat_id: str) -> None:
+        await self._stop_watchdog(chat_id)
+        self._watchdog_tasks[chat_id] = asyncio.create_task(self._watchdog_loop(chat_id))
+
+    async def _stop_watchdog(self, chat_id: str) -> None:
+        task = self._watchdog_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _watchdog_loop(self, chat_id: str) -> None:
+        try:
+            await asyncio.sleep(self._WATCHDOG_DELAY_S)
+            # _stop_watchdog pops the dict entry BEFORE calling cancel — so if
+            # the cancel signal hasn't yet propagated through the sleep we
+            # still have a final bail-out: an entry that's no longer "us"
+            # means a concurrent send() already raced to take over.
+            if self._watchdog_tasks.get(chat_id) is not asyncio.current_task():
+                return
+            if self._client is not None and self._connected:
+                try:
+                    await self._client.send_message(chat_id, self._WATCHDOG_INTERIM_MESSAGE)
+                    logger.info("WhatsApp watchdog fired for {} after {}s", chat_id, self._WATCHDOG_DELAY_S)
+                except Exception as e:
+                    logger.debug("WhatsApp watchdog send failed for {}: {}", chat_id, e)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # Self-evict so chats that fire once and never receive another
+            # inbound don't leak a completed-task entry forever.
+            if self._watchdog_tasks.get(chat_id) is asyncio.current_task():
+                self._watchdog_tasks.pop(chat_id, None)
+
     # ----------------------------------------------------------- outbound
 
     async def send(self, msg: OutboundMessage) -> None:
@@ -231,6 +283,7 @@ class WhatsAppChannel(BaseChannel):
 
         chat_id = msg.chat_id
         await self._stop_typing(chat_id)
+        await self._stop_watchdog(chat_id)
 
         if msg.content and not msg.media:
             try:
@@ -366,6 +419,7 @@ class WhatsAppChannel(BaseChannel):
 
         if self.is_allowed(sender_id):
             await self._start_typing(msg.sender)
+            await self._start_watchdog(msg.sender)
 
         if (
             self.config.identity_resolution

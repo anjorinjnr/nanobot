@@ -34,20 +34,36 @@ def ensure_nonempty_tool_result(tool_name: str, content: Any) -> Any:
     """Replace semantically empty tool results with a short marker string."""
     if content is None:
         return empty_tool_result_message(tool_name)
-    if isinstance(content, str) and not content.strip():
+    if isinstance(content, str) and is_blank_text(content):
         return empty_tool_result_message(tool_name)
     if isinstance(content, list):
         if not content:
             return empty_tool_result_message(tool_name)
         text_payload = stringify_text_blocks(content)
-        if text_payload is not None and not text_payload.strip():
+        if text_payload is not None and is_blank_text(text_payload):
             return empty_tool_result_message(tool_name)
     return content
 
 
+# Zero-width and invisible code points models occasionally emit as "content"
+# but that render as nothing in messaging UIs. .strip() does not remove these,
+# so a reply of just U+200B otherwise passes blank-text checks and gets sent
+# as an invisible message (see 2026-05-12 incident).
+_INVISIBLE_TRANSLATION = str.maketrans("", "", (
+    "​"  # ZERO WIDTH SPACE
+    "‌"  # ZERO WIDTH NON-JOINER
+    "‍"  # ZERO WIDTH JOINER
+    "⁠"  # WORD JOINER
+    "﻿"  # ZERO WIDTH NO-BREAK SPACE / BOM
+    "᠎"  # MONGOLIAN VOWEL SEPARATOR
+))
+
+
 def is_blank_text(content: str | None) -> bool:
-    """True when *content* is missing or only whitespace."""
-    return content is None or not content.strip()
+    """True when *content* is missing, only whitespace, or only invisible characters."""
+    if content is None:
+        return True
+    return not content.translate(_INVISIBLE_TRANSLATION).strip()
 
 
 def build_finalization_retry_message() -> dict[str, str]:

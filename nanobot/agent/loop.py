@@ -53,7 +53,7 @@ from nanobot.utils.progress_events import (
     invoke_on_progress,
     on_progress_accepts_tool_events,
 )
-from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE, is_blank_text
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, ToolsConfig, WebToolsConfig
@@ -1307,7 +1307,7 @@ class AgentLoop:
                 pending_queue=pending_queue,
             )
 
-        if final_content is None or not final_content.strip():
+        if is_blank_text(final_content):
             final_content = EMPTY_FINAL_RESPONSE_MESSAGE
             stop_reason = STOP_EMPTY_FINAL
 
