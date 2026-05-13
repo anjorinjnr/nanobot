@@ -100,3 +100,5 @@ temp/
 bridge/node_modules/
 bridge/package-lock.json
 botpy.log
+.venv
+.venv/
