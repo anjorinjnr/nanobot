@@ -140,6 +140,13 @@ class DueTask:
     # Stable identifier from HEARTBEAT.md `Id: t_xxxxxxxx`. None for legacy
     # blocks that predate the ID rollout — fall back to name-based matching.
     id: str | None = None
+    # Optional path (relative to the workspace) of a file whose contents
+    # become the agent message when this task fires, replacing the default
+    # task-name summary. Supports `{recipient}` substitution so a single
+    # task with multiple Recipients fans out to per-user prompt files
+    # (e.g. `context/users/{recipient}.brief.md`). When set, the task
+    # dispatches once per recipient instead of once per group.
+    prompt_file: str | None = None
 
     def recipient_channels(self) -> set[str]:
         """Channel suffixes parsed from Recipients (e.g. {"whatsapp"}).
@@ -164,6 +171,25 @@ class DueTask:
             channel = entry.rsplit(":", 1)[-1].strip().lower()
             if channel:
                 out.add(channel)
+        return out
+
+    def recipient_names(self) -> list[str]:
+        """Recipient names (the `<id>` half of each `<id>:<channel>` entry).
+
+        Preserves the order Recipients were written in so {recipient}
+        substitution in prompt-file paths is deterministic. Returns an
+        empty list when no Recipients field is set.
+        """
+        if not self.recipients:
+            return []
+        out: list[str] = []
+        for entry in self.recipients.split(","):
+            entry = entry.strip()
+            if not entry or ":" not in entry:
+                continue
+            name = entry.rsplit(":", 1)[0].strip()
+            if name and name not in out:
+                out.append(name)
         return out
 
 
@@ -315,12 +341,18 @@ class HeartbeatService:
             id_match = _ID_PAT.search(block)
             task_id = id_match.group(1) if id_match else None
 
+            # Paths cannot contain whitespace — `\S+` truncates at the first
+            # space. Workspace-relative paths like `users/{recipient}.brief.md`
+            # are the intended shape; anything else is a malformed task block.
+            prompt_file_match = re.search(r"^Prompt-file:\s*(\S+)", block, re.MULTILINE)
+            prompt_file = prompt_file_match.group(1).strip() if prompt_file_match else None
+
             effective_due, _ = _effective_due(block, schedule_dt, schedule_str)
             if now >= effective_due:
                 due.append(DueTask(
                     name=task_name, task_type=task_type, schedule=schedule_str,
                     model=model, pre_check=pre_check, recipients=recipients,
-                    id=task_id,
+                    id=task_id, prompt_file=prompt_file,
                 ))
 
         return due
@@ -763,6 +795,103 @@ class HeartbeatService:
         if changed:
             write_text_atomic(self.heartbeat_file, content)
 
+    def _read_prompt_file(self, raw_path: str, recipient: str | None) -> str | None:
+        """Resolve and read a task's Prompt-file, substituting {recipient}.
+
+        - `{recipient}` placeholders are replaced with the supplied recipient
+          name. If the path contains `{recipient}` but none is supplied,
+          returns None (caller falls back to the default task summary).
+        - Paths are resolved relative to the heartbeat workspace and must
+          stay under it — any traversal outside the workspace returns None
+          (defense against a malformed task block escaping the sandbox).
+        - Returns None on any I/O failure; the dispatcher falls back to the
+          task-summary path so a missing/unreadable file doesn't silently
+          drop the task.
+        """
+        path_str = raw_path
+        if "{recipient}" in path_str:
+            if not recipient:
+                logger.warning(
+                    "Heartbeat: prompt-file {!r} references {{recipient}} "
+                    "but task has no Recipients — skipping prompt file",
+                    raw_path,
+                )
+                return None
+            path_str = path_str.replace("{recipient}", recipient)
+
+        candidate = (self.workspace / path_str).resolve()
+        try:
+            workspace_resolved = self.workspace.resolve()
+            candidate.relative_to(workspace_resolved)
+        except ValueError:
+            # Log the post-substitution path too — when the brief silently
+            # degrades, the substituted recipient name is the most common
+            # culprit (typo, missing user file) and the raw path alone hides
+            # it.
+            logger.warning(
+                "Heartbeat: prompt-file {!r} (resolved {!r}) escapes the workspace, refusing",
+                raw_path, str(candidate),
+            )
+            return None
+
+        try:
+            return candidate.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning(
+                "Heartbeat: prompt-file {!r} unreadable ({}); falling back to summary",
+                str(candidate), e,
+            )
+            return None
+
+    async def _dispatch_prompt_file_task(self, task: DueTask, evaluate_response) -> None:
+        """Run a single Prompt-file task, fanning out per recipient.
+
+        Each recipient gets its own agent dispatch with the file's
+        contents as the message. If the task has no Recipients (or the
+        path has no {recipient} placeholder), fires once with `None` as
+        the recipient — the prompt file is shared across whoever the
+        task targets.
+        """
+        recipients = task.recipient_names() or [None]
+        for recipient in recipients:
+            message = self._read_prompt_file(task.prompt_file or "", recipient)
+            if message is None:
+                # Fall back to the default summary so the task still runs
+                # (and ticks) rather than silently being dropped.
+                message = f"{task.name} ({task.task_type})"
+
+            ctx = (
+                self.on_execute_context([task])
+                if self.on_execute_context
+                else nullcontext()
+            )
+            try:
+                with ctx:
+                    response = await self.on_execute(message, task.model)
+                if response:
+                    should_notify = await evaluate_response(
+                        response, task.name, self.provider, self.model,
+                        suppress_errors=self.suppress_errors,
+                    )
+                    if should_notify and self.on_notify:
+                        logger.info(
+                            "Heartbeat: completed, delivering response (prompt-file, recipient={})",
+                            recipient or "<none>",
+                        )
+                        await self.on_notify(response)
+                    else:
+                        logger.info("Heartbeat: silenced by post-run evaluation")
+            except Exception:
+                logger.exception(
+                    "Heartbeat: prompt-file task failed for {} (recipient={})",
+                    task.name, recipient or "<none>",
+                )
+        # Advance schedule once for the task — not per recipient —
+        # so a recurring brief still bumps cleanly even if individual
+        # recipient sends fail.
+        if self.last_run_tracking:
+            self._advance_schedules([task])
+
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
         from nanobot.utils.evaluator import evaluate_response
@@ -816,9 +945,20 @@ class HeartbeatService:
                         else:
                             logger.info("Heartbeat: silenced by post-run evaluation")
                 else:
-                    # Group tasks by model override
+                    # Tasks with Prompt-file dispatch separately, one per
+                    # recipient, so per-user prompt files (e.g.
+                    # context/users/{recipient}.brief.md) can customize the
+                    # message per user. The remaining tasks group by model
+                    # as before and share one summary dispatch.
+                    prompt_tasks = [t for t in due_tasks if t.prompt_file]
+                    remaining_tasks = [t for t in due_tasks if not t.prompt_file]
+
+                    for task in prompt_tasks:
+                        await self._dispatch_prompt_file_task(task, evaluate_response)
+
+                    # Group remaining tasks by model override
                     groups: dict[str | None, list[DueTask]] = {}
-                    for t in due_tasks:
+                    for t in remaining_tasks:
                         groups.setdefault(t.model, []).append(t)
 
                     for model_override, group_tasks in groups.items():

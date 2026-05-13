@@ -1981,3 +1981,189 @@ def test_advance_schedules_id_lookup_logs_id_on_miss(advance_service, caplog) ->
 
     messages = [rec.message for rec in caplog.records]
     assert any("Vanished task" in m and "t_deadbeef" in m for m in messages)
+
+
+# ── Prompt-file dispatch ─────────────────────────────────────────────────────
+
+
+def test_compute_due_tasks_parses_prompt_file() -> None:
+    """The Prompt-file: field on a task block is captured into DueTask."""
+    now = datetime(2026, 3, 12, 8, 0)
+    content = _make_heartbeat(
+        "\n### Morning briefing\nType: system\n"
+        "Schedule: 2026-03-12 07:00\nRecur: every 1 day\n"
+        "Recipients: ebby:whatsapp,seun:whatsapp\n"
+        "Prompt-file: context/users/{recipient}.brief.md\n"
+    )
+    tasks = HeartbeatService._compute_due_tasks(content, now)
+    assert len(tasks) == 1
+    assert tasks[0].prompt_file == "context/users/{recipient}.brief.md"
+
+
+def test_compute_due_tasks_prompt_file_none_when_absent() -> None:
+    """Tasks without Prompt-file have prompt_file=None."""
+    now = datetime(2026, 3, 12, 8, 0)
+    content = _make_heartbeat(
+        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 07:00\n"
+    )
+    tasks = HeartbeatService._compute_due_tasks(content, now)
+    assert tasks[0].prompt_file is None
+
+
+def test_due_task_recipient_names_parses_list() -> None:
+    t = DueTask(
+        name="X", task_type="system", schedule="2026-03-12 07:00",
+        recipients="ebby:whatsapp,seun:whatsapp,kid:telegram",
+    )
+    assert t.recipient_names() == ["ebby", "seun", "kid"]
+
+
+def test_due_task_recipient_names_empty_when_no_recipients() -> None:
+    t = DueTask(name="X", task_type="system", schedule="2026-03-12 07:00")
+    assert t.recipient_names() == []
+
+
+def test_due_task_recipient_names_dedupes_preserving_order() -> None:
+    """A recipient mentioned on multiple channels surfaces once in the
+    name list — prompt-file dispatch fires per name, not per channel."""
+    t = DueTask(
+        name="X", task_type="system", schedule="2026-03-12 07:00",
+        recipients="ebby:whatsapp,ebby:telegram,seun:whatsapp",
+    )
+    assert t.recipient_names() == ["ebby", "seun"]
+
+
+def _make_prompt_service(tmp_path, on_execute):
+    """Build a HeartbeatService wired to capture on_execute calls."""
+    (tmp_path / "HEARTBEAT.md").write_text("# Heartbeat\n## User Tasks\n\n## Completed\n",
+                                            encoding="utf-8")
+    return HeartbeatService(
+        workspace=tmp_path,
+        provider=DummyProvider([]),
+        model="test",
+        on_execute=on_execute,
+        last_run_tracking=True,
+        timezone="America/New_York",
+    )
+
+
+def test_read_prompt_file_substitutes_recipient(tmp_path):
+    users_dir = tmp_path / "context" / "users"
+    users_dir.mkdir(parents=True)
+    (users_dir / "ebby.brief.md").write_text("ebby's brief content", encoding="utf-8")
+
+    service = _make_prompt_service(tmp_path, on_execute=None)
+    out = service._read_prompt_file("context/users/{recipient}.brief.md", "ebby")
+    assert out == "ebby's brief content"
+
+
+def test_read_prompt_file_returns_none_when_recipient_missing(tmp_path):
+    """A {recipient} placeholder with no recipient supplied falls back
+    to the default summary (returns None to the dispatcher)."""
+    service = _make_prompt_service(tmp_path, on_execute=None)
+    out = service._read_prompt_file("context/users/{recipient}.brief.md", None)
+    assert out is None
+
+
+def test_read_prompt_file_rejects_traversal_outside_workspace(tmp_path):
+    """A path that resolves outside the workspace via .. must be refused
+    even if a file exists there — defense against a malformed task block."""
+    outside = tmp_path.parent / "secret.md"
+    outside.write_text("should never be read", encoding="utf-8")
+    try:
+        service = _make_prompt_service(tmp_path, on_execute=None)
+        out = service._read_prompt_file("../secret.md", None)
+        assert out is None
+    finally:
+        outside.unlink()
+
+
+def test_read_prompt_file_returns_none_when_file_missing(tmp_path):
+    service = _make_prompt_service(tmp_path, on_execute=None)
+    out = service._read_prompt_file("context/users/nobody.brief.md", "nobody")
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_prompt_file_task_fires_per_recipient(tmp_path):
+    """A task with Prompt-file and N recipients fires N agent calls,
+    each with that recipient's prompt-file content as the message."""
+    users_dir = tmp_path / "context" / "users"
+    users_dir.mkdir(parents=True)
+    (users_dir / "ebby.brief.md").write_text("ebby content", encoding="utf-8")
+    (users_dir / "seun.brief.md").write_text("seun content", encoding="utf-8")
+
+    captured: list[tuple[str, str | None]] = []
+
+    async def on_execute(msg, model):
+        captured.append((msg, model))
+        return None
+
+    service = _make_prompt_service(tmp_path, on_execute=on_execute)
+
+    async def stub_evaluate(*args, **kwargs):
+        return False
+
+    task = DueTask(
+        name="Morning briefing", task_type="system",
+        schedule="2026-03-12 07:00",
+        recipients="ebby:whatsapp,seun:whatsapp",
+        prompt_file="context/users/{recipient}.brief.md",
+    )
+    await service._dispatch_prompt_file_task(task, stub_evaluate)
+
+    assert [msg for msg, _ in captured] == ["ebby content", "seun content"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_prompt_file_task_falls_back_to_summary_on_missing_file(tmp_path):
+    """A missing prompt file does NOT silently drop the task — falls back
+    to the default task-summary so the dispatcher still runs (and the
+    schedule still advances). Otherwise a typo in PromptFile would
+    silently disable the task forever."""
+    captured: list[str] = []
+
+    async def on_execute(msg, model):
+        captured.append(msg)
+        return None
+
+    service = _make_prompt_service(tmp_path, on_execute=on_execute)
+
+    async def stub_evaluate(*args, **kwargs):
+        return False
+
+    task = DueTask(
+        name="Morning briefing", task_type="system",
+        schedule="2026-03-12 07:00",
+        recipients="ebby:whatsapp",
+        prompt_file="context/users/{recipient}.brief.md",  # file doesn't exist
+    )
+    await service._dispatch_prompt_file_task(task, stub_evaluate)
+
+    assert captured == ["Morning briefing (system)"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_prompt_file_task_fires_once_when_no_recipients(tmp_path):
+    """A task with Prompt-file but no Recipients fires once, with the
+    file content as the message and no {recipient} substitution."""
+    (tmp_path / "shared.md").write_text("shared brief", encoding="utf-8")
+    captured: list[str] = []
+
+    async def on_execute(msg, model):
+        captured.append(msg)
+        return None
+
+    service = _make_prompt_service(tmp_path, on_execute=on_execute)
+
+    async def stub_evaluate(*args, **kwargs):
+        return False
+
+    task = DueTask(
+        name="Weekly digest", task_type="system",
+        schedule="2026-03-12 07:00",
+        prompt_file="shared.md",
+    )
+    await service._dispatch_prompt_file_task(task, stub_evaluate)
+
+    assert captured == ["shared brief"]
