@@ -341,6 +341,9 @@ class HeartbeatService:
             id_match = _ID_PAT.search(block)
             task_id = id_match.group(1) if id_match else None
 
+            # Paths cannot contain whitespace — `\S+` truncates at the first
+            # space. Workspace-relative paths like `users/{recipient}.brief.md`
+            # are the intended shape; anything else is a malformed task block.
             prompt_file_match = re.search(r"^Prompt-file:\s*(\S+)", block, re.MULTILINE)
             prompt_file = prompt_file_match.group(1).strip() if prompt_file_match else None
 
@@ -821,9 +824,13 @@ class HeartbeatService:
             workspace_resolved = self.workspace.resolve()
             candidate.relative_to(workspace_resolved)
         except ValueError:
+            # Log the post-substitution path too — when the brief silently
+            # degrades, the substituted recipient name is the most common
+            # culprit (typo, missing user file) and the raw path alone hides
+            # it.
             logger.warning(
-                "Heartbeat: prompt-file {!r} resolves outside the workspace, refusing",
-                raw_path,
+                "Heartbeat: prompt-file {!r} (resolved {!r}) escapes the workspace, refusing",
+                raw_path, str(candidate),
             )
             return None
 
