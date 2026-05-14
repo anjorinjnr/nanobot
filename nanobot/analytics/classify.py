@@ -1,4 +1,4 @@
-"""Use-case classifier — Gemini Flash with LRU cache.
+"""Use-case classifier — Gemini Flash via OpenRouter, with LRU cache.
 
 Produces a snake_case tag per message. The LLM picks from a preferred set
 when a message fits, and otherwise generates its own descriptive tag.
@@ -6,6 +6,14 @@ when a message fits, and otherwise generates its own descriptive tag.
 reason (no API key, network error, malformed response) we return
 "unclassified" so dashboard filters can distinguish "model couldn't decide"
 from "pipeline broke".
+
+Routing goes through the platform-funded OpenRouter "system" key
+(``LLM_SYSTEM_API_KEY``) so analytics classification doesn't show up in
+tenant cost reports. We hit Gemini Flash via OpenRouter's catalog
+(``google/gemini-2.5-flash``) rather than calling Google directly so all
+homer LLM spend lands in one OpenRouter ledger. The legacy
+``HOMER_ANALYTICS_GEMINI_API_KEY`` (direct-Gemini) is still honored as a
+fallback for dev/local environments that haven't switched yet.
 """
 
 from __future__ import annotations
@@ -110,7 +118,7 @@ async def classify_message_async(text: str) -> str:
         return cached
 
     try:
-        tag = await _call_gemini_async(text)
+        tag = await _call_classifier_async(text)
     except Exception:
         logger.debug("Classification failed", exc_info=True)
         tag = _FALLBACK
@@ -118,34 +126,83 @@ async def classify_message_async(text: str) -> str:
     return tag
 
 
-def _resolve_api_key() -> str:
-    """Pick the API key for the analytics classifier.
+# Map of (env var, route, model_id, provider_label) tried in order. The
+# first one with a non-empty key in the environment is used; the route +
+# model_id + provider_label all change together so the telemetry tag
+# matches the provider that actually served the call. OpenRouter wins
+# when both are configured so platform cost lands in one ledger.
+_CLASSIFIER_ROUTES: tuple[tuple[str, str, str, str], ...] = (
+    (
+        # `openrouter/auto` lets OpenRouter pick the cheapest viable model
+        # per request — single-tag snake_case classification doesn't need
+        # a specific model, and pinning bakes in a SKU that ages out.
+        "LLM_SYSTEM_API_KEY",
+        "https://openrouter.ai/api/v1/chat/completions",
+        "openrouter/auto",
+        "openrouter",
+    ),
+    (
+        "HOMER_ANALYTICS_GEMINI_API_KEY",
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "gemini-2.5-flash",
+        "gemini",
+    ),
+    (
+        "GEMINI_API_KEY",
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "gemini-2.5-flash",
+        "gemini",
+    ),
+)
 
-    Hosted tenants set tenant-owned ``GEMINI_API_KEY`` for chat. We don't
-    want to charge tenants for Homer's classifier, and not every tenant
-    even uses Gemini for chat — when they don't, the classifier silently
-    fails and every event ships as ``unclassified``. Prefer the
-    Homer-owned ``HOMER_ANALYTICS_GEMINI_API_KEY`` injected by the portal,
-    fall back to ``GEMINI_API_KEY`` so dev/local with a single key still
-    works.
+
+def _resolve_route() -> tuple[str, str, str, str] | None:
+    """Pick the active classifier route.
+
+    Preference order, top→bottom:
+      1. ``LLM_SYSTEM_API_KEY`` → OpenRouter (post-consolidation default;
+         platform-funded sub-key, cost lands on the system bucket).
+      2. ``HOMER_ANALYTICS_GEMINI_API_KEY`` → direct Gemini (legacy
+         Homer-owned key for tenants still on the pre-consolidation env
+         emission).
+      3. ``GEMINI_API_KEY`` → direct Gemini (dev/local with a single
+         tenant key, charges tenant quota — only use when nothing else is
+         configured).
+
+    Returns ``None`` when no key is set, so the caller can short-circuit
+    to ``unclassified`` without making a network call.
     """
-    return (
-        os.environ.get("HOMER_ANALYTICS_GEMINI_API_KEY", "").strip()
-        or os.environ.get("GEMINI_API_KEY", "").strip()
-    )
+    for env_var, route, model_id, provider in _CLASSIFIER_ROUTES:
+        key = (os.environ.get(env_var) or "").strip()
+        if key:
+            return key, route, model_id, provider
+    return None
 
 
-async def _call_gemini_async(text: str) -> str:
-    """Call Gemini Flash and return a validated tag.
+def _resolve_api_key() -> str:
+    """Compatibility shim — returns just the api_key from the active route.
+
+    Kept so external callers (admin diagnostics, smoke tests) don't break
+    on the rename. New code should use :func:`_resolve_route` to also get
+    the route URL / model id / provider label.
+    """
+    chosen = _resolve_route()
+    return chosen[0] if chosen else ""
+
+
+async def _call_classifier_async(text: str) -> str:
+    """Call the active classifier route and return a validated tag.
 
     Emits one ``$ai_generation`` event tagged ``task_kind=tool_classifier``
-    so spend on this side-channel call shows up correctly in PostHog
-    dashboards. This path bypasses :class:`LLMProvider`, so we wire
-    telemetry in directly. (#55)
+    so platform classification spend shows up correctly in PostHog. This
+    path bypasses :class:`LLMProvider`, so we wire telemetry in directly.
+    (#55)
     """
-    api_key = _resolve_api_key()
-    if not api_key:
+    chosen = _resolve_route()
+    if chosen is None:
         return _FALLBACK
+    api_key, route_url, model_id, provider_label = chosen
+
     start = time.monotonic()
     input_tokens = 0
     output_tokens = 0
@@ -163,12 +220,14 @@ async def _call_gemini_async(text: str) -> str:
         # eats the actual answer. `reasoning_effort: "none"` disables thinking
         # for this call (we don't need it for a one-tag classification), and
         # max_tokens is bumped to a comfortable margin for the longest tag.
+        # OpenRouter forwards `reasoning_effort` to the upstream Gemini
+        # endpoint verbatim, so the same payload works on both routes.
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                route_url,
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={
-                    "model": "gemini-2.5-flash",
+                    "model": model_id,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 100,
                     "temperature": 0,
@@ -186,15 +245,15 @@ async def _call_gemini_async(text: str) -> str:
             return _validate(raw)
     except Exception:
         is_error = True
-        logger.debug("Gemini classification request failed", exc_info=True)
+        logger.debug("Classifier request failed", exc_info=True)
         return _FALLBACK
     finally:
         try:
             from nanobot.analytics.llm_telemetry import track_llm_generation
 
             track_llm_generation(
-                model="gemini-2.5-flash",
-                provider="gemini",
+                model=model_id,
+                provider=provider_label,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 latency_s=time.monotonic() - start,
@@ -204,3 +263,8 @@ async def _call_gemini_async(text: str) -> str:
             )
         except Exception:
             logger.debug("classify telemetry emit failed", exc_info=True)
+
+
+# Back-compat alias for tests + downstream callers that patched the old
+# function name. New code should reference _call_classifier_async.
+_call_gemini_async = _call_classifier_async
