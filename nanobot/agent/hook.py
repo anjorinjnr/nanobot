@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from loguru import logger
@@ -26,6 +27,33 @@ class AgentHookContext:
     error: str | None = None
 
 
+@dataclass
+class TurnMetadata:
+    """Per-turn lifecycle metadata for before_turn / after_turn hooks.
+
+    One instance per ``AgentLoop._process_message`` invocation; the same
+    instance is passed to both ``before_turn`` and ``after_turn`` so hooks
+    can stash per-turn state on ``state`` (keyed by class name to avoid
+    cross-hook collisions). ``response_content`` and ``stop_reason`` are
+    populated by the caller before ``after_turn`` fires.
+
+    Not slotted: ``state`` needs to be a mutable shared dict, and hooks may
+    occasionally want to subclass for richer metadata (e.g. test fixtures).
+    """
+
+    channel: str
+    sender_id: str
+    chat_id: Any
+    content: str
+    media: list[str]
+    timestamp: datetime
+    is_synthetic: bool
+    message_id: str | None = None
+    state: dict[str, Any] = field(default_factory=dict)
+    response_content: str | None = None
+    stop_reason: str | None = None
+
+
 class AgentHook:
     """Minimal lifecycle surface for shared runner customization."""
 
@@ -34,6 +62,9 @@ class AgentHook:
 
     def wants_streaming(self) -> bool:
         return False
+
+    async def before_turn(self, turn: TurnMetadata) -> None:
+        pass
 
     async def before_iteration(self, context: AgentHookContext) -> None:
         pass
@@ -48,6 +79,9 @@ class AgentHook:
         pass
 
     async def after_iteration(self, context: AgentHookContext) -> None:
+        pass
+
+    async def after_turn(self, turn: TurnMetadata) -> None:
         pass
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
@@ -82,6 +116,9 @@ class CompositeHook(AgentHook):
             except Exception:
                 logger.exception("AgentHook.{} error in {}", method_name, type(h).__name__)
 
+    async def before_turn(self, turn: TurnMetadata) -> None:
+        await self._for_each_hook_safe("before_turn", turn)
+
     async def before_iteration(self, context: AgentHookContext) -> None:
         await self._for_each_hook_safe("before_iteration", context)
 
@@ -96,6 +133,9 @@ class CompositeHook(AgentHook):
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         await self._for_each_hook_safe("after_iteration", context)
+
+    async def after_turn(self, turn: TurnMetadata) -> None:
+        await self._for_each_hook_safe("after_turn", turn)
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         for h in self._hooks:

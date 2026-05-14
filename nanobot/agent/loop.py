@@ -15,7 +15,7 @@ from loguru import logger
 
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
+from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook, TurnMetadata
 from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.runner import (
     STOP_EMPTY_FINAL,
@@ -235,6 +235,21 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+        # Homer fork: register the chat_persist adapter so persistence flows
+        # through the AgentHook lifecycle instead of inline _process_message
+        # calls. The underlying impl env-gates itself, so this is a no-op when
+        # HOMER_CHAT_PERSIST_ENABLED is unset (OSS deploys, CI).
+        from nanobot.analytics.chat_persist_hook import ChatPersistAgentHook
+        self._extra_hooks.append(
+            ChatPersistAgentHook(schedule_background=self._schedule_background)
+        )
+        # Composite used for turn-scoped lifecycle (before_turn / after_turn).
+        # Distinct from the per-iteration composite built in _run_agent_loop —
+        # turn hooks fire once per _process_message, iteration hooks fire once
+        # per LLM step.
+        self._turn_hook: AgentHook = (
+            CompositeHook(self._extra_hooks) if self._extra_hooks else AgentHook()
+        )
         self._scope_context_provider = scope_context_provider or ""
         self._scope_context_fn: Callable[[str], str] | None = None
         self._disable_memory_writes = bool(disable_memory_writes)
@@ -1164,25 +1179,22 @@ class AgentLoop:
             is_guest=guest is not None,
         )
 
-        # hist_chat_messages persistence (homer family-history). No-op unless
-        # HOMER_CHAT_PERSIST_ENABLED + Supabase env are set; failures swallow.
-        # Synthetic turns (heartbeat/cron) are not chat and shouldn't land in
-        # the contributor's transcript.
-        from nanobot.analytics.chat_persist import get_chat_persist_hook
-        _chat_persist = get_chat_persist_hook()
-        _chat_ctx = None
-        if not _synthetic:
-            try:
-                _chat_ctx = await _chat_persist.on_message_received(
-                    channel=msg.channel,
-                    sender_id=msg.sender_id,
-                    content=msg.content,
-                    media=msg.media,
-                    timestamp=msg.timestamp,
-                    schedule_background=self._schedule_background,
-                )
-            except Exception:
-                logger.debug("chat_persist on_message_received error (non-fatal)", exc_info=True)
+        # Per-turn AgentHook lifecycle. The same TurnMetadata instance is
+        # passed to before_turn and after_turn so hooks can stash state on it
+        # (e.g. chat_persist stashes its resolved contributor ctx). Failures
+        # are isolated inside the composite — a faulty hook can't break the
+        # turn.
+        turn = TurnMetadata(
+            channel=msg.channel,
+            sender_id=msg.sender_id,
+            chat_id=msg.chat_id,
+            content=msg.content,
+            media=[p for p in (msg.media or []) if isinstance(p, str) and p],
+            timestamp=msg.timestamp,
+            is_synthetic=_synthetic,
+            message_id=msg.metadata.get("message_id"),
+        )
+        await self._turn_hook.before_turn(turn)
 
         key = session_key or msg.session_key
         session = sessions.get_or_create(key)
@@ -1390,19 +1402,12 @@ class AgentLoop:
             except Exception:
                 logger.debug("agent_initiated_action emit failed", exc_info=True)
 
-        # Persist assistant reply to hist_chat_messages. _chat_ctx is None
-        # when persistence is disabled, the channel is unsupported, or the
-        # sender didn't resolve to a contributor — all already logged in
-        # on_message_received.
-        if _chat_ctx is not None:
-            try:
-                await _chat_persist.on_response_sent(
-                    _chat_ctx,
-                    response_content=final_content,
-                    schedule_background=self._schedule_background,
-                )
-            except Exception:
-                logger.debug("chat_persist on_response_sent error (non-fatal)", exc_info=True)
+        # Fire after_turn lifecycle. Hooks read state stashed during
+        # before_turn (e.g. chat_persist pairs its inbound contributor ctx
+        # with the assistant reply here). Errors are isolated in the composite.
+        turn.response_content = final_content
+        turn.stop_reason = stop_reason
+        await self._turn_hook.after_turn(turn)
 
         meta = dict(msg.metadata or {})
         streamed = on_stream is not None and stop_reason != STOP_ERROR
