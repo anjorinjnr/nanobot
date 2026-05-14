@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -49,9 +50,17 @@ class TurnMetadata:
     timestamp: datetime
     is_synthetic: bool
     message_id: str | None = None
+    is_guest: bool = False
+    # Synthetic-turn trigger (heartbeat, cron, …). None for user turns.
+    trigger_kind: str | None = None
+    # time.monotonic() snapshot taken when the turn begins — used by hooks
+    # that compute latency without re-stamping their own timers.
+    started_at_monotonic: float = field(default_factory=time.monotonic)
     state: dict[str, Any] = field(default_factory=dict)
+    # Populated by the caller immediately before after_turn fires.
     response_content: str | None = None
     stop_reason: str | None = None
+    tools_used: list[str] = field(default_factory=list)
 
 
 class AgentHook:
