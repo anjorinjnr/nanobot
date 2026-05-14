@@ -106,7 +106,7 @@ class TestClassifyAsync:
     @pytest.mark.asyncio
     async def test_cache_hit_avoids_api_call(self):
         _cache._data.clear()
-        with patch("nanobot.analytics.classify._call_gemini_async", return_value="calendar") as mock:
+        with patch("nanobot.analytics.classify._call_classifier_async", return_value="calendar") as mock:
             r1 = await classify_message_async("schedule a meeting")
             r2 = await classify_message_async("schedule a meeting")
             assert r1 == r2 == "calendar"
@@ -115,5 +115,5 @@ class TestClassifyAsync:
     @pytest.mark.asyncio
     async def test_falls_back_on_exception(self):
         _cache._data.clear()
-        with patch("nanobot.analytics.classify._call_gemini_async", side_effect=Exception("boom")):
+        with patch("nanobot.analytics.classify._call_classifier_async", side_effect=Exception("boom")):
             assert await classify_message_async("anything") == _FALLBACK
