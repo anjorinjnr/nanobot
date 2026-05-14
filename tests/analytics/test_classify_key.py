@@ -31,7 +31,7 @@ def test_llm_system_key_wins_when_set(monkeypatch):
     api_key, url, model, provider = chosen
     assert api_key == "sk-or-v1-system"
     assert "openrouter.ai" in url
-    assert model == "google/gemini-2.5-flash"
+    assert model == "openrouter/auto"
     assert provider == "openrouter"
 
 

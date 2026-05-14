@@ -133,9 +133,12 @@ async def classify_message_async(text: str) -> str:
 # when both are configured so platform cost lands in one ledger.
 _CLASSIFIER_ROUTES: tuple[tuple[str, str, str, str], ...] = (
     (
+        # `openrouter/auto` lets OpenRouter pick the cheapest viable model
+        # per request — single-tag snake_case classification doesn't need
+        # a specific model, and pinning bakes in a SKU that ages out.
         "LLM_SYSTEM_API_KEY",
         "https://openrouter.ai/api/v1/chat/completions",
-        "google/gemini-2.5-flash",
+        "openrouter/auto",
         "openrouter",
     ),
     (
