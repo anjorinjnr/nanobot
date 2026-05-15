@@ -27,13 +27,25 @@ USD_PER_MTOK: dict[str, tuple[float, float] | tuple[float, float, float]] = {
     # Anthropic
     "claude-haiku-4-5-20251001": (1.00, 5.00, 0.10),
     "claude-sonnet-4-6": (3.00, 15.00, 0.30),
-    # Gemini
+    # Gemini (direct via Google AI)
     "gemini/gemini-2.5-flash": (0.075, 0.30),
     "gemini/gemini-3-flash-preview": (0.30, 2.50),
     "gemini/gemini-3.1-pro-preview": (1.25, 10.00),
     # OpenRouter — DeepSeek
+    # Both slugs exist in the wild: switch_model.py's `default-cheap`
+    # preset emits `deepseek/deepseek-v3.2` (which litellm prefixes to
+    # `openrouter/deepseek/deepseek-v3.2`), while OR also exposes the
+    # `deepseek-chat-v3.2` and `:free` variants. Price them all the
+    # same — the v3.2 SKU is one price tier.
+    "openrouter/deepseek/deepseek-v3.2": (0.27, 0.41),
     "openrouter/deepseek/deepseek-chat-v3.2": (0.27, 0.41),
     "openrouter/deepseek/deepseek-chat-v3.2:free": (0.0, 0.0),
+    # OpenRouter — Gemini (routed via OR rather than direct Google AI).
+    # Pricing matches Google's published rates; OR pass-throughs cost.
+    "openrouter/google/gemini-2.5-flash": (0.075, 0.30),
+    "openrouter/google/gemini-2.5-pro": (1.25, 5.00),
+    "openrouter/google/gemini-3-flash-preview": (0.30, 2.50),
+    "openrouter/google/gemini-3.1-pro-preview": (1.25, 10.00),
     # OpenRouter — Cerebras Qwen
     "cerebras/qwen-3-235b-a22b-instruct": (0.60, 1.20),
 }
