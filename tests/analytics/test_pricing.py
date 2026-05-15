@@ -69,6 +69,37 @@ def test_cost_table_free_models_are_zero():
     assert cost == 0.0
 
 
+def test_cost_table_prices_deepseek_v32_slug():
+    """`switch_model.py --model default-cheap` emits
+    `deepseek/deepseek-v3.2` (no `-chat-`), which litellm prefixes to
+    `openrouter/deepseek/deepseek-v3.2`. Before this row was added the
+    lookup missed and every default-tier chat/heartbeat tick recorded
+    `$ai_total_cost_usd = 0`, which is what hid Esther's pre-hotfix
+    spam window from cost dashboards.
+    """
+    cost = estimate_cost_usd(
+        "openrouter/deepseek/deepseek-v3.2",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+    )
+    # 0.27 input + 0.41 output per Mtok
+    assert cost == pytest.approx(0.68, abs=1e-9)
+
+
+def test_cost_table_prices_openrouter_gemini_routes():
+    """Hosted-default tenants on `google/gemini-2.5-pro` via OR were
+    showing $0 cost on every chat turn until these rows landed —
+    pricing parity with direct-Gemini, just routed through OR.
+    """
+    cost = estimate_cost_usd(
+        "openrouter/google/gemini-2.5-pro",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+    )
+    # 1.25 input + 5.00 output per Mtok
+    assert cost == pytest.approx(6.25, abs=1e-9)
+
+
 # ── normalize_model_name ─────────────────────────────────────────────────
 
 
