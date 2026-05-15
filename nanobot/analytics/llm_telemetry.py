@@ -184,6 +184,8 @@ def track_llm_generation(
     http_status: int | None = None,
     trace_id: str | None = None,
     is_synthetic: bool | None = None,
+    model_served: str | None = None,
+    cost_usd_served: float | None = None,
     extra: dict[str, Any] | None = None,
 ) -> None:
     """Fire one ``$ai_generation`` event. Fire-and-forget.
@@ -230,6 +232,23 @@ def track_llm_generation(
             props["$ai_http_status"] = int(http_status)
         if trace_id:
             props["$ai_trace_id"] = trace_id
+        # `$ai_model` is what we asked for; `$ai_model_served` is what
+        # the provider actually routed to (OpenRouter exposes this via
+        # `response.model`). Diverges when OR's auto-router or a
+        # fallback chain substitutes — the only way to answer "which
+        # generation actually used GPT-class compute" after the fact.
+        # Emit only when it actually differs to keep payloads tight.
+        served_norm = canonicalize_for_telemetry(model_served) if model_served else None
+        if served_norm and served_norm != props["$ai_model"]:
+            props["$ai_model_served"] = served_norm
+        # `$ai_cost_usd_served` is the provider's authoritative dollar
+        # charge (OpenRouter populates `usage.cost`). Strictly better
+        # than our pricing-table estimate when present — no maintenance,
+        # accounts for promo credits / volume tiers / route price
+        # changes. Keep both: `$ai_total_cost_usd` (estimate) is the
+        # universal fallback for providers that don't report cost.
+        if cost_usd_served is not None:
+            props["$ai_cost_usd_served"] = round(float(cost_usd_served), 8)
 
         hid = _household_id()
         if hid:

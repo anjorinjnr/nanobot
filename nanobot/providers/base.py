@@ -62,6 +62,18 @@ class LLMResponse:
     error_code: str | None = None  # Provider/code semantic, e.g. rate_limit_exceeded.
     error_retry_after_s: float | None = None
     error_should_retry: bool | None = None
+    # Cost-attribution fields populated by OpenAI-compatible providers
+    # (OpenRouter in particular). `model_served` is the routed-to SKU
+    # from `response.model` — diverges from the requested model when
+    # OR's auto-router or a fallback chain substitutes (e.g. asking for
+    # `openrouter/auto` and getting `openai/gpt-5.4-pro` served).
+    # `cost_usd` is the provider's own authoritative dollar charge from
+    # `response.usage.cost` (OpenRouter populates this). When present it
+    # beats our estimate — no pricing-table maintenance, accounts for
+    # promo credits, volume tiers, and per-route price changes.
+    # Both default None for providers that don't supply them.
+    model_served: str | None = None
+    cost_usd: float | None = None
 
     @property
     def has_tool_calls(self) -> bool:
@@ -576,6 +588,8 @@ class LLMProvider(ABC):
                 latency_s=latency_s,
                 is_error=response.finish_reason == "error",
                 http_status=response.error_status_code,
+                model_served=response.model_served,
+                cost_usd_served=response.cost_usd,
             )
         except Exception:  # noqa: BLE001 — telemetry must never crash the loop.
             logger.opt(exception=True).debug("ai_generation telemetry emit failed")

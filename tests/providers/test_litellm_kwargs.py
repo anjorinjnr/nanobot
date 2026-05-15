@@ -755,6 +755,20 @@ def test_dashscope_no_extra_body_when_reasoning_effort_none() -> None:
     assert "extra_body" not in kw
 
 
+def test_openrouter_always_requests_usage_include_for_cost_capture() -> None:
+    """OR requests opt into authoritative cost reporting on every call —
+    cost dashboards depend on `usage.cost` landing in response. Direct
+    providers (OpenAI, DashScope, etc.) must NOT get this added because
+    strict-schema endpoints reject unknown extra_body fields.
+    """
+    or_kw = _build_kwargs_for("openrouter", "anthropic/claude-sonnet-4-6", reasoning_effort=None)
+    assert or_kw.get("extra_body") == {"usage": {"include": True}}
+
+    # Non-OR providers must NOT carry the `usage` opt-in.
+    openai_kw = _build_kwargs_for("openai", "gpt-5", reasoning_effort=None)
+    assert "extra_body" not in openai_kw or "usage" not in openai_kw["extra_body"]
+
+
 def test_minimax_reasoning_split_enabled_with_reasoning_effort() -> None:
     kw = _build_kwargs_for("minimax", "MiniMax-M2.7", reasoning_effort="medium")
     assert kw["extra_body"] == {"reasoning_split": True}
@@ -879,9 +893,15 @@ def test_kimi_k25_no_extra_body_when_reasoning_effort_none() -> None:
 
 
 def test_kimi_k25_thinking_enabled_with_openrouter_prefix() -> None:
-    """OpenRouter-style model names like moonshotai/kimi-k2.5 must trigger thinking."""
+    """OpenRouter-style model names like moonshotai/kimi-k2.5 must trigger
+    thinking. OR requests also opt into authoritative cost reporting via
+    `usage.include=true`, captured alongside the thinking config.
+    """
     kw = _build_kwargs_for("openrouter", "moonshotai/kimi-k2.5", reasoning_effort="medium")
-    assert kw.get("extra_body") == {"thinking": {"type": "enabled"}}
+    assert kw.get("extra_body") == {
+        "thinking": {"type": "enabled"},
+        "usage": {"include": True},
+    }
 
 
 def test_kimi_k26_thinking_enabled() -> None:
@@ -891,9 +911,15 @@ def test_kimi_k26_thinking_enabled() -> None:
 
 
 def test_kimi_k26_thinking_enabled_with_openrouter_prefix() -> None:
-    """OpenRouter-style names like moonshotai/kimi-k2.6 must trigger thinking."""
+    """OpenRouter-style names like moonshotai/kimi-k2.6 must trigger
+    thinking, and OR requests also opt into `usage.include=true` for
+    authoritative cost reporting.
+    """
     kw = _build_kwargs_for("openrouter", "moonshotai/kimi-k2.6", reasoning_effort="medium")
-    assert kw.get("extra_body") == {"thinking": {"type": "enabled"}}
+    assert kw.get("extra_body") == {
+        "thinking": {"type": "enabled"},
+        "usage": {"include": True},
+    }
 
 
 def test_moonshot_kimi_k26_temperature_override() -> None:
@@ -903,9 +929,14 @@ def test_moonshot_kimi_k26_temperature_override() -> None:
 
 
 def test_kimi_k25_thinking_disabled_with_openrouter_prefix() -> None:
-    """OpenRouter names must NOT trigger thinking without reasoning_effort."""
+    """OpenRouter names must NOT trigger thinking without reasoning_effort.
+    extra_body is still set because OR requests always opt into
+    authoritative cost reporting (`usage.include=true`); just no
+    thinking field.
+    """
     kw = _build_kwargs_for("openrouter", "moonshotai/kimi-k2.5", reasoning_effort=None)
-    assert "extra_body" not in kw
+    assert kw.get("extra_body") == {"usage": {"include": True}}
+    assert "thinking" not in kw["extra_body"]
 
 
 def test_kimi_k26_code_preview_thinking_enabled() -> None:

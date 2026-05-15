@@ -149,6 +149,85 @@ def test_track_unknown_task_kind_tagged_not_dropped(mock_hook):
     assert props["unknown_task_kind"] is True
 
 
+def test_track_emits_ai_model_served_when_or_substitutes(mock_hook):
+    """Asked for `openrouter/auto`, OR served `openai/gpt-5.4-pro` — the
+    served SKU lands on $ai_model_served so dashboards can attribute
+    GPT-class spend to specific generations, households, and call sites
+    even when the request was generic.
+    """
+    track_llm_generation(
+        model="openrouter/auto",
+        provider="openrouter",
+        input_tokens=100,
+        output_tokens=50,
+        latency_s=0.5,
+        task_kind="chat",
+        model_served="openai/gpt-5.4-pro",
+    )
+    _, props = _last_event(mock_hook._client)
+    # canonicalize_for_telemetry strips the `openrouter/` prefix on
+    # $ai_model so dashboards see a single model dimension; the
+    # served-model field gets the same treatment, but since the served
+    # SKU is from a different provider (openai/...) it still distinct.
+    assert props["$ai_model"] == "auto"
+    assert props["$ai_model_served"] == "gpt-5.4-pro"
+
+
+def test_track_omits_ai_model_served_when_same_as_request(mock_hook):
+    """Direct providers and OR routes that didn't substitute return the
+    same model — no point storing two copies of the same string.
+    """
+    track_llm_generation(
+        model="claude-haiku-4-5-20251001",
+        provider="anthropic",
+        input_tokens=100,
+        output_tokens=50,
+        latency_s=0.5,
+        task_kind="chat",
+        model_served="claude-haiku-4-5-20251001",
+    )
+    _, props = _last_event(mock_hook._client)
+    assert "$ai_model_served" not in props
+
+
+def test_track_emits_ai_cost_usd_served_when_provider_reports_cost(mock_hook):
+    """OpenRouter populates `usage.cost`. Captured as
+    $ai_cost_usd_served and kept alongside $ai_total_cost_usd (the
+    estimate) so we can reconcile dashboards even when the estimate
+    drifts (promo credits, volume tiers, route price changes).
+    """
+    track_llm_generation(
+        model="google/gemini-2.5-pro",
+        provider="openrouter",
+        input_tokens=1000,
+        output_tokens=500,
+        latency_s=0.5,
+        task_kind="chat",
+        cost_usd_served=0.0123456789,
+    )
+    _, props = _last_event(mock_hook._client)
+    # OR's authoritative number — kept to 8 decimal places.
+    assert props["$ai_cost_usd_served"] == pytest.approx(0.01234568, abs=1e-9)
+    # Estimate still emitted so direct-provider dashboards keep working.
+    assert "$ai_total_cost_usd" in props
+
+
+def test_track_omits_ai_cost_usd_served_when_provider_silent(mock_hook):
+    """Direct-Anthropic / direct-Gemini responses don't carry `cost` —
+    omit the served-cost field entirely so downstream queries can
+    distinguish "provider didn't report" from "$0.00 charge"."""
+    track_llm_generation(
+        model="claude-haiku-4-5-20251001",
+        provider="anthropic",
+        input_tokens=100,
+        output_tokens=50,
+        latency_s=0.5,
+        task_kind="chat",
+    )
+    _, props = _last_event(mock_hook._client)
+    assert "$ai_cost_usd_served" not in props
+
+
 def test_track_skips_emit_when_posthog_disabled(monkeypatch):
     fake = MagicMock()
     fake._initialized = True
