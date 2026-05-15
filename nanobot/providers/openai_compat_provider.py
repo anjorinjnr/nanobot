@@ -434,6 +434,18 @@ class OpenAICompatProvider(LLMProvider):
                 {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
             )
 
+        # OpenRouter: opt into authoritative cost reporting on the
+        # response. OR returns `usage.cost` (USD float) on every chat
+        # completion when `usage: {include: true}` is set on the body.
+        # Captured by openai_compat's _extract_cost_usd and emitted as
+        # `$ai_cost_usd_served` — strictly better than our pricing-table
+        # estimate (no maintenance, promo credits / volume tiers /
+        # per-route price changes all reflected). No-op for direct
+        # providers; OR-specific to avoid breaking OpenAI strict-schema
+        # endpoints that reject unknown fields.
+        if _uses_openrouter_attribution(spec, getattr(self, "api_base", None)):
+            kwargs.setdefault("extra_body", {})["usage"] = {"include": True}
+
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -615,6 +627,60 @@ class OpenAICompatProvider(LLMProvider):
         return str(value)
 
     @classmethod
+    def _extract_served_model(cls, response: Any) -> str | None:
+        """Return the routed-to model id from `response.model`, or None.
+
+        OpenRouter (and most OpenAI-compatible providers) echo the SKU
+        they actually served on the response. For OR specifically this
+        can differ from the requested model when the auto-router or a
+        fallback chain substitutes — capturing it is how we answer
+        "which generation actually used GPT-class compute" after the
+        fact.
+        """
+        response_map = cls._maybe_mapping(response)
+        if response_map is not None:
+            served = response_map.get("model")
+        else:
+            served = getattr(response, "model", None)
+        if not served:
+            return None
+        return str(served)
+
+    @classmethod
+    def _extract_cost_usd(cls, response: Any) -> float | None:
+        """Return the provider's authoritative dollar charge, or None.
+
+        OpenRouter populates `usage.cost` (USD, float) on every
+        completion. When present this strictly beats our pricing-table
+        estimate — no table maintenance, accounts for promo credits,
+        volume tiers, and per-route price changes. Direct providers
+        (Anthropic, Gemini) don't supply this field, so callers fall
+        back to `$ai_total_cost_usd` (the estimate).
+
+        Returns None when the field is absent or non-numeric — never
+        raises, telemetry must not crash callers.
+        """
+        usage_obj: Any = None
+        response_map = cls._maybe_mapping(response)
+        if response_map is not None:
+            usage_obj = response_map.get("usage")
+        elif hasattr(response, "usage") and response.usage:
+            usage_obj = response.usage
+        if usage_obj is None:
+            return None
+        usage_map = cls._maybe_mapping(usage_obj)
+        if usage_map is not None:
+            cost = usage_map.get("cost")
+        else:
+            cost = getattr(usage_obj, "cost", None)
+        if cost is None:
+            return None
+        try:
+            return float(cost)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
     def _extract_usage(cls, response: Any) -> dict[str, int]:
         """Extract token usage from an OpenAI-compatible response.
 
@@ -700,6 +766,8 @@ class OpenAICompatProvider(LLMProvider):
                         reasoning_content=reasoning_content,
                         finish_reason=str(response_map.get("finish_reason") or "stop"),
                         usage=self._extract_usage(response_map),
+                        model_served=self._extract_served_model(response_map),
+                        cost_usd=self._extract_cost_usd(response_map),
                     )
                 return LLMResponse(content="Error: API returned empty choices.", finish_reason="error")
 
@@ -751,6 +819,8 @@ class OpenAICompatProvider(LLMProvider):
                 finish_reason=finish_reason,
                 usage=self._extract_usage(response_map),
                 reasoning_content=reasoning_content if isinstance(reasoning_content, str) else None,
+                model_served=self._extract_served_model(response_map),
+                cost_usd=self._extract_cost_usd(response_map),
             )
 
         if not response.choices:
@@ -798,6 +868,8 @@ class OpenAICompatProvider(LLMProvider):
             finish_reason=finish_reason or "stop",
             usage=self._extract_usage(response),
             reasoning_content=reasoning_content,
+            model_served=self._extract_served_model(response),
+            cost_usd=self._extract_cost_usd(response),
         )
 
     @classmethod
@@ -807,6 +879,14 @@ class OpenAICompatProvider(LLMProvider):
         tc_bufs: dict[int, dict[str, Any]] = {}
         finish_reason = "stop"
         usage: dict[str, int] = {}
+        # `response.model` typically arrives on the first chunk; OR's
+        # `usage.cost` only shows up on the final chunk that carries
+        # the usage block. Track the latest non-None of each across the
+        # whole stream so the aggregated LLMResponse reflects the
+        # routed-to model + authoritative cost regardless of which
+        # chunk they landed on.
+        served_model: str | None = None
+        cost_usd: float | None = None
 
         def _accum_tc(tc: Any, idx_hint: int) -> None:
             """Accumulate one streaming tool-call delta into *tc_bufs*."""
@@ -841,6 +921,10 @@ class OpenAICompatProvider(LLMProvider):
 
             chunk_map = cls._maybe_mapping(chunk)
             if chunk_map is not None:
+                served_model = cls._extract_served_model(chunk_map) or served_model
+                chunk_cost = cls._extract_cost_usd(chunk_map)
+                if chunk_cost is not None:
+                    cost_usd = chunk_cost
                 choices = chunk_map.get("choices") or []
                 if not choices:
                     usage = cls._extract_usage(chunk_map) or usage
@@ -867,6 +951,10 @@ class OpenAICompatProvider(LLMProvider):
                 usage = cls._extract_usage(chunk_map) or usage
                 continue
 
+            served_model = cls._extract_served_model(chunk) or served_model
+            chunk_cost = cls._extract_cost_usd(chunk)
+            if chunk_cost is not None:
+                cost_usd = chunk_cost
             if not chunk.choices:
                 usage = cls._extract_usage(chunk) or usage
                 continue
@@ -901,6 +989,8 @@ class OpenAICompatProvider(LLMProvider):
             finish_reason=finish_reason,
             usage=usage,
             reasoning_content="".join(reasoning_parts) or None,
+            model_served=served_model,
+            cost_usd=cost_usd,
         )
 
     @classmethod
