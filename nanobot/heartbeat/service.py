@@ -193,12 +193,35 @@ class DueTask:
         return out
 
 
+# Canonical preset slate — kept in lockstep with homer's tools/switch_model.py
+# MODELS dict. Every entry resolves to an OpenRouter slug (vendor/model) because
+# the consolidation migrated all tenant LLM traffic to OpenRouter sub-keys.
+# Older aliases (flash25, flash, pro, sonnet, haiku) are retained for back-compat
+# with tasks predating the consolidation but should be considered deprecated.
 MODEL_PRESETS: dict[str, str] = {
-    "flash25": "gemini/gemini-2.5-flash",
-    "flash": "gemini/gemini-3-flash-preview",
-    "pro": "gemini/gemini-3.1-pro-preview",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
+    # OpenRouter-routed canonical presets
+    "auto":            "openrouter/auto",
+    "cheap":           "deepseek/deepseek-v3.2",
+    "default-cheap":   "deepseek/deepseek-v3.2",
+
+    "gemini-fast":     "google/gemini-2.5-flash",
+    "gemini-balanced": "google/gemini-2.5-pro",
+    "gemini-smart":    "google/gemini-3.1-pro-preview",
+
+    "gpt-fast":        "openai/gpt-5-mini",
+    "gpt-balanced":    "openai/gpt-5",
+    "gpt-smart":       "openai/gpt-5.5",
+
+    "claude-fast":     "anthropic/claude-haiku-4.5",
+    "claude-balanced": "anthropic/claude-sonnet-4.6",
+    "claude-smart":    "anthropic/claude-opus-4.7",
+
+    # Deprecated direct-provider aliases — pre-consolidation.
+    "flash25":         "gemini/gemini-2.5-flash",
+    "flash":           "gemini/gemini-3-flash-preview",
+    "pro":             "gemini/gemini-3.1-pro-preview",
+    "sonnet":          "claude-sonnet-4-6",
+    "haiku":           "claude-haiku-4-5-20251001",
 }
 
 
