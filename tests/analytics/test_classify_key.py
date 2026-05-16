@@ -3,7 +3,7 @@
 Three-way precedence so the classifier can run on either side of the
 OpenRouter consolidation:
 
-  1. ``LLM_SYSTEM_API_KEY`` → OpenRouter (post-consolidation; platform-
+  1. ``OPENROUTER_API_KEY_SYSTEM`` → OpenRouter (post-consolidation; platform-
      funded system sub-key).
   2. ``HOMER_ANALYTICS_GEMINI_API_KEY`` → direct Gemini (legacy Homer-
      owned analytics key).
@@ -17,13 +17,13 @@ from nanobot.analytics.classify import _resolve_api_key, _resolve_route
 
 
 def _clear(monkeypatch):
-    for v in ("LLM_SYSTEM_API_KEY", "HOMER_ANALYTICS_GEMINI_API_KEY", "GEMINI_API_KEY"):
+    for v in ("OPENROUTER_API_KEY_SYSTEM", "HOMER_ANALYTICS_GEMINI_API_KEY", "GEMINI_API_KEY"):
         monkeypatch.delenv(v, raising=False)
 
 
 def test_llm_system_key_wins_when_set(monkeypatch):
     _clear(monkeypatch)
-    monkeypatch.setenv("LLM_SYSTEM_API_KEY", "sk-or-v1-system")
+    monkeypatch.setenv("OPENROUTER_API_KEY_SYSTEM", "sk-or-v1-system")
     monkeypatch.setenv("HOMER_ANALYTICS_GEMINI_API_KEY", "homer_owned")
     monkeypatch.setenv("GEMINI_API_KEY", "tenant_owned")
     chosen = _resolve_route()
@@ -61,7 +61,7 @@ def test_returns_empty_when_nothing_set(monkeypatch):
 
 def test_strips_whitespace(monkeypatch):
     _clear(monkeypatch)
-    monkeypatch.setenv("LLM_SYSTEM_API_KEY", "  sk-or-v1-padded  ")
+    monkeypatch.setenv("OPENROUTER_API_KEY_SYSTEM", "  sk-or-v1-padded  ")
     assert _resolve_api_key() == "sk-or-v1-padded"
 
 
@@ -69,6 +69,6 @@ def test_blank_higher_priority_key_falls_through(monkeypatch):
     """An accidentally-empty higher-priority key must not blackhole the
     classifier."""
     _clear(monkeypatch)
-    monkeypatch.setenv("LLM_SYSTEM_API_KEY", "   ")
+    monkeypatch.setenv("OPENROUTER_API_KEY_SYSTEM", "   ")
     monkeypatch.setenv("HOMER_ANALYTICS_GEMINI_API_KEY", "homer_owned")
     assert _resolve_api_key() == "homer_owned"

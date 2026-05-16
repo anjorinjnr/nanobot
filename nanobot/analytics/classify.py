@@ -8,7 +8,7 @@ reason (no API key, network error, malformed response) we return
 from "pipeline broke".
 
 Routing goes through the platform-funded OpenRouter "system" key
-(``LLM_SYSTEM_API_KEY``) so analytics classification doesn't show up in
+(``OPENROUTER_API_KEY_SYSTEM``) so analytics classification doesn't show up in
 tenant cost reports. We hit Gemini Flash via OpenRouter's catalog
 (``google/gemini-2.5-flash``) rather than calling Google directly so all
 homer LLM spend lands in one OpenRouter ledger. The legacy
@@ -136,7 +136,7 @@ _CLASSIFIER_ROUTES: tuple[tuple[str, str, str, str], ...] = (
         # `openrouter/auto` lets OpenRouter pick the cheapest viable model
         # per request — single-tag snake_case classification doesn't need
         # a specific model, and pinning bakes in a SKU that ages out.
-        "LLM_SYSTEM_API_KEY",
+        "OPENROUTER_API_KEY_SYSTEM",
         "https://openrouter.ai/api/v1/chat/completions",
         "openrouter/auto",
         "openrouter",
@@ -160,7 +160,7 @@ def _resolve_route() -> tuple[str, str, str, str] | None:
     """Pick the active classifier route.
 
     Preference order, top→bottom:
-      1. ``LLM_SYSTEM_API_KEY`` → OpenRouter (post-consolidation default;
+      1. ``OPENROUTER_API_KEY_SYSTEM`` → OpenRouter (post-consolidation default;
          platform-funded sub-key, cost lands on the system bucket).
       2. ``HOMER_ANALYTICS_GEMINI_API_KEY`` → direct Gemini (legacy
          Homer-owned key for tenants still on the pre-consolidation env
