@@ -925,6 +925,34 @@ def test_compute_due_tasks_all_presets_resolve() -> None:
         assert due[0].model == expected, f"Preset '{preset}' did not resolve"
 
 
+def test_compute_due_tasks_caller_supplied_presets_override_builtin() -> None:
+    """When _compute_due_tasks is passed an explicit `model_presets`, it wins
+    over the module-level MODEL_PRESETS slate. Lets homer ship a different
+    preset map via guest_config.json without forking nanobot."""
+    now = datetime(2026, 3, 12, 10, 0)
+    past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+    custom = {"gemini-fast": "openrouter/google/gemini-3-flash-preview"}
+    content = _make_heartbeat(
+        f"\n### Task\nSchedule: {past}\nModel: gemini-fast\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now, model_presets=custom)
+    assert len(due) == 1
+    assert due[0].model == "openrouter/google/gemini-3-flash-preview"
+
+
+def test_compute_due_tasks_empty_caller_presets_falls_back_to_builtin() -> None:
+    """An empty dict shouldn't black-hole `Model:` resolution — None / empty
+    means "no override", fall back to the built-in slate."""
+    now = datetime(2026, 3, 12, 10, 0)
+    past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+    content = _make_heartbeat(
+        f"\n### Task\nSchedule: {past}\nModel: flash\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now, model_presets=None)
+    assert len(due) == 1
+    assert due[0].model == MODEL_PRESETS["flash"]
+
+
 @pytest.mark.asyncio
 async def test_tick_groups_tasks_by_model(tmp_path, monkeypatch) -> None:
     """Tasks with different models get separate on_execute calls."""

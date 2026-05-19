@@ -253,6 +253,7 @@ class HeartbeatService:
         timezone: str | None = None,
         suppress_errors: bool = False,
         pre_check_registry: dict[str, str] | None = None,
+        model_presets: dict[str, str] | None = None,
     ):
         self.workspace = workspace
         self.provider = provider
@@ -266,6 +267,9 @@ class HeartbeatService:
         self.timezone = timezone
         self.suppress_errors = suppress_errors
         self.pre_check_registry = pre_check_registry or {}
+        # An empty/None override falls back to the built-in slate so existing
+        # deployments and tests keep working without a config change.
+        self.model_presets = model_presets or MODEL_PRESETS
         self._running = False
         self._task: asyncio.Task | None = None
 
@@ -282,7 +286,11 @@ class HeartbeatService:
         return datetime.now(tz=tz) if tz else datetime.now().astimezone()
 
     @staticmethod
-    def _compute_due_tasks(content: str, now: datetime) -> list[DueTask]:
+    def _compute_due_tasks(
+        content: str,
+        now: datetime,
+        model_presets: dict[str, str] | None = None,
+    ) -> list[DueTask]:
         """Deterministically compute which tasks are due now.
 
         Returns a list of DueTask covering three types:
@@ -353,7 +361,8 @@ class HeartbeatService:
             model = None
             if model_match:
                 raw = model_match.group(1).strip()
-                model = MODEL_PRESETS.get(raw, raw)  # resolve preset or use as-is
+                presets = model_presets if model_presets is not None else MODEL_PRESETS
+                model = presets.get(raw, raw)  # resolve preset or use as-is
 
             pre_check_match = re.search(r"^Pre-check:\s*(\S+)", block, re.MULTILINE)
             pre_check = pre_check_match.group(1).strip() if pre_check_match else None
@@ -490,7 +499,7 @@ class HeartbeatService:
         now = self._now()
 
         if self.last_run_tracking:
-            due = self._compute_due_tasks(content, now.replace(tzinfo=None))
+            due = self._compute_due_tasks(content, now.replace(tzinfo=None), self.model_presets)
             if not due:
                 return "skip", "", []
             summary = ", ".join(f"{t.name} ({t.task_type})" for t in due)
