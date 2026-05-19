@@ -290,6 +290,58 @@ async def test_tick_notifies_when_evaluator_says_yes(tmp_path, monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_tick_skips_notify_when_on_execute_returns_empty(tmp_path, monkeypatch) -> None:
+    """When on_execute returns empty string, the evaluator is not consulted and
+    on_notify is not called. This is the contract the cli-side send_reasoning
+    gate relies on: returning "" from on_heartbeat_execute drops the
+    heartbeat's freeform tail without firing a delivery."""
+    (tmp_path / "HEARTBEAT.md").write_text("- [ ] check status", encoding="utf-8")
+
+    provider = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(
+                    id="hb_1",
+                    name="heartbeat",
+                    arguments={"action": "run", "tasks": "check status"},
+                )
+            ],
+        ),
+    ])
+
+    executed: list[str] = []
+    notified: list[str] = []
+    eval_called: list[bool] = []
+
+    async def _on_execute(tasks: str, model_override: str | None = None) -> str:
+        executed.append(tasks)
+        return ""  # send_reasoning=False path in production
+
+    async def _on_notify(response: str) -> None:
+        notified.append(response)
+
+    async def _eval(*a, **kw):
+        eval_called.append(True)
+        return True
+
+    monkeypatch.setattr("nanobot.utils.evaluator.evaluate_response", _eval)
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="openai/gpt-4o-mini",
+        on_execute=_on_execute,
+        on_notify=_on_notify,
+    )
+
+    await service._tick()
+    assert executed == ["check status"]
+    assert notified == []          # on_notify was NOT called
+    assert eval_called == []       # evaluator was NOT consulted either
+
+
+@pytest.mark.asyncio
 async def test_tick_suppresses_when_evaluator_says_no(tmp_path, monkeypatch) -> None:
     """Phase 1 run -> Phase 2 execute -> Phase 3 evaluate=silent -> on_notify NOT called."""
     (tmp_path / "HEARTBEAT.md").write_text("- [ ] check status", encoding="utf-8")
