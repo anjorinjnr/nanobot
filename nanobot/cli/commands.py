@@ -917,6 +917,7 @@ def _run_gateway(
         timezone=config.agents.defaults.timezone,
         suppress_errors=hb_cfg.suppress_errors,
         pre_check_registry=hb_cfg.pre_check_registry,
+        model_presets=hb_cfg.model_presets or None,
     )
 
     if channels.enabled_channels:

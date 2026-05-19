@@ -174,6 +174,7 @@ class HeartbeatConfig(Base):
     keep_recent_messages: int = 8
     suppress_errors: bool = True  # When True, error/failure messages from heartbeat are silenced (logged only, never sent to users)
     pre_check_registry: dict[str, str] = {}  # Maps Pre-check keys in HEARTBEAT.md to shell commands
+    model_presets: dict[str, str] = {}  # Maps `Model:` task-field aliases to upstream model ids. When non-empty, replaces nanobot's built-in MODEL_PRESETS for this gateway; when empty, the built-in slate is used.
 
 
 class ApiConfig(Base):
