@@ -834,7 +834,23 @@ def _run_gateway(
             pass
 
         session_key = f"{channel}:{chat_id}" if hb_cfg.shared_session else "heartbeat"
+
+        # Wipe the session before each dispatch so cross-task context can't
+        # bleed in. Heartbeat tasks each read their own state from files
+        # (message_log.jsonl, action_items.json, calendar API, etc.); they
+        # never need history from prior dispatches. Keeping that history
+        # produced hallucinated confirmations — e.g. Gmail-scan ticks
+        # pulling the morning brief out of context and fabricating
+        # "I've sent the morning brief to X" as the final turn. See #98 for
+        # the user-facing-leak gate; this PR stops the hallucination at its
+        # source. Heartbeat ticks are serialized in _run_loop, so the wipe
+        # can't race a concurrent dispatch.
+        if not hb_cfg.shared_session:
+            session = agent.sessions.get_or_create(session_key)
+            session.messages = []
+            agent.sessions.save(session)
         pre_exec_msg_count = len(agent.sessions.get_or_create(session_key).messages)
+
         resp = await agent.process_direct(
             tasks,
             session_key=session_key,
@@ -846,7 +862,7 @@ def _run_gateway(
             trigger_kind="heartbeat",
         )
 
-        session = agent.sessions.get_or_create("heartbeat")
+        session = agent.sessions.get_or_create(session_key)
         result = filter_heartbeat_response(resp, tasks, suppress_errors=hb_cfg.suppress_errors)
 
         if not result:
@@ -855,7 +871,10 @@ def _run_gateway(
             _drop_last_turn(session)
 
         _persist_outbound_messages(session, tasks, since_idx=pre_exec_msg_count)
-        session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
+        # No retain_recent_legal_suffix when wiping per dispatch — the next
+        # dispatch wipes anyway, so any retention is dead weight.
+        if hb_cfg.shared_session:
+            session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
         agent.sessions.save(session)
 
         # send_reasoning=False (the default) means only explicit `message` tool
