@@ -636,6 +636,32 @@ def serve(
 # ============================================================================
 
 
+def _wipe_isolated_heartbeat_session(sessions: "SessionManager", session_key: str) -> int:
+    """Reset the heartbeat session's message log before a dispatch.
+
+    Heartbeat tasks each share one "heartbeat" session_key when
+    ``shared_session=False`` (the default). Without resetting, the
+    previous dispatch's tail bleeds into the next dispatch's prompt and
+    the model hallucinates confirmations of unrelated past tasks
+    (e.g. Gmail-scan ticks fabricating "I've sent the morning brief").
+    Each task reads its own real state from files; cross-dispatch
+    session history adds no signal.
+
+    Returns ``0`` — the post-execute side reads ``pre_exec_msg_count``
+    to find this dispatch's outbound messages, which now start from the
+    top of an empty session.
+
+    Heartbeat ticks are serialized in ``_run_loop``; this is safe to
+    call without a lock. Callers should never invoke this with the
+    user's chat session_key — see the ``shared_session`` branch in
+    ``on_heartbeat_execute``.
+    """
+    session = sessions.get_or_create(session_key)
+    session.messages = []
+    sessions.save(session)
+    return 0
+
+
 @app.command()
 def gateway(
     port: int | None = typer.Option(None, "--port", "-p", help="Gateway port"),
@@ -834,7 +860,14 @@ def _run_gateway(
             pass
 
         session_key = f"{channel}:{chat_id}" if hb_cfg.shared_session else "heartbeat"
-        pre_exec_msg_count = len(agent.sessions.get_or_create(session_key).messages)
+        if hb_cfg.shared_session:
+            # shared_session=True co-opts the user's chat session — never wipe.
+            pre_exec_msg_count = len(agent.sessions.get_or_create(session_key).messages)
+        else:
+            pre_exec_msg_count = _wipe_isolated_heartbeat_session(
+                agent.sessions, session_key,
+            )
+
         resp = await agent.process_direct(
             tasks,
             session_key=session_key,
@@ -846,7 +879,7 @@ def _run_gateway(
             trigger_kind="heartbeat",
         )
 
-        session = agent.sessions.get_or_create("heartbeat")
+        session = agent.sessions.get_or_create(session_key)
         result = filter_heartbeat_response(resp, tasks, suppress_errors=hb_cfg.suppress_errors)
 
         if not result:
@@ -855,7 +888,10 @@ def _run_gateway(
             _drop_last_turn(session)
 
         _persist_outbound_messages(session, tasks, since_idx=pre_exec_msg_count)
-        session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
+        # No retain_recent_legal_suffix when wiping per dispatch — the next
+        # dispatch wipes anyway, so any retention is dead weight.
+        if hb_cfg.shared_session:
+            session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
         agent.sessions.save(session)
 
         # send_reasoning=False (the default) means only explicit `message` tool
