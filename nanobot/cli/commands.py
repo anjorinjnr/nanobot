@@ -857,6 +857,16 @@ def _run_gateway(
         _persist_outbound_messages(session, tasks, since_idx=pre_exec_msg_count)
         session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
         agent.sessions.save(session)
+
+        # send_reasoning=False (the default) means only explicit `message` tool
+        # calls reach the user. The agent's freeform tail — model narration
+        # after a tool call, hallucinated confirmations of unrelated past
+        # tasks, "I've checked your Gmail" routine updates — is dropped at the
+        # notify gate. Real deliveries already happened inside the loop via
+        # the `message` tool's own bus.publish_outbound path; only the post-
+        # tool narration is suppressed here.
+        if not hb_cfg.send_reasoning:
+            return ""
         return result
 
     async def on_heartbeat_notify(response: str) -> None:
