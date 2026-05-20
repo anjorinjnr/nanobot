@@ -1486,3 +1486,32 @@ def test_channels_login_requires_channel_name() -> None:
     result = runner.invoke(app, ["channels", "login"])
 
     assert result.exit_code == 2
+
+
+def test_wipe_isolated_heartbeat_session_clears_prior_messages(tmp_path) -> None:
+    """The wipe helper must clear cross-dispatch context. Regression guard for
+    the hallucinated-confirmation bug (e.g. Gmail-scan ticks pulling the morning
+    brief out of stale session history)."""
+    from nanobot.cli.commands import _wipe_isolated_heartbeat_session
+    from nanobot.session.manager import SessionManager
+
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("heartbeat")
+    session.messages = [
+        {"role": "user", "content": "Compose this morning's brief for Ebby"},
+        {"role": "assistant", "content": "🌅 Good morning..."},
+        {"role": "user", "content": "Gmail scan (system)"},
+    ]
+    sessions.save(session)
+
+    pre_exec = _wipe_isolated_heartbeat_session(sessions, "heartbeat")
+
+    # The wipe returns 0 so the post-execute side reads outbound messages
+    # from the top of an empty session.
+    assert pre_exec == 0
+    # The in-memory session is reset.
+    assert sessions.get_or_create("heartbeat").messages == []
+    # And the wipe is persisted — a fresh cache lookup (simulating a reload)
+    # also sees the empty session.
+    sessions.invalidate("heartbeat")
+    assert sessions.get_or_create("heartbeat").messages == []

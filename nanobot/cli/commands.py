@@ -636,6 +636,32 @@ def serve(
 # ============================================================================
 
 
+def _wipe_isolated_heartbeat_session(sessions: "SessionManager", session_key: str) -> int:
+    """Reset the heartbeat session's message log before a dispatch.
+
+    Heartbeat tasks each share one "heartbeat" session_key when
+    ``shared_session=False`` (the default). Without resetting, the
+    previous dispatch's tail bleeds into the next dispatch's prompt and
+    the model hallucinates confirmations of unrelated past tasks
+    (e.g. Gmail-scan ticks fabricating "I've sent the morning brief").
+    Each task reads its own real state from files; cross-dispatch
+    session history adds no signal.
+
+    Returns ``0`` — the post-execute side reads ``pre_exec_msg_count``
+    to find this dispatch's outbound messages, which now start from the
+    top of an empty session.
+
+    Heartbeat ticks are serialized in ``_run_loop``; this is safe to
+    call without a lock. Callers should never invoke this with the
+    user's chat session_key — see the ``shared_session`` branch in
+    ``on_heartbeat_execute``.
+    """
+    session = sessions.get_or_create(session_key)
+    session.messages = []
+    sessions.save(session)
+    return 0
+
+
 @app.command()
 def gateway(
     port: int | None = typer.Option(None, "--port", "-p", help="Gateway port"),
@@ -834,22 +860,13 @@ def _run_gateway(
             pass
 
         session_key = f"{channel}:{chat_id}" if hb_cfg.shared_session else "heartbeat"
-
-        # Wipe the session before each dispatch so cross-task context can't
-        # bleed in. Heartbeat tasks each read their own state from files
-        # (message_log.jsonl, action_items.json, calendar API, etc.); they
-        # never need history from prior dispatches. Keeping that history
-        # produced hallucinated confirmations — e.g. Gmail-scan ticks
-        # pulling the morning brief out of context and fabricating
-        # "I've sent the morning brief to X" as the final turn. See #98 for
-        # the user-facing-leak gate; this PR stops the hallucination at its
-        # source. Heartbeat ticks are serialized in _run_loop, so the wipe
-        # can't race a concurrent dispatch.
-        if not hb_cfg.shared_session:
-            session = agent.sessions.get_or_create(session_key)
-            session.messages = []
-            agent.sessions.save(session)
-        pre_exec_msg_count = len(agent.sessions.get_or_create(session_key).messages)
+        if hb_cfg.shared_session:
+            # shared_session=True co-opts the user's chat session — never wipe.
+            pre_exec_msg_count = len(agent.sessions.get_or_create(session_key).messages)
+        else:
+            pre_exec_msg_count = _wipe_isolated_heartbeat_session(
+                agent.sessions, session_key,
+            )
 
         resp = await agent.process_direct(
             tasks,
