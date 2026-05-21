@@ -511,6 +511,43 @@ class TestResolveSenderName:
         assert ch._resolve_sender_name("999999", "s1") == "Late Joiner"
 
 
+class TestLookupSenderName:
+    """`_lookup_sender_name` is the side-effect-free variant of
+    `_resolve_sender_name` (no greeted-set marking). The auto-heal path
+    relies on it firing on every inbound, not just first-per-session."""
+
+    def test_resolves_from_sender_map(self):
+        ch = _make_identity_channel(sender_map={"14125550002": "Emeka"})
+        assert ch._lookup_sender_name("14125550002") == "Emeka"
+
+    def test_resolves_lid_via_cross_reference(self):
+        ch = _make_identity_channel(
+            sender_map={"14125550002": "Emeka"},
+            lid_map={"914125550002": {"phone": "14125550002"}},
+        )
+        assert ch._lookup_sender_name("914125550002") == "Emeka"
+
+    def test_resolves_lid_with_direct_name(self):
+        ch = _make_identity_channel(
+            lid_map={"914125550002": {"phone": "14125550002", "name": "Emeka Direct"}},
+        )
+        assert ch._lookup_sender_name("914125550002") == "Emeka Direct"
+
+    def test_unknown_returns_none(self):
+        ch = _make_identity_channel()
+        assert ch._lookup_sender_name("999999") is None
+
+    def test_does_not_mark_greeted(self):
+        """Repeated calls must keep returning the same name — the side-effect-free
+        variant is the whole point of this method."""
+        ch = _make_identity_channel(sender_map={"14125550002": "Emeka"})
+        assert ch._lookup_sender_name("14125550002") == "Emeka"
+        assert ch._lookup_sender_name("14125550002") == "Emeka"
+        # And the greeted-gate behavior of _resolve_sender_name still works.
+        assert ch._resolve_sender_name("14125550002", "s1") == "Emeka"
+        assert ch._resolve_sender_name("14125550002", "s1") is None
+
+
 @pytest.mark.asyncio
 async def test_sender_name_injected_in_content():
     ch = _make_identity_channel(
@@ -850,3 +887,127 @@ async def test_send_media_caption_applies_markdown_link_transform():
     ch._client.send_media.assert_awaited_once()
     kwargs = ch._client.send_media.await_args.kwargs
     assert kwargs["caption"] == "Photo from https://homer.help/e/abc"
+
+
+# ── Auto-heal users.yaml on handle drift ─────────────────────────────────────
+#
+# `_auto_heal_users_yaml` lazy-imports `users_loader` from $HOMER_TOOLS at
+# runtime. In CI/dev the homer repo lives at `../homer` relative to nanobot;
+# this fixture puts its `tools/` dir on sys.path so the import resolves the
+# same way the container's entrypoint sets PYTHONPATH=$HOMER_TOOLS at boot.
+
+import os as _os
+import sys as _sys
+import yaml as _yaml
+
+_HOMER_TOOLS = Path(__file__).resolve().parent.parent.parent.parent / "homer" / "tools"
+
+
+@pytest.fixture
+def homer_users_yaml(tmp_path, monkeypatch):
+    """Provision a temp users.yaml + put homer's tools on sys.path so the
+    lazy `import users_loader` in `_auto_heal_users_yaml` resolves."""
+    if not _HOMER_TOOLS.exists():
+        pytest.skip(f"homer/tools not at {_HOMER_TOOLS} (expected sibling clone)")
+    if str(_HOMER_TOOLS) not in _sys.path:
+        monkeypatch.syspath_prepend(str(_HOMER_TOOLS))
+    # Force a fresh users_loader read of the override env var on this call.
+    _sys.modules.pop("users_loader", None)
+    path = tmp_path / "users.yaml"
+    monkeypatch.setenv("HOMER_USERS_YAML", str(path))
+    return path
+
+
+def _write_v2(path: Path, **users) -> None:
+    path.write_text(_yaml.safe_dump(
+        {"schema_version": 2, "users": users}, sort_keys=False,
+    ), encoding="utf-8")
+
+
+class TestAutoHealUsersYaml:
+    """Drift detection runs after `_resolve_sender_name`. The hook is
+    `_auto_heal_users_yaml(name, sender_jid)`; it must be idempotent,
+    only rewrite when needed, and never crash message handling."""
+
+    @pytest.mark.asyncio
+    async def test_rewrites_when_handle_differs(self, homer_users_yaml):
+        _write_v2(homer_users_yaml, primary={
+            "display_name": "Ebby Anjorin",
+            "role": "admin",
+            "channels": {"whatsapp": "246157477413033@lid"},  # stale Baileys form
+        })
+        ch = _make_identity_channel()
+        await ch._auto_heal_users_yaml("Ebby Anjorin", "246157477413033@lid.whatsapp.net")
+        doc = _yaml.safe_load(homer_users_yaml.read_text())
+        assert doc["users"]["primary"]["channels"]["whatsapp"] == "246157477413033@lid.whatsapp.net"
+
+    @pytest.mark.asyncio
+    async def test_noop_when_handle_matches(self, homer_users_yaml):
+        _write_v2(homer_users_yaml, primary={
+            "display_name": "Ebby Anjorin",
+            "role": "admin",
+            "channels": {"whatsapp": "246157477413033@lid.whatsapp.net"},
+        })
+        before_mtime = homer_users_yaml.stat().st_mtime_ns
+        ch = _make_identity_channel()
+        await ch._auto_heal_users_yaml("Ebby Anjorin", "246157477413033@lid.whatsapp.net")
+        # File must not have been rewritten — same mtime.
+        assert homer_users_yaml.stat().st_mtime_ns == before_mtime
+
+    @pytest.mark.asyncio
+    async def test_noop_for_unknown_name(self, homer_users_yaml):
+        _write_v2(homer_users_yaml, primary={
+            "display_name": "Ebby Anjorin", "role": "admin",
+            "channels": {"whatsapp": "old@lid"},
+        })
+        before = homer_users_yaml.read_bytes()
+        ch = _make_identity_channel()
+        # Name not in registry — must not create a new user, must not crash.
+        await ch._auto_heal_users_yaml("Stranger", "999@lid.whatsapp.net")
+        assert homer_users_yaml.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_empty_args_skip(self, homer_users_yaml):
+        _write_v2(homer_users_yaml, primary={
+            "display_name": "Ebby", "role": "admin",
+            "channels": {"whatsapp": "x@lid"},
+        })
+        before = homer_users_yaml.read_bytes()
+        ch = _make_identity_channel()
+        await ch._auto_heal_users_yaml("", "x@lid.whatsapp.net")
+        await ch._auto_heal_users_yaml("Ebby", "")
+        assert homer_users_yaml.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_swallows_load_failure(self, monkeypatch, homer_users_yaml, caplog):
+        """A broken users.yaml must not crash the channel — the heal logs and
+        returns, and the inbound message still gets processed."""
+        homer_users_yaml.write_text("not: valid: yaml: ::\n", encoding="utf-8")
+        ch = _make_identity_channel()
+        # Should not raise.
+        await ch._auto_heal_users_yaml("Ebby Anjorin", "246157477413033@lid.whatsapp.net")
+
+    @pytest.mark.asyncio
+    async def test_creates_channels_dict_when_absent(self, homer_users_yaml):
+        """A user record with no channels yet (e.g. fresh row written by the
+        portal before the welcome backfill ran) still gets healed."""
+        _write_v2(homer_users_yaml, primary={
+            "display_name": "Ebby Anjorin", "role": "admin",
+        })
+        ch = _make_identity_channel()
+        await ch._auto_heal_users_yaml("Ebby Anjorin", "246157477413033@lid.whatsapp.net")
+        doc = _yaml.safe_load(homer_users_yaml.read_text())
+        assert doc["users"]["primary"]["channels"]["whatsapp"] == "246157477413033@lid.whatsapp.net"
+
+    @pytest.mark.asyncio
+    async def test_case_insensitive_name_match(self, homer_users_yaml):
+        """sender_map values come from homer's USER.md / users.yaml; capitalisation
+        may not match exactly. Heal uses case-insensitive display_name lookup."""
+        _write_v2(homer_users_yaml, seun={
+            "display_name": "Seun", "role": "member",
+            "channels": {"whatsapp": "105321339076677@lid"},
+        })
+        ch = _make_identity_channel()
+        await ch._auto_heal_users_yaml("seun", "105321339076677@lid.whatsapp.net")
+        doc = _yaml.safe_load(homer_users_yaml.read_text())
+        assert doc["users"]["seun"]["channels"]["whatsapp"] == "105321339076677@lid.whatsapp.net"

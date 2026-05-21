@@ -424,6 +424,18 @@ class WhatsAppChannel(BaseChannel):
             await self._ensure_maps_loaded()
             if msg.pn and msg.sender and msg.pn != msg.sender:
                 await self._save_lid_mapping(msg.pn, msg.sender)
+            # Auto-heal users.yaml when a known sender's stored WhatsApp
+            # handle drifts (e.g. Baileys→Neonize JID format change). Runs
+            # on EVERY inbound, not just first-per-session, because
+            # _resolve_sender_name's greeted-set would otherwise swallow
+            # later drift detection. Fire-and-forget — never block message
+            # delivery on registry maintenance.
+            if not msg.is_group and msg.sender:
+                name_for_heal = self._lookup_sender_name(sender_id)
+                if name_for_heal:
+                    asyncio.create_task(
+                        self._auto_heal_users_yaml(name_for_heal, msg.sender)
+                    )
 
         media_paths = list(msg.media)
         content = msg.content
@@ -492,23 +504,30 @@ class WhatsAppChannel(BaseChannel):
                 return True
         return False
 
+    def _lookup_sender_name(self, sender_id: str) -> str | None:
+        """Resolve ``sender_id`` to a display name from sender_map / lid_map.
+
+        Pure lookup — no side effects. Use this when something other than the
+        greeting-prefix logic needs the name (e.g. the auto-heal in
+        ``_on_inbound``, which runs on every inbound rather than once per
+        session)."""
+        if sender_id in self._sender_map:
+            return self._sender_map[sender_id]
+        info = self._lid_map.get(sender_id)
+        if isinstance(info, dict):
+            direct = info.get("name") or None
+            if direct:
+                return direct
+            phone = info.get("phone", "")
+            if phone and phone in self._sender_map:
+                return self._sender_map[phone]
+        return None
+
     def _resolve_sender_name(self, sender_id: str, session_key: str) -> str | None:
         if session_key in self._greeted_sessions:
             return None
 
-        name: str | None = None
-
-        if sender_id in self._sender_map:
-            name = self._sender_map[sender_id]
-
-        if not name:
-            info = self._lid_map.get(sender_id)
-            if isinstance(info, dict):
-                name = info.get("name") or None
-                if not name:
-                    phone = info.get("phone", "")
-                    if phone and phone in self._sender_map:
-                        name = self._sender_map[phone]
+        name = self._lookup_sender_name(sender_id)
 
         if name:
             self._greeted_sessions[session_key] = None
@@ -516,6 +535,57 @@ class WhatsAppChannel(BaseChannel):
                 self._greeted_sessions.popitem(last=False)
 
         return name
+
+    async def _auto_heal_users_yaml(self, name: str, sender_jid: str) -> None:
+        """Update ``context/users.yaml`` when a known household member sends
+        an inbound from a JID that doesn't match the stored handle.
+
+        Catches handle drift across channel-implementation upgrades — the
+        Baileys→Neonize swap left registries pointing at bare ``@lid`` JIDs
+        that no longer route under Neonize. See homer/docs/identity-resolution.md
+        for the full design.
+
+        Failure-safe: any error logs a warning and returns. Message delivery
+        must not block on (or be cancelled by) registry maintenance.
+        """
+        if not name or not sender_jid:
+            return
+        try:
+            # PYTHONPATH=$HOMER_TOOLS is set by the homer container's
+            # entrypoint, so this import resolves inside the tenant container.
+            # On a standalone nanobot (no homer alongside) the import fails
+            # and auto-heal is a no-op — there's no registry to update.
+            import users_loader  # type: ignore[import-not-found]
+        except ImportError:
+            return
+
+        def _heal() -> str | None:
+            data = users_loader.load_users()
+            symbol, record = users_loader.find_by_display_name(data, name)
+            if record is None:
+                return None
+            current = (record.get("channels") or {}).get("whatsapp")
+            if str(current or "") == sender_jid:
+                return None
+            channels = dict(record.get("channels") or {})
+            channels["whatsapp"] = sender_jid
+            record["channels"] = channels
+            users_loader.save_users(data)
+            return symbol
+
+        try:
+            healed = await asyncio.to_thread(_heal)
+        except Exception as e:
+            logger.warning(
+                "auto-heal users.yaml failed for {} (sender={}): {}",
+                name, sender_jid, e,
+            )
+            return
+        if healed:
+            logger.info(
+                "auto-healed users.yaml channels.whatsapp[{}] → {}",
+                healed, sender_jid,
+            )
 
     async def _ensure_maps_loaded(self) -> None:
         if not self._lid_map_loaded:
