@@ -1041,3 +1041,37 @@ class TestAutoHealUsersYaml:
         await ch._auto_heal_users_yaml("seun", "105321339076677@lid.whatsapp.net")
         doc = _yaml.safe_load(homer_users_yaml.read_text())
         assert doc["users"]["seun"]["channels"]["whatsapp"] == "105321339076677@lid.whatsapp.net"
+
+    @pytest.mark.asyncio
+    async def test_nickname_matches_full_display_name(self, homer_users_yaml):
+        """homer's sender_map stores nicknames (e.g. 'Ebby'), users.yaml stores
+        full names ('Ebby Anjorin'). The heal falls back to first-token match
+        when full-string match fails."""
+        _write_v2(homer_users_yaml, primary={
+            "display_name": "Ebby Anjorin", "role": "admin",
+            "channels": {"whatsapp": "246157477413033@lid"},
+        })
+        ch = _make_identity_channel()
+        await ch._auto_heal_users_yaml("Ebby", "246157477413033@lid.whatsapp.net")
+        doc = _yaml.safe_load(homer_users_yaml.read_text())
+        assert doc["users"]["primary"]["channels"]["whatsapp"] == "246157477413033@lid.whatsapp.net"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_nickname_skips(self, homer_users_yaml):
+        """If two stored users share a first name, the heal can't safely pick
+        one — must skip rather than risk healing the wrong row."""
+        _write_v2(homer_users_yaml,
+            primary={
+                "display_name": "Alex Johnson", "role": "admin",
+                "channels": {"whatsapp": "stored-A@lid"},
+            },
+            alex_2={
+                "display_name": "Alex Smith", "role": "member",
+                "channels": {"whatsapp": "stored-B@lid"},
+            },
+        )
+        before = homer_users_yaml.read_bytes()
+        ch = _make_identity_channel()
+        await ch._auto_heal_users_yaml("Alex", "live@lid.whatsapp.net")
+        # File untouched — ambiguous first name → no-op.
+        assert homer_users_yaml.read_bytes() == before
