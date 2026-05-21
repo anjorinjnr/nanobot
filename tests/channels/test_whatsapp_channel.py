@@ -926,26 +926,9 @@ async def test_send_media_caption_applies_markdown_link_transform():
 # this fixture puts its `tools/` dir on sys.path so the import resolves the
 # same way the container's entrypoint sets PYTHONPATH=$HOMER_TOOLS at boot.
 
-import os as _os
-import sys as _sys
 import yaml as _yaml
-
-_HOMER_TOOLS = Path(__file__).resolve().parent.parent.parent.parent / "homer" / "tools"
-
-
-@pytest.fixture
-def homer_users_yaml(tmp_path, monkeypatch):
-    """Provision a temp users.yaml + put homer's tools on sys.path so the
-    lazy `import users_loader` in `_auto_heal_users_yaml` resolves."""
-    if not _HOMER_TOOLS.exists():
-        pytest.skip(f"homer/tools not at {_HOMER_TOOLS} (expected sibling clone)")
-    if str(_HOMER_TOOLS) not in _sys.path:
-        monkeypatch.syspath_prepend(str(_HOMER_TOOLS))
-    # Force a fresh users_loader read of the override env var on this call.
-    _sys.modules.pop("users_loader", None)
-    path = tmp_path / "users.yaml"
-    monkeypatch.setenv("HOMER_USERS_YAML", str(path))
-    return path
+# `homer_users_yaml` fixture lives in tests/conftest.py — shared with the
+# heartbeat dispatch tests.
 
 
 def _write_v2(path: Path, **users) -> None:
