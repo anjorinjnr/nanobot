@@ -826,9 +826,24 @@ def _run_gateway(
         if msgs and msgs[-1].get("role") == "user":
             msgs.pop()
 
-    async def on_heartbeat_execute(tasks: str, model_override: str | None = None) -> str:
-        """Phase 2: execute heartbeat tasks through the full agent loop."""
-        channel, chat_id = _pick_heartbeat_target()
+    async def on_heartbeat_execute(
+        tasks: str,
+        model_override: str | None = None,
+        *,
+        target: tuple[str, str] | None = None,
+    ) -> str:
+        """Phase 2: execute heartbeat tasks through the full agent loop.
+
+        ``target`` overrides the default ``_pick_heartbeat_target`` pick.
+        Set by the prompt-file dispatcher after it pre-resolves a recipient
+        via homer's users_loader, so the agent runs in the recipient's
+        session and ``message()`` defaults route to the right WhatsApp socket
+        — the model never has to construct a ``chat_id``.
+        """
+        if target is not None:
+            channel, chat_id = target
+        else:
+            channel, chat_id = _pick_heartbeat_target()
 
         async def _silent(*_args, **_kwargs):
             pass
@@ -869,10 +884,21 @@ def _run_gateway(
             return ""
         return result
 
-    async def on_heartbeat_notify(response: str) -> None:
-        """Deliver a heartbeat response to the user's channel."""
+    async def on_heartbeat_notify(
+        response: str,
+        *,
+        target: tuple[str, str] | None = None,
+    ) -> None:
+        """Deliver a heartbeat response to the user's channel.
+
+        ``target`` overrides ``_pick_heartbeat_target`` when the dispatcher
+        has already resolved the recipient (e.g. per-recipient prompt-file
+        fan-out)."""
         from nanobot.bus.events import OutboundMessage
-        channel, chat_id = _pick_heartbeat_target()
+        if target is not None:
+            channel, chat_id = target
+        else:
+            channel, chat_id = _pick_heartbeat_target()
         if channel == "cli":
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))

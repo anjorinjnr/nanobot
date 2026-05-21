@@ -192,6 +192,28 @@ class DueTask:
                 out.append(name)
         return out
 
+    def recipient_pairs(self) -> list[tuple[str, str]]:
+        """Recipients as ``(name, channel)`` pairs in source order.
+
+        Like ``recipient_names()`` but keeps the channel each name is
+        addressed on. Used by the prompt-file dispatcher to pre-resolve
+        ``(symbol, channel) → handle`` against users.yaml before handing
+        the agent a session that already routes to the right place.
+        """
+        if not self.recipients:
+            return []
+        out: list[tuple[str, str]] = []
+        for entry in self.recipients.split(","):
+            entry = entry.strip()
+            if not entry or ":" not in entry:
+                continue
+            name, channel = entry.rsplit(":", 1)
+            name = name.strip()
+            channel = channel.strip().lower()
+            if name and channel:
+                out.append((name, channel))
+        return out
+
 
 # Canonical preset slate — kept in lockstep with homer's tools/switch_model.py
 # MODELS dict. Every entry resolves to an OpenRouter slug (vendor/model) because
@@ -879,13 +901,34 @@ class HeartbeatService:
         """Run a single Prompt-file task, fanning out per recipient.
 
         Each recipient gets its own agent dispatch with the file's
-        contents as the message. If the task has no Recipients (or the
-        path has no {recipient} placeholder), fires once with `None` as
-        the recipient — the prompt file is shared across whoever the
-        task targets.
+        contents as the message. The (recipient_symbol, channel) pair
+        from ``Recipients:`` is resolved to a channel handle via
+        homer's ``users_loader`` before dispatch, and the resolved
+        ``(channel, handle)`` is passed to ``on_execute`` /
+        ``on_notify`` as ``target=`` so the agent runs in the
+        recipient's session and ``message()`` defaults route correctly
+        — the model never has to construct a chat_id.
+
+        Tasks with no Recipients fire once with no target; on_execute
+        falls back to its own routing (the legacy
+        ``_pick_heartbeat_target`` behavior in nanobot/cli/commands.py)
+        for backward compatibility with shared digest-style tasks.
+
+        Resolution failures (unknown symbol, missing handle, no users.yaml,
+        standalone nanobot without homer) log a warning and skip that
+        recipient — never crash the whole task.
         """
-        recipients = task.recipient_names() or [None]
-        for recipient in recipients:
+        pairs: list[tuple[str | None, str | None]]
+        pairs = list(task.recipient_pairs()) or [(None, None)]
+        for recipient, channel in pairs:
+            target = self._resolve_dispatch_target(recipient, channel)
+            if recipient is not None and channel is not None and target is None:
+                # Recipient was specified but resolution failed; skip rather
+                # than fall back to _pick_heartbeat_target (which would land
+                # the brief in some unrelated session — exactly the bug this
+                # path is designed to prevent).
+                continue
+
             message = self._read_prompt_file(task.prompt_file or "", recipient)
             if message is None:
                 # Fall back to the default summary so the task still runs
@@ -899,7 +942,9 @@ class HeartbeatService:
             )
             try:
                 with ctx:
-                    response = await self.on_execute(message, task.model)
+                    response = await self.on_execute(
+                        message, task.model, target=target,
+                    )
                 if response:
                     should_notify = await evaluate_response(
                         response, task.name, self.provider, self.model,
@@ -910,7 +955,7 @@ class HeartbeatService:
                             "Heartbeat: completed, delivering response (prompt-file, recipient={})",
                             recipient or "<none>",
                         )
-                        await self.on_notify(response)
+                        await self.on_notify(response, target=target)
                     else:
                         logger.info("Heartbeat: silenced by post-run evaluation")
             except Exception:
@@ -923,6 +968,49 @@ class HeartbeatService:
         # recipient sends fail.
         if self.last_run_tracking:
             self._advance_schedules([task])
+
+    @staticmethod
+    def _resolve_dispatch_target(
+        recipient: str | None, channel: str | None,
+    ) -> tuple[str, str] | None:
+        """Resolve a ``(recipient_symbol, channel)`` pair to a concrete
+        ``(channel, chat_id)`` tuple via homer's users_loader.
+
+        Returns ``None`` when:
+          - either arg is empty (task has no Recipients — caller passes
+            ``(None, None)`` to signal "single shared dispatch, let the
+            on_execute callback pick its own target");
+          - homer's users_loader isn't importable (standalone nanobot
+            with no homer alongside);
+          - the symbol/channel can't be resolved (unknown user, missing
+            channel entry, empty handle).
+
+        The user-symbol case is the only one a caller distinguishes —
+        the dispatcher uses ``None``-from-resolution to skip that
+        recipient rather than fall back to a global default.
+        """
+        if not recipient or not channel:
+            return None
+        try:
+            # PYTHONPATH=$HOMER_TOOLS at container boot, so this resolves
+            # without a sys.path tweak. Standalone nanobot hits ImportError
+            # and we return None — auto-resolution simply isn't available.
+            import users_loader  # type: ignore[import-not-found]
+        except ImportError:
+            logger.debug(
+                "Heartbeat: users_loader unavailable; dispatching with no target "
+                "for recipient={} channel={}", recipient, channel,
+            )
+            return None
+        try:
+            handle = users_loader.resolve_handle(recipient, channel)
+        except Exception as e:
+            logger.warning(
+                "Heartbeat: cannot resolve recipient {!r}:{!r} ({}); skipping",
+                recipient, channel, e,
+            )
+            return None
+        return (channel, handle)
 
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
