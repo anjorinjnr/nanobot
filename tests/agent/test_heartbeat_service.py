@@ -1,7 +1,6 @@
 import asyncio
 import re
 from datetime import datetime, timedelta
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -2202,25 +2201,18 @@ def test_read_prompt_file_returns_none_when_file_missing(tmp_path):
     assert out is None
 
 
-# Per-recipient dispatch tests need homer's users_loader available, since the
-# dispatcher pre-resolves (symbol, channel) → handle via load_users() before
-# firing the agent. In CI/dev the homer repo lives at `../homer` relative to
-# nanobot (same convention as the auto-heal fixture above).
-_HOMER_TOOLS_FOR_HB = Path(__file__).resolve().parent.parent.parent.parent / "homer" / "tools"
+# Per-recipient dispatch tests use the shared `homer_users_yaml` fixture
+# in tests/conftest.py (which puts homer/tools on sys.path and points
+# HOMER_USERS_YAML at a tmp file). The seeded-users variant below adds
+# the two-user fixture that the dispatch tests assert against.
 
 
 @pytest.fixture
-def homer_users_yaml_for_dispatch(tmp_path, monkeypatch):
-    """Put homer's tools on sys.path + provision a tmp users.yaml so the
-    prompt-file dispatcher can resolve symbolic recipients to handles."""
-    if not _HOMER_TOOLS_FOR_HB.exists():
-        pytest.skip(f"homer/tools not at {_HOMER_TOOLS_FOR_HB} (expected sibling clone)")
-    monkeypatch.syspath_prepend(str(_HOMER_TOOLS_FOR_HB))
-    import sys as _sys
-    _sys.modules.pop("users_loader", None)
-    users_yaml = tmp_path / "users.yaml"
+def homer_users_yaml_for_dispatch(homer_users_yaml):
+    """Pre-seed the shared fixture's users.yaml with two members so
+    ``ebby:whatsapp`` and ``seun:whatsapp`` resolve."""
     import yaml as _yaml
-    users_yaml.write_text(
+    homer_users_yaml.write_text(
         _yaml.safe_dump({
             "schema_version": 2,
             "users": {
@@ -2238,8 +2230,7 @@ def homer_users_yaml_for_dispatch(tmp_path, monkeypatch):
         }, sort_keys=False),
         encoding="utf-8",
     )
-    monkeypatch.setenv("HOMER_USERS_YAML", str(users_yaml))
-    return users_yaml
+    return homer_users_yaml
 
 
 @pytest.mark.asyncio
@@ -2310,11 +2301,9 @@ async def test_dispatch_prompt_file_task_falls_back_to_summary_on_missing_file(t
 
 @pytest.mark.asyncio
 async def test_dispatch_prompt_file_task_skips_unresolvable_recipient(tmp_path, homer_users_yaml_for_dispatch):
-    """A recipient that's specified but not in users.yaml is skipped rather
-    than dispatched to the heartbeat's default target. Falling back to the
-    default would land the brief in some unrelated session — exactly the
-    bug step 4 exists to prevent. Step 4 commit message refers to this as
-    'strict skip'."""
+    """A specified recipient missing from users.yaml is skipped rather than
+    dispatched to a fallback target — falling back would land the brief in
+    an unrelated session."""
     users_dir = tmp_path / "context" / "users"
     users_dir.mkdir(parents=True)
     (users_dir / "ebby.brief.md").write_text("ebby content", encoding="utf-8")
@@ -2341,6 +2330,69 @@ async def test_dispatch_prompt_file_task_skips_unresolvable_recipient(tmp_path, 
 
     # Only ebby resolved — ghost was skipped, not delivered to a fallback target.
     assert captured == ["ebby content"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_prompt_file_task_no_advance_when_all_unresolvable(tmp_path, homer_users_yaml_for_dispatch):
+    """If a task has Recipients but EVERY one fails to resolve, the schedule
+    must not advance — otherwise a misconfigured Recipients line silently
+    ships the brief into the void and we lose a day's worth of delivery
+    with no signal."""
+    users_dir = tmp_path / "context" / "users"
+    users_dir.mkdir(parents=True)
+
+    captured: list[str] = []
+
+    async def on_execute(msg, model, *, target=None):
+        captured.append(msg)
+        return None
+
+    service = _make_prompt_service(tmp_path, on_execute=on_execute)
+    advance_calls: list[list[str]] = []
+    service._advance_schedules = lambda tasks: advance_calls.append([t.name for t in tasks])
+
+    async def stub_evaluate(*args, **kwargs):
+        return False
+
+    task = DueTask(
+        name="Morning briefing", task_type="system",
+        schedule="2026-03-12 07:00",
+        recipients="ghost:whatsapp,phantom:whatsapp",  # neither in users.yaml
+        prompt_file="context/users/{recipient}.brief.md",
+    )
+    await service._dispatch_prompt_file_task(task, stub_evaluate)
+
+    assert captured == []  # No dispatch happened.
+    assert advance_calls == []  # And no advance — task retries next tick.
+
+
+@pytest.mark.asyncio
+async def test_dispatch_prompt_file_task_advances_when_at_least_one_delivered(tmp_path, homer_users_yaml_for_dispatch):
+    """Partial success still advances the schedule — one delivered counts.
+    Otherwise an intermittent resolver failure would jam the whole task."""
+    users_dir = tmp_path / "context" / "users"
+    users_dir.mkdir(parents=True)
+    (users_dir / "ebby.brief.md").write_text("ebby content", encoding="utf-8")
+
+    async def on_execute(msg, model, *, target=None):
+        return None
+
+    service = _make_prompt_service(tmp_path, on_execute=on_execute)
+    advance_calls: list[list[str]] = []
+    service._advance_schedules = lambda tasks: advance_calls.append([t.name for t in tasks])
+
+    async def stub_evaluate(*args, **kwargs):
+        return False
+
+    task = DueTask(
+        name="Morning briefing", task_type="system",
+        schedule="2026-03-12 07:00",
+        recipients="ebby:whatsapp,ghost:whatsapp",
+        prompt_file="context/users/{recipient}.brief.md",
+    )
+    await service._dispatch_prompt_file_task(task, stub_evaluate)
+
+    assert advance_calls == [["Morning briefing"]]
 
 
 @pytest.mark.asyncio

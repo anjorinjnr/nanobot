@@ -806,6 +806,11 @@ def _run_gateway(
         # Fallback keeps prior behavior but remains explicit.
         return "cli", "direct"
 
+    def _resolve_target_or_default(target: tuple[str, str] | None) -> tuple[str, str]:
+        """Use the explicit dispatch target when provided (prompt-file fan-out);
+        otherwise fall back to the global picker (shared-digest path)."""
+        return target if target is not None else _pick_heartbeat_target()
+
     # Create heartbeat service
     def _persist_outbound_messages(session: "Session", task_name: str, since_idx: int = 0) -> None:
         """Persist outbound messages: write to message log and inject into recipient sessions."""
@@ -834,16 +839,11 @@ def _run_gateway(
     ) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop.
 
-        ``target`` overrides the default ``_pick_heartbeat_target`` pick.
-        Set by the prompt-file dispatcher after it pre-resolves a recipient
-        via homer's users_loader, so the agent runs in the recipient's
-        session and ``message()`` defaults route to the right WhatsApp socket
-        — the model never has to construct a ``chat_id``.
+        ``target`` overrides ``_pick_heartbeat_target`` so the prompt-file
+        dispatcher's pre-resolved recipient binds the agent's session — the
+        model doesn't need to construct a ``chat_id``.
         """
-        if target is not None:
-            channel, chat_id = target
-        else:
-            channel, chat_id = _pick_heartbeat_target()
+        channel, chat_id = _resolve_target_or_default(target)
 
         async def _silent(*_args, **_kwargs):
             pass
@@ -895,10 +895,7 @@ def _run_gateway(
         has already resolved the recipient (e.g. per-recipient prompt-file
         fan-out)."""
         from nanobot.bus.events import OutboundMessage
-        if target is not None:
-            channel, chat_id = target
-        else:
-            channel, chat_id = _pick_heartbeat_target()
+        channel, chat_id = _resolve_target_or_default(target)
         if channel == "cli":
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
