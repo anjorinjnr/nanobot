@@ -1,6 +1,7 @@
 import asyncio
 import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -2113,6 +2114,43 @@ def test_due_task_recipient_names_dedupes_preserving_order() -> None:
     assert t.recipient_names() == ["ebby", "seun"]
 
 
+def test_due_task_recipient_pairs_parses_list() -> None:
+    """recipient_pairs keeps (symbol, channel) tuples in source order."""
+    t = DueTask(
+        name="X", task_type="system", schedule="2026-03-12 07:00",
+        recipients="ebby:whatsapp,seun:whatsapp,kid:telegram",
+    )
+    assert t.recipient_pairs() == [
+        ("ebby", "whatsapp"),
+        ("seun", "whatsapp"),
+        ("kid", "telegram"),
+    ]
+
+
+def test_due_task_recipient_pairs_empty_when_no_recipients() -> None:
+    t = DueTask(name="X", task_type="system", schedule="2026-03-12 07:00")
+    assert t.recipient_pairs() == []
+
+
+def test_due_task_recipient_pairs_keeps_per_channel_entries() -> None:
+    """Unlike recipient_names (which dedupes), recipient_pairs preserves
+    every (symbol, channel) entry — pre-resolution fans out per channel."""
+    t = DueTask(
+        name="X", task_type="system", schedule="2026-03-12 07:00",
+        recipients="ebby:whatsapp,ebby:telegram",
+    )
+    assert t.recipient_pairs() == [("ebby", "whatsapp"), ("ebby", "telegram")]
+
+
+def test_due_task_recipient_pairs_normalizes_channel_case() -> None:
+    """Channel match is case-insensitive in the resolver — pairs lowercases."""
+    t = DueTask(
+        name="X", task_type="system", schedule="2026-03-12 07:00",
+        recipients="ebby:WhatsApp",
+    )
+    assert t.recipient_pairs() == [("ebby", "whatsapp")]
+
+
 def _make_prompt_service(tmp_path, on_execute):
     """Build a HeartbeatService wired to capture on_execute calls."""
     (tmp_path / "HEARTBEAT.md").write_text("# Heartbeat\n## User Tasks\n\n## Completed\n",
@@ -2164,19 +2202,61 @@ def test_read_prompt_file_returns_none_when_file_missing(tmp_path):
     assert out is None
 
 
+# Per-recipient dispatch tests need homer's users_loader available, since the
+# dispatcher pre-resolves (symbol, channel) → handle via load_users() before
+# firing the agent. In CI/dev the homer repo lives at `../homer` relative to
+# nanobot (same convention as the auto-heal fixture above).
+_HOMER_TOOLS_FOR_HB = Path(__file__).resolve().parent.parent.parent.parent / "homer" / "tools"
+
+
+@pytest.fixture
+def homer_users_yaml_for_dispatch(tmp_path, monkeypatch):
+    """Put homer's tools on sys.path + provision a tmp users.yaml so the
+    prompt-file dispatcher can resolve symbolic recipients to handles."""
+    if not _HOMER_TOOLS_FOR_HB.exists():
+        pytest.skip(f"homer/tools not at {_HOMER_TOOLS_FOR_HB} (expected sibling clone)")
+    monkeypatch.syspath_prepend(str(_HOMER_TOOLS_FOR_HB))
+    import sys as _sys
+    _sys.modules.pop("users_loader", None)
+    users_yaml = tmp_path / "users.yaml"
+    import yaml as _yaml
+    users_yaml.write_text(
+        _yaml.safe_dump({
+            "schema_version": 2,
+            "users": {
+                "ebby": {
+                    "display_name": "Ebby",
+                    "role": "member",
+                    "channels": {"whatsapp": "ebby@lid.whatsapp.net"},
+                },
+                "seun": {
+                    "display_name": "Seun",
+                    "role": "member",
+                    "channels": {"whatsapp": "seun@lid.whatsapp.net"},
+                },
+            },
+        }, sort_keys=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOMER_USERS_YAML", str(users_yaml))
+    return users_yaml
+
+
 @pytest.mark.asyncio
-async def test_dispatch_prompt_file_task_fires_per_recipient(tmp_path):
+async def test_dispatch_prompt_file_task_fires_per_recipient(tmp_path, homer_users_yaml_for_dispatch):
     """A task with Prompt-file and N recipients fires N agent calls,
-    each with that recipient's prompt-file content as the message."""
+    each with that recipient's prompt-file content as the message,
+    and each dispatch carries the resolved (channel, handle) target so
+    the agent's session inherits the right routing."""
     users_dir = tmp_path / "context" / "users"
     users_dir.mkdir(parents=True)
     (users_dir / "ebby.brief.md").write_text("ebby content", encoding="utf-8")
     (users_dir / "seun.brief.md").write_text("seun content", encoding="utf-8")
 
-    captured: list[tuple[str, str | None]] = []
+    captured: list[tuple[str, str | None, tuple[str, str] | None]] = []
 
-    async def on_execute(msg, model):
-        captured.append((msg, model))
+    async def on_execute(msg, model, *, target=None):
+        captured.append((msg, model, target))
         return None
 
     service = _make_prompt_service(tmp_path, on_execute=on_execute)
@@ -2192,18 +2272,23 @@ async def test_dispatch_prompt_file_task_fires_per_recipient(tmp_path):
     )
     await service._dispatch_prompt_file_task(task, stub_evaluate)
 
-    assert [msg for msg, _ in captured] == ["ebby content", "seun content"]
+    assert [msg for msg, _, _ in captured] == ["ebby content", "seun content"]
+    # And each dispatch carried the resolved target — the whole point of step 4.
+    assert [target for _, _, target in captured] == [
+        ("whatsapp", "ebby@lid.whatsapp.net"),
+        ("whatsapp", "seun@lid.whatsapp.net"),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_dispatch_prompt_file_task_falls_back_to_summary_on_missing_file(tmp_path):
+async def test_dispatch_prompt_file_task_falls_back_to_summary_on_missing_file(tmp_path, homer_users_yaml_for_dispatch):
     """A missing prompt file does NOT silently drop the task — falls back
     to the default task-summary so the dispatcher still runs (and the
     schedule still advances). Otherwise a typo in PromptFile would
     silently disable the task forever."""
     captured: list[str] = []
 
-    async def on_execute(msg, model):
+    async def on_execute(msg, model, *, target=None):
         captured.append(msg)
         return None
 
@@ -2224,14 +2309,50 @@ async def test_dispatch_prompt_file_task_falls_back_to_summary_on_missing_file(t
 
 
 @pytest.mark.asyncio
-async def test_dispatch_prompt_file_task_fires_once_when_no_recipients(tmp_path):
-    """A task with Prompt-file but no Recipients fires once, with the
-    file content as the message and no {recipient} substitution."""
-    (tmp_path / "shared.md").write_text("shared brief", encoding="utf-8")
+async def test_dispatch_prompt_file_task_skips_unresolvable_recipient(tmp_path, homer_users_yaml_for_dispatch):
+    """A recipient that's specified but not in users.yaml is skipped rather
+    than dispatched to the heartbeat's default target. Falling back to the
+    default would land the brief in some unrelated session — exactly the
+    bug step 4 exists to prevent. Step 4 commit message refers to this as
+    'strict skip'."""
+    users_dir = tmp_path / "context" / "users"
+    users_dir.mkdir(parents=True)
+    (users_dir / "ebby.brief.md").write_text("ebby content", encoding="utf-8")
+    (users_dir / "ghost.brief.md").write_text("ghost content", encoding="utf-8")
+
     captured: list[str] = []
 
-    async def on_execute(msg, model):
+    async def on_execute(msg, model, *, target=None):
         captured.append(msg)
+        return None
+
+    service = _make_prompt_service(tmp_path, on_execute=on_execute)
+
+    async def stub_evaluate(*args, **kwargs):
+        return False
+
+    task = DueTask(
+        name="Morning briefing", task_type="system",
+        schedule="2026-03-12 07:00",
+        recipients="ebby:whatsapp,ghost:whatsapp",  # ghost not in users.yaml
+        prompt_file="context/users/{recipient}.brief.md",
+    )
+    await service._dispatch_prompt_file_task(task, stub_evaluate)
+
+    # Only ebby resolved — ghost was skipped, not delivered to a fallback target.
+    assert captured == ["ebby content"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_prompt_file_task_fires_once_when_no_recipients(tmp_path):
+    """A task with Prompt-file but no Recipients fires once with target=None,
+    the legacy shared-digest path. on_execute then falls back to the
+    heartbeat's default routing. No users_loader resolution attempted."""
+    (tmp_path / "shared.md").write_text("shared brief", encoding="utf-8")
+    captured: list[tuple[str, tuple[str, str] | None]] = []
+
+    async def on_execute(msg, model, *, target=None):
+        captured.append((msg, target))
         return None
 
     service = _make_prompt_service(tmp_path, on_execute=on_execute)
@@ -2246,4 +2367,4 @@ async def test_dispatch_prompt_file_task_fires_once_when_no_recipients(tmp_path)
     )
     await service._dispatch_prompt_file_task(task, stub_evaluate)
 
-    assert captured == ["shared brief"]
+    assert captured == [("shared brief", None)]
