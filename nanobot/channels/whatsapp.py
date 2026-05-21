@@ -590,6 +590,21 @@ class WhatsAppChannel(BaseChannel):
             data = users_loader.load_users()
             symbol, record = users_loader.find_by_display_name(data, name)
             if record is None:
+                # homer's sender_map stores nicknames ("Ebby"), users.yaml
+                # stores full names ("Ebby Anjorin"). Fall back to matching
+                # the inbound first-token against each stored display_name's
+                # first token. Skip on ambiguity (two users sharing a first
+                # name) — the heal must not pick the wrong row.
+                first = (name.split() or [""])[0].lower()
+                if first:
+                    matches: list[tuple[str, dict]] = []
+                    for sym, rec in users_loader.iter_users(data):
+                        disp = (rec.get("display_name") or "").split()
+                        if disp and disp[0].lower() == first:
+                            matches.append((sym, rec))
+                    if len(matches) == 1:
+                        symbol, record = matches[0]
+            if record is None:
                 return None
             current = (record.get("channels") or {}).get("whatsapp")
             if str(current or "") == sender_jid:
