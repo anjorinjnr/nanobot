@@ -511,17 +511,44 @@ class WhatsAppChannel(BaseChannel):
         greeting-prefix logic needs the name (e.g. the auto-heal in
         ``_on_inbound``, which runs on every inbound rather than once per
         session)."""
-        if sender_id in self._sender_map:
-            return self._sender_map[sender_id]
+        for candidate in self._phone_key_variants(sender_id):
+            if candidate in self._sender_map:
+                return self._sender_map[candidate]
         info = self._lid_map.get(sender_id)
         if isinstance(info, dict):
             direct = info.get("name") or None
             if direct:
                 return direct
             phone = info.get("phone", "")
-            if phone and phone in self._sender_map:
-                return self._sender_map[phone]
+            if phone:
+                for candidate in self._phone_key_variants(phone):
+                    if candidate in self._sender_map:
+                        return self._sender_map[candidate]
         return None
+
+    @staticmethod
+    def _phone_key_variants(value: str) -> tuple[str, ...]:
+        """Yield key forms to try when looking up ``value`` in a phone-keyed map.
+
+        WhatsApp / homer / Neonize aren't consistent about whether US numbers
+        carry the ``1`` country-code prefix: homer's `_build_sender_map` strips
+        prefixes from `party_id` JIDs (10-digit `4126920720@s.whatsapp.net` →
+        key `4126920720`), but Neonize emits 11-digit `14126920720@s.whatsapp.net`
+        on inbound. Without this normalization, the auto-heal misses Ebby's
+        number entirely.
+
+        Always returns the original form first so non-NANP / non-phone keys
+        round-trip unchanged. US-only heuristic — broader normalization waits
+        on libphonenumber or a deliberate phone-handling pass.
+        """
+        if not value or not value.isdigit():
+            return (value,)
+        variants: list[str] = [value]
+        if value.startswith("1") and len(value) == 11:
+            variants.append(value[1:])
+        elif len(value) == 10:
+            variants.append("1" + value)
+        return tuple(variants)
 
     def _resolve_sender_name(self, sender_id: str, session_key: str) -> str | None:
         if session_key in self._greeted_sessions:

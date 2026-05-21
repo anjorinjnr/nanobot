@@ -547,6 +547,36 @@ class TestLookupSenderName:
         assert ch._resolve_sender_name("14125550002", "s1") == "Emeka"
         assert ch._resolve_sender_name("14125550002", "s1") is None
 
+    def test_normalizes_us_country_code_when_map_is_10_digit(self):
+        """homer's _build_sender_map strips country code prefixes from party_id
+        JIDs (`4126920720@s.whatsapp.net` → `4126920720`), but Neonize emits the
+        11-digit form (`14126920720`) on inbound. Look up must succeed either way."""
+        ch = _make_identity_channel(sender_map={"4126920720": "Ebby"})
+        # Neonize-form sender_id with leading 1.
+        assert ch._lookup_sender_name("14126920720") == "Ebby"
+        # And the bare 10-digit form (in case the map is keyed the other way).
+        assert ch._lookup_sender_name("4126920720") == "Ebby"
+
+    def test_normalizes_us_country_code_when_map_is_11_digit(self):
+        """Inverse: map has the 11-digit form, inbound is bare 10-digit."""
+        ch = _make_identity_channel(sender_map={"14126920720": "Ebby"})
+        assert ch._lookup_sender_name("4126920720") == "Ebby"
+        assert ch._lookup_sender_name("14126920720") == "Ebby"
+
+    def test_no_spurious_match_for_short_string(self):
+        """Don't try to normalize non-phone keys (LIDs, emails, sentinels)."""
+        ch = _make_identity_channel(sender_map={"1abcd": "Should not match"})
+        assert ch._lookup_sender_name("abcd") is None
+
+    def test_lid_phone_uses_normalization(self):
+        """When sender_id is a LID but lid_map exposes a phone, the phone
+        lookup also benefits from country-code normalization."""
+        ch = _make_identity_channel(
+            sender_map={"4126920720": "Ebby"},
+            lid_map={"246157477413033": {"phone": "14126920720"}},
+        )
+        assert ch._lookup_sender_name("246157477413033") == "Ebby"
+
 
 @pytest.mark.asyncio
 async def test_sender_name_injected_in_content():
