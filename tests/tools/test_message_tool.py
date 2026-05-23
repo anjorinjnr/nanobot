@@ -108,6 +108,8 @@ async def test_message_tool_marks_channel_delivery_only_when_enabled() -> None:
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
 
@@ -128,6 +130,8 @@ async def test_message_tool_records_media_deliveries() -> None:
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
 
@@ -147,6 +151,8 @@ async def test_message_tool_inherits_metadata_for_same_target() -> None:
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
     slack_meta = {"slack": {"thread_ts": "111.222", "channel_type": "channel"}}
@@ -165,6 +171,8 @@ async def test_message_tool_clears_metadata_when_context_has_none() -> None:
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
     from nanobot.agent.tools.context import RequestContext
@@ -189,6 +197,8 @@ async def test_message_tool_does_not_inherit_metadata_for_cross_target() -> None
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
     from nanobot.agent.tools.context import RequestContext
@@ -212,6 +222,8 @@ async def test_message_tool_resolves_relative_media_paths() -> None:
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
 
@@ -232,6 +244,8 @@ async def test_message_tool_resolves_relative_media_paths_from_active_workspace(
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     workspace = tmp_path / "workspace"
     tool = MessageTool(send_callback=_send, workspace=workspace)
@@ -254,6 +268,8 @@ async def test_message_tool_rejects_outside_workspace_absolute_media_when_restri
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -279,6 +295,8 @@ async def test_message_tool_allows_workspace_absolute_media_when_restricted(tmp_
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -303,6 +321,8 @@ async def test_message_tool_passes_through_absolute_media_paths() -> None:
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
 
@@ -324,6 +344,8 @@ async def test_message_tool_passes_through_url_media_paths() -> None:
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
 
@@ -345,6 +367,8 @@ async def test_message_tool_resolves_mixed_media_paths() -> None:
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
 
@@ -377,6 +401,8 @@ async def test_message_tool_tracks_turn_media_for_same_target(tmp_path) -> None:
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
     from nanobot.agent.tools.context import RequestContext
@@ -433,6 +459,8 @@ async def test_message_tool_rejects_wrong_explicit_ws_chat_id(tmp_path) -> None:
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
     from nanobot.agent.tools.context import RequestContext
@@ -457,6 +485,8 @@ async def test_message_tool_allows_ws_explicit_when_matches_context(tmp_path) ->
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
     from nanobot.agent.tools.context import RequestContext
@@ -482,6 +512,8 @@ async def test_message_tool_cli_context_may_target_other_ws_chat(tmp_path) -> No
 
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
+        if msg._delivery_future and not msg._delivery_future.done():
+            msg._delivery_future.set_result(None)
 
     tool = MessageTool(send_callback=_send)
     from nanobot.agent.tools.context import RequestContext

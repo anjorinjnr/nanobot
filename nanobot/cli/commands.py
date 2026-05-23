@@ -1138,30 +1138,12 @@ def agent(
         logger.disable("nanobot")
 
     _gw_cli = config.agents.defaults.guest_workspace
-    agent_loop = AgentLoop(
+    agent_loop = AgentLoop.from_config(
+        config,
         bus=bus,
         provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
-        web_config=config.tools.web,
-        context_block_limit=config.agents.defaults.context_block_limit,
-        max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
-        provider_retry_mode=config.agents.defaults.provider_retry_mode,
-        exec_config=config.tools.exec,
         cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-        timezone=config.agents.defaults.timezone,
         guest_workspace=Path(_gw_cli) if _gw_cli else None,
-        unified_session=config.agents.defaults.unified_session,
-        disabled_skills=config.agents.defaults.disabled_skills,
-        session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
-        scope_context_provider=config.agents.defaults.scope_context_provider,
-        disable_memory_writes=config.agents.defaults.disable_memory_writes,
-        tools_config=config.tools,
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):

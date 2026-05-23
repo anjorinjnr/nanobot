@@ -104,7 +104,7 @@ async def test_tick_suppresses_finalization_fallback(tmp_path, monkeypatch) -> N
     notified: list[str] = []
     evaluator_called = False
 
-    async def _on_execute(tasks: str) -> str:
+    async def _on_execute(tasks: str, model: str | None = None) -> str:
         return (
             "I completed the tool steps but couldn't produce a final answer. "
             "Please try again or narrow the task."
@@ -158,7 +158,7 @@ async def test_tick_suppresses_leaked_reasoning(tmp_path, monkeypatch) -> None:
 
     notified: list[str] = []
 
-    async def _on_execute(tasks: str) -> str:
+    async def _on_execute(tasks: str, model: str | None = None) -> str:
         return "HEARTBEAT.md has active tasks listed. They are: Check Gmail."
 
     async def _on_notify(response: str) -> None:
@@ -206,7 +206,7 @@ async def test_tick_delivers_normal_report(tmp_path, monkeypatch) -> None:
 
     notified: list[str] = []
 
-    async def _on_execute(tasks: str) -> str:
+    async def _on_execute(tasks: str, model: str | None = None) -> str:
         return "3 new emails — client proposal from Zain, invoice, meeting reminder."
 
     async def _on_notify(response: str) -> None:

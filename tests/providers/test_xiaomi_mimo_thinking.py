@@ -152,7 +152,9 @@ def test_mimo_via_openrouter_reasoning_effort_none_disables_thinking():
         temperature=0.7, reasoning_effort="none", tool_choice=None,
     )
     assert "reasoning_effort" not in kwargs
-    assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+    # Homer always injects extra_body["usage"]={"include": True} on OpenRouter
+    # for cost attribution; assert only on the thinking field.
+    assert kwargs["extra_body"].get("thinking") == {"type": "disabled"}
 
 
 def test_mimo_via_openrouter_reasoning_effort_medium_enables_thinking():
@@ -164,7 +166,7 @@ def test_mimo_via_openrouter_reasoning_effort_medium_enables_thinking():
         temperature=0.7, reasoning_effort="medium", tool_choice=None,
     )
     assert kwargs.get("reasoning_effort") == "medium"
-    assert kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert kwargs["extra_body"].get("thinking") == {"type": "enabled"}
 
 
 def test_mimo_via_openrouter_bare_slug_also_matches():
@@ -176,7 +178,7 @@ def test_mimo_via_openrouter_bare_slug_also_matches():
         tools=None, model=None, max_tokens=100,
         temperature=0.7, reasoning_effort="none", tool_choice=None,
     )
-    assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert kwargs["extra_body"].get("thinking") == {"type": "disabled"}
 
 
 def test_mimo_flash_via_openrouter_does_not_inject_thinking():
@@ -188,7 +190,7 @@ def test_mimo_flash_via_openrouter_does_not_inject_thinking():
         tools=None, model=None, max_tokens=100,
         temperature=0.7, reasoning_effort="none", tool_choice=None,
     )
-    assert "extra_body" not in kwargs
+    assert "thinking" not in kwargs.get("extra_body", {})
 
 
 def test_non_mimo_model_via_openrouter_unaffected():
@@ -199,4 +201,4 @@ def test_non_mimo_model_via_openrouter_unaffected():
         tools=None, model=None, max_tokens=100,
         temperature=0.7, reasoning_effort="none", tool_choice=None,
     )
-    assert "extra_body" not in kwargs
+    assert "thinking" not in kwargs.get("extra_body", {})
