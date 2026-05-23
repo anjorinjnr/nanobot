@@ -202,10 +202,20 @@ class AgentLoop:
         scope_context_provider: str = "",
         disable_memory_writes: bool = False,
         tools_config: ToolsConfig | None = None,
+        # Upstream v0.2.0 additions accepted for compatibility with from_config
+        # and the slash commands wired through CommandRouter (`/model`, `/history`).
+        tool_hint_max_length: int | None = None,
+        consolidation_ratio: float | None = None,
+        max_messages: int = 120,
+        model_presets: "dict[str, Any] | None" = None,
+        model_preset: str | None = None,
+        provider_snapshot_loader: Any | None = None,
+        preset_snapshot_loader: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
         _tc = tools_config or ToolsConfig()
+        self.tools_config = _tc
         defaults = AgentDefaults()
         self.bus = bus
         self._guest_workspace = guest_workspace
@@ -305,6 +315,77 @@ class AgentLoop:
         self._current_iteration: int = 0
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+
+        # Upstream v0.2.0 preset/runtime kwargs — accept and minimally wire so
+        # CommandRouter's /model and /history commands can read state. Full
+        # preset switching (provider snapshot loaders, FallbackProvider) is a
+        # separate integration on top of homer's loop.
+        self.tool_hint_max_length = tool_hint_max_length
+        self.consolidation_ratio = consolidation_ratio
+        self.max_messages = max_messages if max_messages and max_messages > 0 else 120
+        self.model_presets = dict(model_presets) if model_presets else {}
+        self._active_preset: str | None = None
+        self._provider_snapshot_loader = provider_snapshot_loader
+        self._preset_snapshot_loader = preset_snapshot_loader
+        if model_preset:
+            try:
+                self.set_model_preset(model_preset)
+            except Exception:
+                logger.exception("Failed to apply initial model_preset={}", model_preset)
+
+    @property
+    def model_preset(self) -> str | None:
+        """Currently-active preset name, or None when on defaults."""
+        return self._active_preset
+
+    @model_preset.setter
+    def model_preset(self, name: str | None) -> None:
+        self.set_model_preset(name)
+
+    def set_model_preset(self, name: str | None, *, publish_update: bool = True) -> None:
+        """Switch the active model preset for future turns.
+
+        Minimal homer implementation: looks up the preset, swaps
+        ``self.model`` / ``self.context_window_tokens`` / provider generation
+        knobs. Does NOT rebuild the provider chain or fan changes out to
+        FallbackProvider — that wiring lives in upstream's preset_helpers
+        module and isn't backported here.
+        """
+        if name is None:
+            self._active_preset = None
+            return
+        preset = self.model_presets.get(name)
+        if preset is None:
+            raise KeyError(name)
+        # Allow either a pydantic ModelPresetConfig or a plain object that
+        # exposes the same attributes (max_tokens, model, etc.).
+        new_model = getattr(preset, "model", None)
+        new_ctx = getattr(preset, "context_window_tokens", None)
+        new_max_tokens = getattr(preset, "max_tokens", None)
+        new_temperature = getattr(preset, "temperature", None)
+        new_reasoning = getattr(preset, "reasoning_effort", None)
+        if new_model:
+            self.model = new_model
+            if hasattr(self, "subagents") and self.subagents is not None:
+                self.subagents.set_provider(self.provider, new_model)
+            if hasattr(self, "consolidator") and self.consolidator is not None:
+                self.consolidator.set_provider(
+                    self.provider, new_model,
+                    new_ctx if new_ctx is not None and new_ctx > 0 else self.context_window_tokens,
+                )
+            if hasattr(self, "dream") and self.dream is not None:
+                self.dream.set_provider(self.provider, new_model)
+        if new_ctx is not None and new_ctx > 0:
+            self.context_window_tokens = new_ctx
+        gen = getattr(self.provider, "generation", None)
+        if gen is not None:
+            if new_max_tokens is not None:
+                gen.max_tokens = new_max_tokens
+            if new_temperature is not None:
+                gen.temperature = new_temperature
+            if new_reasoning is not None:
+                gen.reasoning_effort = new_reasoning
+        self._active_preset = name
 
     @classmethod
     def from_config(

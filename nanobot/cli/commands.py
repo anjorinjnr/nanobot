@@ -234,6 +234,60 @@ async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner 
         await _print_interactive_line(text)
 
 
+async def _print_cli_reasoning(
+    text: str, thinking: ThinkingSpinner | None, renderer: object | None = None,
+) -> None:
+    """Render the model's reasoning channel content in dim italic."""
+    def _write() -> None:
+        ansi = _render_interactive_ansi(
+            lambda c: c.print(f"  [dim italic]✻ {text}[/dim italic]")
+        )
+        print_formatted_text(ANSI(ansi), end="")
+
+    with thinking.pause() if thinking else nullcontext():
+        await run_in_terminal(_write)
+
+
+async def _maybe_print_interactive_progress(
+    msg, thinking, channels_config, renderer=None,
+) -> bool:
+    """Decide how (or whether) to surface a `_progress` / `_retry_wait` / reasoning
+    frame to the interactive CLI. Returns True iff the message was handled.
+
+    Routing rules (mirrors upstream v0.2.0):
+      * ``_retry_wait``       → always show as a progress line (the user needs
+        to see why the prompt looks frozen).
+      * ``_reasoning`` /
+        ``_reasoning_delta``  → show via ``_print_cli_reasoning`` when
+        ``channels_config.show_reasoning`` is True; otherwise suppressed.
+        The ``send_progress`` knob is orthogonal — reasoning has its own gate.
+      * other ``_progress``   → show as a progress line, gated by
+        ``send_progress`` / ``send_tool_hints``.
+      * everything else       → return False (caller renders the message itself).
+    """
+    metadata = msg.metadata or {}
+    if metadata.get("_retry_wait"):
+        await _print_interactive_progress_line(msg.content, thinking)
+        return True
+
+    is_reasoning = bool(metadata.get("_reasoning") or metadata.get("_reasoning_delta"))
+    if is_reasoning:
+        if getattr(channels_config, "show_reasoning", True):
+            await _print_cli_reasoning(msg.content, thinking, renderer)
+        return True
+
+    if metadata.get("_progress"):
+        is_tool_hint = bool(metadata.get("_tool_hint"))
+        if is_tool_hint and not getattr(channels_config, "send_tool_hints", False):
+            return True
+        if not is_tool_hint and not getattr(channels_config, "send_progress", True):
+            return True
+        await _print_interactive_progress_line(msg.content, thinking)
+        return True
+
+    return False
+
+
 def _is_exit_command(command: str) -> bool:
     """Return True when input should end interactive chat."""
     return command.lower() in EXIT_COMMANDS
@@ -1436,6 +1490,12 @@ app.add_typer(provider_app, name="provider")
 
 
 _LOGIN_HANDLERS: dict[str, callable] = {}
+_LOGOUT_HANDLERS: dict[str, callable] = {}
+
+_PROVIDER_DISPLAY: dict[str, str] = {
+    "openai_codex": "OpenAI Codex",
+    "github_copilot": "GitHub Copilot",
+}
 
 
 def _register_login(name: str):
@@ -1446,11 +1506,16 @@ def _register_login(name: str):
     return decorator
 
 
-@provider_app.command("login")
-def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
-):
-    """Authenticate with an OAuth provider."""
+def _register_logout(name: str):
+    def decorator(fn):
+        _LOGOUT_HANDLERS[name] = fn
+        return fn
+
+    return decorator
+
+
+def _resolve_oauth_provider(provider: str):
+    """Resolve and validate an OAuth provider configuration."""
     from nanobot.providers.registry import PROVIDERS
 
     key = provider.replace("-", "_")
@@ -1459,6 +1524,15 @@ def provider_login(
         names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)
         console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: {names}")
         raise typer.Exit(1)
+    return spec
+
+
+@provider_app.command("login")
+def provider_login(
+    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+):
+    """Authenticate with an OAuth provider."""
+    spec = _resolve_oauth_provider(provider)
 
     handler = _LOGIN_HANDLERS.get(spec.name)
     if not handler:
@@ -1467,6 +1541,75 @@ def provider_login(
 
     console.print(f"{__logo__} OAuth Login - {spec.label}\n")
     handler()
+
+
+@provider_app.command("logout")
+def provider_logout(
+    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+):
+    """Log out from an OAuth provider."""
+    spec = _resolve_oauth_provider(provider)
+
+    handler = _LOGOUT_HANDLERS.get(spec.name)
+    if not handler:
+        console.print(f"[red]Logout not implemented for {spec.label}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} OAuth Logout - {spec.label}\n")
+    handler()
+
+
+def _delete_oauth_files(token_path: Path, provider_label: str) -> None:
+    """Delete OAuth token + lock files, reporting the result."""
+    removed_paths: list[Path] = []
+    skipped: list[tuple[Path, OSError]] = []
+    for path in (token_path, token_path.with_suffix(".lock")):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            skipped.append((path, exc))
+            continue
+        removed_paths.append(path)
+
+    if not removed_paths and not skipped:
+        console.print(f"[yellow]! No local OAuth credentials found for {provider_label}[/yellow]")
+        return
+
+    if removed_paths:
+        console.print(f"[green]✓ Logged out from {provider_label}[/green]")
+        for path in removed_paths:
+            console.print(f"[dim]Removed: {path}[/dim]")
+    for path, exc in skipped:
+        console.print(f"[yellow]! Could not remove {path}: {exc}[/yellow]")
+
+
+@_register_logout("openai_codex")
+def _logout_openai_codex() -> None:
+    """Clear local OAuth credentials for OpenAI Codex."""
+    try:
+        from oauth_cli_kit.providers import OPENAI_CODEX_PROVIDER
+        from oauth_cli_kit.storage import FileTokenStorage
+    except ImportError:
+        console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
+        raise typer.Exit(1)
+
+    storage = FileTokenStorage(token_filename=OPENAI_CODEX_PROVIDER.token_filename)
+    _delete_oauth_files(storage.get_token_path(), _PROVIDER_DISPLAY["openai_codex"])
+
+
+@_register_logout("github_copilot")
+def _logout_github_copilot() -> None:
+    """Clear local OAuth credentials for GitHub Copilot."""
+    try:
+        from nanobot.providers.github_copilot_provider import get_storage
+    except ImportError:
+        console.print("[red]GitHub Copilot provider unavailable. Ensure oauth-cli-kit is installed.[/red]")
+        raise typer.Exit(1)
+
+    storage = get_storage()
+    _delete_oauth_files(storage.get_token_path(), _PROVIDER_DISPLAY["github_copilot"])
 
 
 @_register_login("openai_codex")

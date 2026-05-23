@@ -160,6 +160,7 @@ class TestRestartCommand:
         session = MagicMock()
         session.get_history.return_value = [{"role": "user"}] * 3
         loop.sessions = MagicMock()
+        loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
         loop._start_time = time.time() - 125
         loop._last_usage = {"prompt_tokens": 0, "completion_tokens": 0}
@@ -186,6 +187,7 @@ class TestRestartCommand:
         loop, _bus = _make_loop()
         session = MagicMock()
         session.get_history.return_value = [{"role": "user"}]
+        loop.sessions = MagicMock()
         loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
         loop.consolidator.estimate_session_prompt_tokens = MagicMock(
@@ -228,6 +230,7 @@ class TestRestartCommand:
         session = MagicMock()
         session.get_history.return_value = [{"role": "user"}]
         loop.sessions = MagicMock()
+        loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
         loop._last_usage = {"prompt_tokens": 1200, "completion_tokens": 34}
         loop.consolidator.estimate_session_prompt_tokens = MagicMock(
@@ -255,6 +258,7 @@ class TestRestartCommand:
             {"role": "user", "content": "How are you?"},
             {"role": "assistant", "content": "I am doing well."},
         ]
+        loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
 
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history")
@@ -273,6 +277,7 @@ class TestRestartCommand:
         session.get_history.return_value = [
             {"role": "user", "content": f"message {i}"} for i in range(20)
         ]
+        loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
 
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history 3")
@@ -297,6 +302,7 @@ class TestRestartCommand:
             },
             *({"role": "assistant", "content": f"reply {i}"} for i in range(60)),
         ]
+        loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
 
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history 999")
@@ -323,6 +329,7 @@ class TestRestartCommand:
         loop, _bus = _make_loop()
         session = MagicMock()
         session.get_history.return_value = []
+        loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
 
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history")
@@ -336,6 +343,7 @@ class TestRestartCommand:
         loop, _bus = _make_loop()
         session = MagicMock()
         session.get_history.return_value = []
+        loop.sessions = MagicMock()
         loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
         loop.subagents = MagicMock()
