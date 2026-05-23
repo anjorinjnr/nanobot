@@ -222,8 +222,40 @@ async def _print_interactive_response(
     await run_in_terminal(_write)
 
 
-def _print_cli_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
-    """Print a CLI progress line, pausing the spinner if needed."""
+def _print_cli_progress_line(
+    text: str,
+    thinking: ThinkingSpinner | None,
+    renderer: object | None = None,
+) -> None:
+    """Print a CLI progress line, pausing the spinner if needed.
+
+    When *renderer* (a ``StreamRenderer``) is supplied:
+      * stop and clear any transient ``_live`` frame first, so the trace
+        line doesn't get clobbered by the next live update;
+      * open the assistant header (``ensure_header``) so the trace appears
+        *under* the bot row, not stranded under "You";
+      * pause via ``renderer.pause_spinner()`` so the renderer's own
+        spinner state stays in sync;
+      * print to ``renderer.console`` (which the renderer owns) instead
+        of the module-level ``console``.
+    """
+    if renderer is not None:
+        live = getattr(renderer, "_live", None)
+        if live is not None:
+            try:
+                live.stop()
+            finally:
+                renderer._live = None
+        ensure_header = getattr(renderer, "ensure_header", None)
+        if callable(ensure_header):
+            ensure_header()
+        pause_cm = renderer.pause_spinner() if hasattr(renderer, "pause_spinner") else (
+            thinking.pause() if thinking else nullcontext()
+        )
+        target_console = getattr(renderer, "console", console)
+        with pause_cm:
+            target_console.print(f"  [dim]↳ {text}[/dim]")
+        return
     with thinking.pause() if thinking else nullcontext():
         console.print(f"  [dim]↳ {text}[/dim]")
 
