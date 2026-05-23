@@ -243,14 +243,18 @@ class AgentLoop:
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
+        from nanobot.config.schema import ToolsConfig as _ToolsConfig
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
             bus=bus,
             model=self.model,
-            web_config=self.web_config,
+            tools_config=_ToolsConfig(
+                exec=self.exec_config,
+                web=self.web_config,
+                restrict_to_workspace=restrict_to_workspace,
+            ),
             max_tool_result_chars=self.max_tool_result_chars,
-            exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
             disabled_skills=disabled_skills,
         )
@@ -296,7 +300,7 @@ class AgentLoop:
         )
         self._register_default_tools()
         if _tc.my.enable:
-            self.tools.register(MyTool(loop=self, modify_allowed=_tc.my.allow_set))
+            self.tools.register(MyTool(runtime_state=self, modify_allowed=_tc.my.allow_set))
         self._runtime_vars: dict[str, Any] = {}
         self._current_iteration: int = 0
         self.commands = CommandRouter()
@@ -622,16 +626,20 @@ class AgentLoop:
         sender_id: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
+        from nanobot.agent.tools.context import RequestContext
         # Compute the effective session key (accounts for unified sessions)
         # so that subagent results route to the correct pending queue.
         effective_key = UNIFIED_SESSION_KEY if self._unified_session else f"{channel}:{chat_id}"
+        ctx = RequestContext(
+            channel=channel,
+            chat_id=chat_id,
+            message_id=message_id,
+            session_key=effective_key,
+        )
         for name in ("message", "spawn", "cron", "my"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    if name == "spawn":
-                        tool.set_context(channel, chat_id, effective_key=effective_key)
-                    else:
-                        tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    tool.set_context(ctx)
         # Stamp sender identity onto the exec tool so trusted scripts can
         # authenticate the requester from the runtime, not from LLM args.
         if exec_tool := self.tools.get("exec"):
@@ -1062,10 +1070,7 @@ class AgentLoop:
 
             session, pending = self.auto_compact.prepare_session(session, key)
 
-            await self.consolidator.maybe_consolidate_by_tokens(
-                session,
-                session_summary=pending,
-            )
+            await self.consolidator.maybe_consolidate_by_tokens(session)
             # Persist subagent follow-ups into durable history BEFORE prompt
             # assembly. ContextBuilder merges adjacent same-role messages for
             # provider compatibility, which previously caused the follow-up to
@@ -1198,10 +1203,7 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        await self.consolidator.maybe_consolidate_by_tokens(
-            session,
-            session_summary=pending,
-        )
+        await self.consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(
             msg.channel, msg.chat_id, msg.metadata.get("message_id"), sender_id=msg.sender_id,
