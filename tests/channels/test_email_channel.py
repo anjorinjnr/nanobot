@@ -1308,6 +1308,7 @@ def _make_oauth2_config(tmp_path, *, creds_cls=_FakeOAuth2Creds, **overrides):
         smtp_host="smtp.gmail.com",
         smtp_port=587,
         from_address="homer@joybuild.ai",
+        allow_from=["*"],
         verify_dkim=False,
         verify_spf=False,
     )

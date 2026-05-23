@@ -1357,18 +1357,15 @@ async def test_on_help_includes_restart_command() -> None:
     assert "/dream-restore" in help_text
 
 
+@pytest.mark.skip(
+    reason="Homer #35 deliberately dropped the /start handler (welcome is "
+    "sent out-of-band by homer). The companion test_start_command_has_no_handler "
+    "above enforces the absence of _on_start; this upstream test asserts the "
+    "opposite contract and does not apply."
+)
 @pytest.mark.asyncio
 async def test_on_start_ignores_unauthorized_user_silently() -> None:
-    channel = TelegramChannel(
-        TelegramConfig(enabled=True, token="123:abc", allow_from=["999"], group_policy="open"),
-        MessageBus(),
-    )
-    update = _make_telegram_update(text="/start", chat_type="private")
-    update.message.reply_text = AsyncMock()
-
-    await channel._on_start(update, None)
-
-    update.message.reply_text.assert_not_awaited()
+    pass
 
 
 @pytest.mark.asyncio
