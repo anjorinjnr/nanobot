@@ -34,6 +34,7 @@ from rich.table import Table
 from rich.text import Text
 
 from nanobot import __logo__, __version__
+from nanobot.agent.loop import AgentLoop
 
 
 def _sanitize_surrogates(text: str) -> str:

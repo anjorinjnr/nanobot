@@ -306,6 +306,54 @@ class AgentLoop:
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
+    @classmethod
+    def from_config(
+        cls,
+        config: Any,
+        bus: MessageBus | None = None,
+        **extra: Any,
+    ) -> AgentLoop:
+        """Construct an AgentLoop from a Config (Nanobot SDK entry point).
+
+        Upstream v0.2.0 introduced this classmethod. Homer keeps a thinner
+        version that maps Config onto homer's __init__ kwargs. ``extra``
+        overrides any of the standard config-derived values.
+        """
+        from nanobot.bus.queue import MessageBus as _MessageBus
+        from nanobot.providers.factory import make_provider
+
+        if bus is None:
+            bus = _MessageBus()
+        defaults = config.agents.defaults
+        provider = extra.pop("provider", None) or make_provider(config)
+        # Upstream's from_config accepts image_generation_provider_configs; homer
+        # doesn't wire image generation through the loop yet, so swallow it.
+        extra.pop("image_generation_provider_configs", None)
+        return cls(
+            bus=bus,
+            provider=provider,
+            workspace=Path(config.workspace_path) if not isinstance(config.workspace_path, Path) else config.workspace_path,
+            model=extra.pop("model", None) or defaults.model,
+            max_iterations=extra.pop("max_iterations", None) or defaults.max_tool_iterations,
+            context_window_tokens=extra.pop("context_window_tokens", None) or defaults.context_window_tokens,
+            context_block_limit=defaults.context_block_limit,
+            max_tool_result_chars=defaults.max_tool_result_chars,
+            provider_retry_mode=defaults.provider_retry_mode,
+            web_config=config.tools.web,
+            exec_config=config.tools.exec,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            mcp_servers=config.tools.mcp_servers,
+            channels_config=config.channels,
+            timezone=defaults.timezone,
+            unified_session=defaults.unified_session,
+            disabled_skills=defaults.disabled_skills,
+            session_ttl_minutes=defaults.session_ttl_minutes,
+            scope_context_provider=defaults.scope_context_provider,
+            disable_memory_writes=defaults.disable_memory_writes,
+            tools_config=config.tools,
+            **extra,
+        )
+
     # ── Audit logging ────────────────────────────────────────────────────────
 
     def _audit_tool_call(
