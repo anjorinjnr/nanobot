@@ -36,6 +36,17 @@ from rich.text import Text
 from nanobot import __logo__, __version__
 
 
+def _sanitize_surrogates(text: str) -> str:
+    """Reconstruct surrogate pairs into real characters; replace lone surrogates.
+
+    On Windows, console input may produce lone surrogate code points (e.g.
+    ``\\ud83d\\udc08`` for U+1F408).  Round-tripping through UTF-16 reconstructs
+    paired surrogates into their actual characters and replaces unpaired ones
+    with U+FFFD.
+    """
+    return text.encode("utf-16-le", errors="surrogatepass").decode("utf-16-le", errors="replace")
+
+
 class SafeFileHistory(FileHistory):
     """FileHistory subclass that sanitizes surrogate characters on write.
 
@@ -45,8 +56,7 @@ class SafeFileHistory(FileHistory):
     """
 
     def store_string(self, string: str) -> None:
-        safe = string.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
-        super().store_string(safe)
+        super().store_string(_sanitize_surrogates(string))
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
 from nanobot.config.paths import get_workspace_path, is_default_workspace
 from nanobot.config.schema import Config

@@ -7,11 +7,22 @@ from nanobot.agent.tools.web import WebSearchTool
 from nanobot.config.schema import WebSearchConfig
 
 
-def _tool(provider: str = "brave", api_key: str = "", base_url: str = "") -> WebSearchTool:
-    return WebSearchTool(config=WebSearchConfig(provider=provider, api_key=api_key, base_url=base_url))
+def _tool(
+    provider: str = "brave",
+    api_key: str = "",
+    base_url: str = "",
+    user_agent: str | None = None,
+) -> WebSearchTool:
+    return WebSearchTool(
+        config=WebSearchConfig(provider=provider, api_key=api_key, base_url=base_url),
+        user_agent=user_agent,
+    )
 
 
-def _response(status: int = 200, json: dict | None = None) -> httpx.Response:
+def _response(
+    status: int = 200,
+    json: dict | None = None,
+) -> httpx.Response:
     """Build a mock httpx.Response with a dummy request attached."""
     r = httpx.Response(status, json=json)
     r._request = httpx.Request("GET", "https://mock")
@@ -42,15 +53,65 @@ async def test_brave_search(monkeypatch):
     async def mock_get(self, url, **kw):
         assert "brave" in url
         assert kw["headers"]["X-Subscription-Token"] == "brave-key"
+        assert kw["headers"]["User-Agent"] == "nanobot-search-test"
         return _response(json={
             "web": {"results": [{"title": "NanoBot", "url": "https://example.com", "description": "AI assistant"}]}
         })
 
     monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
-    tool = _tool(provider="brave", api_key="brave-key")
+    tool = _tool(provider="brave", api_key="brave-key", user_agent="nanobot-search-test")
     result = await tool.execute(query="nanobot", count=1)
     assert "NanoBot" in result
     assert "https://example.com" in result
+
+
+@pytest.mark.asyncio
+async def test_brave_search_retries_rate_limit_once(monkeypatch):
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    async def mock_sleep(delay: float):
+        sleeps.append(delay)
+
+    async def mock_get(self, url, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _response(status=429, json={"error": "rate limit"})
+        return _response(json={
+            "web": {"results": [{"title": "Recovered", "url": "https://example.com", "description": "ok"}]}
+        })
+
+    monkeypatch.setattr("nanobot.agent.tools.web.asyncio.sleep", mock_sleep)
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+
+    tool = _tool(provider="brave", api_key="brave-key")
+    result = await tool.execute(query="nanobot", count=1)
+
+    assert calls["n"] == 2
+    assert "Recovered" in result
+    assert sleeps == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_brave_search_returns_clear_rate_limit_after_retries(monkeypatch):
+    calls = {"n": 0}
+
+    async def mock_sleep(delay: float):
+        return None
+
+    async def mock_get(self, url, **kw):
+        calls["n"] += 1
+        return _response(status=429, json={"error": "rate limit"})
+
+    monkeypatch.setattr("nanobot.agent.tools.web.asyncio.sleep", mock_sleep)
+    monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+
+    tool = _tool(provider="brave", api_key="brave-key")
+    result = await tool.execute(query="nanobot", count=1)
+
+    assert calls["n"] == 2
+    assert "Brave search rate limited" in result
+    assert "consecutive web_search" in result
 
 
 @pytest.mark.asyncio
@@ -58,12 +119,13 @@ async def test_tavily_search(monkeypatch):
     async def mock_post(self, url, **kw):
         assert "tavily" in url
         assert kw["headers"]["Authorization"] == "Bearer tavily-key"
+        assert kw["headers"]["User-Agent"] == "nanobot-search-test"
         return _response(json={
             "results": [{"title": "OpenClaw", "url": "https://openclaw.io", "content": "Framework"}]
         })
 
     monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
-    tool = _tool(provider="tavily", api_key="tavily-key")
+    tool = _tool(provider="tavily", api_key="tavily-key", user_agent="nanobot-search-test")
     result = await tool.execute(query="openclaw")
     assert "OpenClaw" in result
     assert "https://openclaw.io" in result
@@ -73,12 +135,13 @@ async def test_tavily_search(monkeypatch):
 async def test_searxng_search(monkeypatch):
     async def mock_get(self, url, **kw):
         assert "searx.example" in url
+        assert kw["headers"]["User-Agent"] == "nanobot-search-test"
         return _response(json={
             "results": [{"title": "Result", "url": "https://example.com", "content": "SearXNG result"}]
         })
 
     monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
-    tool = _tool(provider="searxng", base_url="https://searx.example")
+    tool = _tool(provider="searxng", base_url="https://searx.example", user_agent="nanobot-search-test")
     result = await tool.execute(query="test")
     assert "Result" in result
 
@@ -125,12 +188,13 @@ async def test_jina_search(monkeypatch):
     async def mock_get(self, url, **kw):
         assert "s.jina.ai" in str(url)
         assert kw["headers"]["Authorization"] == "Bearer jina-key"
+        assert kw["headers"]["User-Agent"] == "nanobot-search-test"
         return _response(json={
             "data": [{"title": "Jina Result", "url": "https://jina.ai", "content": "AI search"}]
         })
 
     monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
-    tool = _tool(provider="jina", api_key="jina-key")
+    tool = _tool(provider="jina", api_key="jina-key", user_agent="nanobot-search-test")
     result = await tool.execute(query="test")
     assert "Jina Result" in result
     assert "https://jina.ai" in result
@@ -141,6 +205,7 @@ async def test_kagi_search(monkeypatch):
     async def mock_get(self, url, **kw):
         assert "kagi.com/api/v0/search" in url
         assert kw["headers"]["Authorization"] == "Bot kagi-key"
+        assert kw["headers"]["User-Agent"] == "nanobot-search-test"
         assert kw["params"] == {"q": "test", "limit": 2}
         return _response(json={
             "data": [
@@ -150,7 +215,7 @@ async def test_kagi_search(monkeypatch):
         })
 
     monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
-    tool = _tool(provider="kagi", api_key="kagi-key")
+    tool = _tool(provider="kagi", api_key="kagi-key", user_agent="nanobot-search-test")
     result = await tool.execute(query="test", count=2)
     assert "Kagi Result" in result
     assert "https://kagi.com" in result
@@ -281,3 +346,82 @@ async def test_duckduckgo_timeout_returns_error(monkeypatch):
     result = await tool.execute(query="test")
     gate.set()
     assert "Error" in result
+
+
+@pytest.mark.asyncio
+async def test_olostep_search_formats_answer_and_sources(monkeypatch):
+    from types import SimpleNamespace
+
+    calls: dict[str, str] = {}
+
+    class MockAsyncOlostep:
+        def __init__(self, api_key: str):
+            calls["api_key"] = api_key
+            self.answers = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def create(self, task: str):
+            calls["task"] = task
+            return SimpleNamespace(
+                answer="Mocked Olostep answer",
+                sources=[SimpleNamespace(title="Example Source", url="https://example.com")],
+            )
+
+    import sys
+    import types
+
+    fake_mod = types.ModuleType("olostep")
+    fake_mod.AsyncOlostep = MockAsyncOlostep
+    fake_mod.Olostep_BaseError = Exception
+    monkeypatch.setitem(sys.modules, "olostep", fake_mod)
+
+    tool = _tool(provider="olostep", api_key="olostep-key")
+    result = await tool.execute(query="test query")
+
+    assert calls["api_key"] == "olostep-key"
+    assert calls["task"] == "test query"
+    assert "Mocked Olostep answer" in result
+    assert "Example Source" in result
+    assert "https://example.com" in result
+
+
+@pytest.mark.asyncio
+async def test_olostep_missing_key_falls_back_to_duckduckgo(monkeypatch):
+    import sys
+    import types
+    from unittest.mock import patch
+
+    class MockDDGS:
+        def __init__(self, **kw):
+            pass
+
+        def text(self, query, max_results=5):
+            return [{"title": "Fallback", "href": "https://ddg.example", "body": "fallback"}]
+
+    fake_mod = types.ModuleType("olostep")
+    fake_mod.AsyncOlostep = object
+    fake_mod.Olostep_BaseError = Exception
+    monkeypatch.setitem(sys.modules, "olostep", fake_mod)
+
+    monkeypatch.delenv("OLOSTEP_API_KEY", raising=False)
+    with patch("ddgs.DDGS", MockDDGS):
+        tool = _tool(provider="olostep", api_key="")
+        result = await tool.execute(query="test query")
+
+    assert "Fallback" in result
+
+
+@pytest.mark.asyncio
+async def test_olostep_package_missing_returns_install_hint(monkeypatch):
+    import sys
+    monkeypatch.delitem(sys.modules, "olostep", raising=False)
+    monkeypatch.setitem(sys.modules, "olostep", None)
+    tool = _tool(provider="olostep", api_key="olostep-key")
+    result = await tool.execute(query="test query")
+
+    assert result == "Error: olostep package not installed. Run: pip install olostep"

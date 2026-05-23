@@ -14,8 +14,12 @@ except ImportError:
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.telegram import TELEGRAM_REPLY_CONTEXT_MAX_LEN, TelegramChannel, _StreamBuf
-from nanobot.channels.telegram import TelegramConfig
+from nanobot.channels.telegram import (
+    TELEGRAM_REPLY_CONTEXT_MAX_LEN,
+    TelegramChannel,
+    TelegramConfig,
+    _StreamBuf,
+)
 
 
 class _FakeHTTPXRequest:
@@ -59,6 +63,9 @@ class _FakeBot:
 
     async def send_photo(self, **kwargs) -> None:
         self.sent_media.append({"kind": "photo", **kwargs})
+
+    async def send_video(self, **kwargs) -> None:
+        self.sent_media.append({"kind": "video", **kwargs})
 
     async def send_voice(self, **kwargs) -> None:
         self.sent_media.append({"kind": "voice", **kwargs})
@@ -191,6 +198,7 @@ async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     assert builder.get_updates_request_value is poll_req
     assert callable(app.updater.start_polling_kwargs["error_callback"])
     assert any(cmd.command == "status" for cmd in app.bot.commands)
+    assert any(cmd.command == "history" for cmd in app.bot.commands)
     assert any(cmd.command == "dream" for cmd in app.bot.commands)
     assert any(cmd.command == "dream_log" for cmd in app.bot.commands)
     assert any(cmd.command == "dream_restore" for cmd in app.bot.commands)
@@ -300,17 +308,19 @@ async def test_on_error_logs_network_issues_as_warning(monkeypatch) -> None:
     recorded: list[tuple[str, str]] = []
 
     monkeypatch.setattr(
-        "nanobot.channels.telegram.logger.warning",
+        channel.logger,
+        "warning",
         lambda message, error: recorded.append(("warning", message.format(error))),
     )
     monkeypatch.setattr(
-        "nanobot.channels.telegram.logger.error",
+        channel.logger,
+        "error",
         lambda message, error: recorded.append(("error", message.format(error))),
     )
 
     await channel._on_error(object(), SimpleNamespace(error=NetworkError("proxy disconnected")))
 
-    assert recorded == [("warning", "Telegram network issue: proxy disconnected")]
+    assert recorded == [("warning", "network issue: proxy disconnected")]
 
 
 @pytest.mark.asyncio
@@ -324,13 +334,14 @@ async def test_on_error_summarizes_empty_network_error(monkeypatch) -> None:
     recorded: list[tuple[str, str]] = []
 
     monkeypatch.setattr(
-        "nanobot.channels.telegram.logger.warning",
+        channel.logger,
+        "warning",
         lambda message, error: recorded.append(("warning", message.format(error))),
     )
 
     await channel._on_error(object(), SimpleNamespace(error=NetworkError("")))
 
-    assert recorded == [("warning", "Telegram network issue: NetworkError")]
+    assert recorded == [("warning", "network issue: NetworkError")]
 
 
 @pytest.mark.asyncio
@@ -342,17 +353,19 @@ async def test_on_error_keeps_non_network_exceptions_as_error(monkeypatch) -> No
     recorded: list[tuple[str, str]] = []
 
     monkeypatch.setattr(
-        "nanobot.channels.telegram.logger.warning",
+        channel.logger,
+        "warning",
         lambda message, error: recorded.append(("warning", message.format(error))),
     )
     monkeypatch.setattr(
-        "nanobot.channels.telegram.logger.error",
+        channel.logger,
+        "error",
         lambda message, error: recorded.append(("error", message.format(error))),
     )
 
     await channel._on_error(object(), SimpleNamespace(error=RuntimeError("boom")))
 
-    assert recorded == [("error", "Telegram error: boom")]
+    assert recorded == [("error", "error: boom")]
 
 
 @pytest.mark.asyncio
@@ -745,6 +758,36 @@ async def test_send_remote_media_url_after_security_validation(monkeypatch) -> N
             "chat_id": 123,
             "photo": "https://example.com/cat.jpg",
             "reply_parameters": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_local_media_preserves_filename(tmp_path: Path) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    attachment = tmp_path / "report.final.md"
+    attachment.write_bytes(b"# Report\n")
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="",
+            media=[str(attachment)],
+        )
+    )
+
+    assert channel._app.bot.sent_media == [
+        {
+            "kind": "document",
+            "chat_id": 123,
+            "document": b"# Report\n",
+            "reply_parameters": None,
+            "filename": "report.final.md",
         }
     ]
 
@@ -1277,6 +1320,20 @@ def test_start_command_has_no_handler() -> None:
     assert not hasattr(telegram_module.TelegramChannel, "_on_start")
 
 
+def test_telegram_bus_slash_command_regex_matches_agent_loop_commands() -> None:
+    """Bus-routed slash commands must match the Telegram handler regex (see builtin router)."""
+    pat = TelegramChannel.TELEGRAM_BUS_SLASH_COMMAND_RE
+    assert pat.fullmatch("/history")
+    assert pat.fullmatch("/history 5")
+    assert pat.fullmatch("/goal ship the feature")
+    assert pat.fullmatch("/pairing list")
+    assert pat.fullmatch("/model fast")
+    assert pat.fullmatch("/new@nanobot_bot")
+    assert pat.fullmatch("/goal@nanobot_bot refine objective")
+    assert pat.fullmatch("/dream-log deadbeef") is None
+    assert pat.fullmatch("/dream-restore deadbeef") is None
+
+
 @pytest.mark.asyncio
 async def test_on_help_includes_restart_command() -> None:
     channel = TelegramChannel(
@@ -1294,7 +1351,62 @@ async def test_on_help_includes_restart_command() -> None:
     assert "/status" in help_text
     assert "/dream" in help_text
     assert "/dream-log" in help_text
+    assert "/goal" in help_text
+    assert "/pairing" in help_text
+    assert "/model" in help_text
     assert "/dream-restore" in help_text
+
+
+@pytest.mark.asyncio
+async def test_on_start_ignores_unauthorized_user_silently() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["999"], group_policy="open"),
+        MessageBus(),
+    )
+    update = _make_telegram_update(text="/start", chat_type="private")
+    update.message.reply_text = AsyncMock()
+
+    await channel._on_start(update, None)
+
+    update.message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_help_ignores_unauthorized_user_silently() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["999"], group_policy="open"),
+        MessageBus(),
+    )
+    update = _make_telegram_update(text="/help", chat_type="private")
+    update.message.reply_text = AsyncMock()
+
+    await channel._on_help(update, None)
+
+    update.message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_message_ignores_unauthorized_user_before_side_effects() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["999"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    started_typing: list[str] = []
+    handled: list[dict] = []
+    channel._start_typing = lambda chat_id: started_typing.append(chat_id)
+    channel._add_reaction = AsyncMock(return_value=None)
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+
+    await channel._on_message(_make_telegram_update(text="hello", chat_type="private"), None)
+
+    assert started_typing == []
+    channel._add_reaction.assert_not_awaited()
+    assert handled == []
 
 
 @pytest.mark.asyncio
@@ -1738,3 +1850,32 @@ async def test_send_uses_native_keyboard_when_flag_on() -> None:
     sent = channel._app.bot.sent_messages[0]
     assert isinstance(sent.get("reply_markup"), InlineKeyboardMarkup)
     assert "[Yes]" not in sent["text"]  # native keyboard owns the rendering
+
+
+@pytest.mark.asyncio
+async def test_callback_query_ignores_unauthorized_user_before_side_effects() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["999"], inline_keyboards=True),
+        MessageBus(),
+    )
+    channel._handle_message = AsyncMock()
+
+    query = SimpleNamespace(
+        id="cb_1",
+        data="Yes",
+        answer=AsyncMock(),
+        message=SimpleNamespace(
+            chat_id=123,
+            edit_reply_markup=AsyncMock(),
+        ),
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=12345, username="alice", first_name="Alice"),
+    )
+
+    await channel._on_callback_query(update, None)
+
+    query.answer.assert_not_awaited()
+    query.message.edit_reply_markup.assert_not_awaited()
+    channel._handle_message.assert_not_awaited()

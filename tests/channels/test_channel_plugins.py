@@ -13,6 +13,8 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.manager import ChannelManager
 from nanobot.config.schema import ChannelsConfig
+from nanobot.providers.transcription import GroqTranscriptionProvider as _GroqProvider
+from nanobot.providers.transcription import OpenAITranscriptionProvider as _OpenAIProvider
 from nanobot.utils.restart import RestartNotice
 
 # ---------------------------------------------------------------------------
@@ -338,11 +340,10 @@ async def test_base_channel_passes_language_to_groq_transcription_provider():
 # Transcription provider HTTP tests
 # ---------------------------------------------------------------------------
 
-from nanobot.providers.transcription import GroqTranscriptionProvider as _GroqProvider
-from nanobot.providers.transcription import OpenAITranscriptionProvider as _OpenAIProvider
-
 
 class _StubResponse:
+    status_code = 200
+
     def raise_for_status(self):
         return None
 
@@ -791,6 +792,50 @@ async def test_send_with_retry_skips_send_when_streamed():
     assert send_delta_called is False
 
 
+def test_outbound_duplicate_suppression_is_scoped_to_origin_message() -> None:
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig(send_max_retries=3),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.bus = MessageBus()
+    mgr.channels = {}
+    mgr._dispatch_task = None
+    mgr._origin_reply_fingerprints = {}
+
+    first = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="Done",
+        metadata={"message_id": "msg-1"},
+    )
+    duplicate = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="  Done  ",
+        metadata={"origin_message_id": "msg-1"},
+    )
+    separate_turn = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="Done",
+        metadata={"message_id": "msg-2"},
+    )
+    new_origin_content = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="Done with extra details",
+        metadata={"origin_message_id": "msg-1"},
+    )
+
+    assert mgr._should_suppress_outbound(first) is False
+    assert mgr._should_suppress_outbound(duplicate) is True
+    assert mgr._should_suppress_outbound(separate_turn) is False
+    assert mgr._should_suppress_outbound(new_origin_content) is False
+
+
 @pytest.mark.asyncio
 async def test_send_with_retry_propagates_cancelled_error():
     """_send_with_retry should re-raise CancelledError for graceful shutdown."""
@@ -916,8 +961,8 @@ class _StartableChannel(BaseChannel):
 
 
 @pytest.mark.asyncio
-async def test_validate_allow_from_raises_on_empty_list():
-    """_validate_allow_from should raise SystemExit when allow_from is empty list."""
+async def test_validate_allow_from_allows_empty_list():
+    """Empty allow_from is valid now — pairing store handles unapproved senders."""
     fake_config = SimpleNamespace(
         channels=ChannelsConfig(),
         providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
@@ -928,10 +973,8 @@ async def test_validate_allow_from_raises_on_empty_list():
     mgr.channels = {"test": _ChannelWithAllowFrom(fake_config, None, [])}
     mgr._dispatch_task = None
 
-    with pytest.raises(SystemExit) as exc_info:
-        mgr._validate_allow_from()
-
-    assert "empty allowFrom" in str(exc_info.value)
+    # Should not raise — empty list defers to pairing store
+    mgr._validate_allow_from()
 
 
 @pytest.mark.asyncio
@@ -952,8 +995,8 @@ async def test_validate_allow_from_passes_with_asterisk():
 
 
 @pytest.mark.asyncio
-async def test_validate_allow_from_raises_on_empty_dict_allow_from():
-    """_validate_allow_from should reject empty dict-backed allow_from lists."""
+async def test_validate_allow_from_allows_empty_dict_allow_from():
+    """Empty dict-backed allow_from is valid — pairing store handles approval."""
     fake_config = SimpleNamespace(
         channels=ChannelsConfig(),
         providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
@@ -964,10 +1007,37 @@ async def test_validate_allow_from_raises_on_empty_dict_allow_from():
     mgr.channels = {"test": _ChannelWithAllowFrom({"enabled": True}, None, [])}
     mgr._dispatch_task = None
 
-    with pytest.raises(SystemExit) as exc_info:
-        mgr._validate_allow_from()
+    mgr._validate_allow_from()
 
-    assert "empty allowFrom" in str(exc_info.value)
+
+@pytest.mark.asyncio
+async def test_validate_allow_from_allows_missing_allow_from():
+    """Omitted allowFrom is valid — channel operates in pairing-only mode."""
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig(),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    class _NoAllowFromChannel(BaseChannel):
+        name = "noallow"
+        display_name = "No Allow"
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+        async def send(self, msg: OutboundMessage) -> None:
+            pass
+
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.channels = {"test": _NoAllowFromChannel({"enabled": True}, None)}
+    mgr._dispatch_task = None
+
+    # Should not raise — pairing-only mode
+    mgr._validate_allow_from()
 
 
 @pytest.mark.asyncio

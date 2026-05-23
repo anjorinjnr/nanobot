@@ -33,7 +33,7 @@ from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTo
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.search import GlobTool, GrepTool
+from nanobot.agent.tools.search import GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.self import MyTool
 from nanobot.agent.tools.spawn import SpawnTool
@@ -348,8 +348,7 @@ class AgentLoop:
         )
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
-        for cls in (GlobTool, GrepTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(NotebookEditTool(workspace=self.workspace, allowed_dir=allowed_dir))
         if self.exec_config.enable:
             self.tools.register(

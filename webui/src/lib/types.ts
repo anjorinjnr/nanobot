@@ -22,6 +22,14 @@ export interface UIImage {
   name?: string;
 }
 
+export type UIMediaKind = "image" | "video" | "file";
+
+export interface UIMediaAttachment {
+  kind: UIMediaKind;
+  url?: string;
+  name?: string;
+}
+
 export interface UIMessage {
   id: string;
   role: Role;
@@ -34,6 +42,42 @@ export interface UIMessage {
   traces?: string[];
   /** User turn: optimistic blob URLs for preview. Replay: placeholder chips. */
   images?: UIImage[];
+  /** Signed or local UI-renderable media attachments. */
+  media?: UIMediaAttachment[];
+  /** Assistant turn: accumulated model reasoning / thinking text. Built up
+   * incrementally from ``reasoning_delta`` frames; finalized when
+   * ``reasoning_end`` arrives. */
+  reasoning?: string;
+  /** True while ``reasoning_delta`` frames are still arriving for this turn.
+   * Drives the shimmer header on ``ReasoningBubble``. */
+  reasoningStreaming?: boolean;
+  /** End-to-end wall time for this assistant turn (persisted ``latency_ms`` / ``turn_end``). */
+  latencyMs?: number;
+}
+
+/** Structured UI blob on ``progress`` WS frames; channels may add more ``kind`` values later. */
+export interface AgentUIBlob {
+  kind: string;
+  data?: unknown;
+}
+
+/** WebSocket snapshot for sustained goals (`goal_state` events; keyed by ``chat_id``). */
+export interface GoalStateWsPayload {
+  active: boolean;
+  ui_summary?: string;
+  objective?: string;
+}
+
+export interface ToolProgressEvent {
+  version?: number;
+  phase?: "start" | "end" | "error" | string;
+  call_id?: string;
+  name?: string;
+  arguments?: unknown;
+  result?: unknown;
+  error?: unknown;
+  files?: unknown[];
+  embeds?: unknown[];
 }
 
 export interface ChatSummary {
@@ -44,6 +88,7 @@ export interface ChatSummary {
   chatId: string;
   createdAt: string | null;
   updatedAt: string | null;
+  title?: string;
   preview: string;
 }
 
@@ -52,6 +97,62 @@ export interface BootstrapResponse {
   ws_path: string;
   expires_in: number;
   model_name?: string | null;
+}
+
+export interface SettingsPayload {
+  agent: {
+    model: string;
+    provider: string;
+    resolved_provider: string | null;
+    has_api_key: boolean;
+  };
+  providers: Array<{
+    name: string;
+    label: string;
+    configured: boolean;
+    api_key_hint?: string | null;
+    api_base?: string | null;
+    default_api_base?: string | null;
+  }>;
+  web_search: {
+    provider: string;
+    api_key_hint?: string | null;
+    base_url?: string | null;
+    providers: Array<{
+      name: string;
+      label: string;
+      credential: "none" | "api_key" | "base_url";
+    }>;
+  };
+  runtime: {
+    config_path: string;
+  };
+  requires_restart: boolean;
+}
+
+export interface SettingsUpdate {
+  model?: string;
+  provider?: string;
+}
+
+export interface ProviderSettingsUpdate {
+  provider: string;
+  apiKey?: string;
+  apiBase?: string;
+}
+
+export interface WebSearchSettingsUpdate {
+  provider: string;
+  apiKey?: string;
+  baseUrl?: string;
+}
+
+export interface SlashCommand {
+  command: string;
+  title: string;
+  description: string;
+  icon: string;
+  argHint?: string;
 }
 
 export type ConnectionStatus =
@@ -71,9 +172,15 @@ export type InboundEvent =
       text: string;
       reply_to?: string;
       media?: string[];
+      media_urls?: Array<{ url: string; name?: string }>;
+      tool_events?: ToolProgressEvent[];
       /** Present when the frame is an agent breadcrumb (e.g. tool hint,
        * generic progress line) rather than a conversational reply. */
-      kind?: "tool_hint" | "progress";
+      kind?: "tool_hint" | "progress" | "reasoning";
+      /** Server-measured turn wall time when this frame finishes an assistant reply. */
+      latency_ms?: number;
+      /** Optional structured payload on progress frames (channel-specific). */
+      agent_ui?: AgentUIBlob;
     }
   | {
       event: "delta";
@@ -86,6 +193,43 @@ export type InboundEvent =
       chat_id: string;
       stream_id?: string;
     }
+  | {
+      event: "reasoning_delta";
+      chat_id: string;
+      text: string;
+      stream_id?: string;
+    }
+  | {
+      event: "reasoning_end";
+      chat_id: string;
+      stream_id?: string;
+    }
+  | {
+      event: "runtime_model_updated";
+      model_name: string;
+      model_preset?: string | null;
+    }
+  | {
+      event: "turn_end";
+      chat_id: string;
+      latency_ms?: number;
+      /** Authoritative sustained-goal snapshot for this chat (same shape as ``goal_state`` events). */
+      goal_state?: GoalStateWsPayload;
+    }
+  | {
+      event: "goal_status";
+      chat_id: string;
+      /** Turn executing (user message through agent loop). */
+      status: "running" | "idle";
+      /** Server ``time.time()`` when ``status`` is ``running``. */
+      started_at?: number;
+    }
+  | {
+      event: "goal_state";
+      chat_id: string;
+      goal_state: GoalStateWsPayload;
+    }
+  | { event: "session_updated"; chat_id: string }
   | { event: "error"; chat_id?: string; detail?: string };
 
 /** Base64-encoded image attached to an outbound ``message`` envelope.
@@ -101,6 +245,19 @@ export interface OutboundMedia {
   name?: string;
 }
 
+export interface OutboundImageGeneration {
+  enabled: true;
+  aspect_ratio?: string | null;
+}
+
+/** Response shape for ``GET .../webui-thread`` (server-built transcript replay). */
+export interface WebuiThreadPersistedPayload {
+  schemaVersion: number;
+  sessionKey?: string;
+  savedAt?: string;
+  messages: UIMessage[];
+}
+
 export type Outbound =
   | { type: "new_chat" }
   | { type: "attach"; chat_id: string }
@@ -109,4 +266,8 @@ export type Outbound =
       chat_id: string;
       content: string;
       media?: OutboundMedia[];
+      image_generation?: OutboundImageGeneration;
+      /** Marks messages sent by the embedded WebUI, without changing the
+       * generic websocket protocol for other clients. */
+      webui?: true;
     };
