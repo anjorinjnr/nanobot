@@ -177,58 +177,50 @@ def test_inbound_suppression_lookup_error_fails_open() -> None:
     assert scope_guard.check_inbound_suppressed("whatsapp", "x") is False
 
 
-# --- Phase 2: is_allowed consults the lookup --------------------------------
+# --- is_allowed boundary: outbound scope lookup must NOT gate inbound --------
+#
+# Revert of PR #81 (`feat(channels): Phase 2 — converge inbound is_allowed
+# onto the scope lookup`). #81 made any sender with an active scope pass
+# is_allowed regardless of static allow_from. That collapsed two independent
+# ACLs into one and, in deployments that run a privileged "main" agent + a
+# scoped "guest" agent on the same channel account (homer's split-agent
+# architecture), let guests reach the main agent's privileged context.
+# Concrete incident: 2026-05-27 — a guest's active trip scope authorized
+# them at the main agent's inbound, and a separate heartbeat-dispatch bug
+# leaked kid-related email content to them. The fundamental error in #81
+# was using the *outbound* scope lookup as the *inbound* ACL; outbound
+# authorization is per-recipient consent, inbound authorization is per-
+# process trust, and they need to stay separate. These tests lock the
+# revert in so the "additive convergence" idea can't slide back unnoticed.
 
-def test_is_allowed_authorized_by_scope_even_when_not_in_allow_from() -> None:
-    """A sender with an active scope is allowed even if absent from allow_from.
+def test_is_allowed_does_not_consult_outbound_scope_lookup() -> None:
+    """A scope-authorized sender absent from allow_from must NOT pass is_allowed.
 
-    This is the core Phase 2 invariant — the scope lookup is the canonical
-    inbound ACL; the static config list is bootstrap-only.
+    Regression for the 2026-05-27 incident — the outbound scope lookup
+    governs sends, not inbound. Don't let a host's scope ACL silently
+    open a privileged process's inbound surface.
     """
     _install(lambda ch, sid: ScopeLookupResult(authorized=True, reason="active_scope"))
-    # Empty allow_from would normally deny everyone.
     channel = _RecordingChannel()
     channel.config = {"allow_from": []}
-    assert channel.is_allowed("14129739891@s.whatsapp.net") is True
+    assert channel.is_allowed("14129739891@s.whatsapp.net") is False
 
 
-def test_is_allowed_falls_back_to_allow_from_when_no_lookup() -> None:
-    """No lookup installed → behave exactly like the pre-Phase-2 static check."""
+def test_is_allowed_static_allow_from_when_no_lookup() -> None:
+    """No lookup installed → behave exactly like the static check."""
     channel = _RecordingChannel()
     channel.config = {"allow_from": ["alice"]}
     assert channel.is_allowed("alice") is True
     assert channel.is_allowed("eve") is False
 
 
-def test_is_allowed_falls_back_when_lookup_says_no() -> None:
-    """Lookup refuses → the static list still gets a chance to allow."""
-    _install(lambda ch, sid: ScopeLookupResult(authorized=False, reason="no_scope"))
-    channel = _RecordingChannel()
-    channel.config = {"allow_from": ["alice"]}
-    assert channel.is_allowed("alice") is True   # static fallback wins
-    assert channel.is_allowed("eve") is False    # neither scope nor static
-
-
-def test_is_allowed_lookup_exception_falls_back_to_static() -> None:
-    """A broken lookup must not silently lock out senders who are in the static list."""
-    def boom(ch, sid):
-        raise RuntimeError("scope_store crashed")
-    _install(boom)
+def test_is_allowed_static_allow_from_even_when_lookup_present() -> None:
+    """Static allow_from is authoritative; lookup says yes-or-no doesn't matter."""
+    _install(lambda ch, sid: ScopeLookupResult(authorized=True, reason="active_scope"))
     channel = _RecordingChannel()
     channel.config = {"allow_from": ["alice"]}
     assert channel.is_allowed("alice") is True
-
-
-def test_is_allowed_no_reply_scope_still_allowed_for_inbound_acl() -> None:
-    """A no-reply scope authorizes the sender at the ACL level. The actual
-    suppression of the reply happens further up the inbound path via
-    check_inbound_suppressed — is_allowed isn't where that gate lives."""
-    _install(lambda ch, sid: ScopeLookupResult(
-        authorized=True, reason="no_reply_scope", suppress_inbound=True,
-    ))
-    channel = _RecordingChannel()
-    channel.config = {"allow_from": []}
-    assert channel.is_allowed("14129739891@s.whatsapp.net") is True
+    assert channel.is_allowed("eve") is False  # lookup says yes; still rejected
 
 
 # --- _send_with_retry behavior -----------------------------------------------
