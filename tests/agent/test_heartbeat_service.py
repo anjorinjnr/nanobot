@@ -674,7 +674,7 @@ async def test_on_execute_context_wraps_execution(tmp_path, _accept_any_recipien
     from contextlib import contextmanager
 
     @contextmanager
-    def hook(group_tasks):
+    def hook(group_tasks, *, target=None):
         enter_calls.append(list(group_tasks))
         try:
             yield

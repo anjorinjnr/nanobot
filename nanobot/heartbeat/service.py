@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import AbstractContextManager, nullcontext
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, Callable, Coroutine, Literal
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Literal, Protocol
 
 from loguru import logger
 from zoneinfo import ZoneInfo
@@ -264,6 +264,28 @@ MODEL_PRESETS: dict[str, str] = {
 }
 
 
+class _OnExecuteContext(Protocol):
+    """Structural type for the ``on_execute_context`` hook.
+
+    The hook receives the current dispatch's task list and (when the
+    dispatcher pre-resolved a single recipient for the call) the
+    ``target`` to pin MessageTool against. Implementations return a
+    context manager that wraps the ``on_execute`` invocation.
+
+    Defined as a Protocol rather than a plain ``Callable[...]`` so the
+    expected signature stays self-documenting and type-checkers can
+    flag drift in either direction (caller adding a kwarg the hook
+    doesn't accept, or hook narrowing the accepted shape).
+    """
+
+    def __call__(
+        self,
+        group_tasks: list["DueTask"],
+        *,
+        target: tuple[str, str] | None = None,
+    ) -> AbstractContextManager[None]: ...
+
+
 class HeartbeatService:
     """
     Periodic heartbeat service that wakes the agent to check for tasks.
@@ -283,9 +305,7 @@ class HeartbeatService:
         model: str,
         on_execute: Callable[[str, str | None], Coroutine[Any, Any, str]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
-        on_execute_context: (
-            Callable[..., AbstractContextManager[None]] | None
-        ) = None,
+        on_execute_context: _OnExecuteContext | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
         last_run_tracking: bool = False,
