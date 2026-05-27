@@ -119,7 +119,7 @@ async def test_trigger_now_executes_when_decision_is_run(tmp_path) -> None:
 
     called_with: list[str] = []
 
-    async def _on_execute(tasks: str, model_override: str | None = None) -> str:
+    async def _on_execute(tasks: str, model_override: str | None = None, **_kwargs) -> str:
         called_with.append(tasks)
         return "done"
 
@@ -152,7 +152,7 @@ async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
         )
     ])
 
-    async def _on_execute(tasks: str, model_override: str | None = None) -> str:
+    async def _on_execute(tasks: str, model_override: str | None = None, **_kwargs) -> str:
         return tasks
 
     service = HeartbeatService(
@@ -264,7 +264,7 @@ async def test_tick_notifies_when_evaluator_says_yes(tmp_path, monkeypatch) -> N
     executed: list[str] = []
     notified: list[str] = []
 
-    async def _on_execute(tasks: str, model_override: str | None = None) -> str:
+    async def _on_execute(tasks: str, model_override: str | None = None, **_kwargs) -> str:
         executed.append(tasks)
         return "deployment failed on staging"
 
@@ -314,7 +314,7 @@ async def test_tick_skips_notify_when_on_execute_returns_empty(tmp_path, monkeyp
     notified: list[str] = []
     eval_called: list[bool] = []
 
-    async def _on_execute(tasks: str, model_override: str | None = None) -> str:
+    async def _on_execute(tasks: str, model_override: str | None = None, **_kwargs) -> str:
         executed.append(tasks)
         return ""  # send_reasoning=False path in production
 
@@ -362,7 +362,7 @@ async def test_tick_suppresses_when_evaluator_says_no(tmp_path, monkeypatch) -> 
     executed: list[str] = []
     notified: list[str] = []
 
-    async def _on_execute(tasks: str, model_override: str | None = None) -> str:
+    async def _on_execute(tasks: str, model_override: str | None = None, **_kwargs) -> str:
         executed.append(tasks)
         return "everything is fine, no issues"
 
@@ -586,6 +586,58 @@ def test_compute_due_tasks_extracts_recipients() -> None:
     assert due[0].recipient_channels() == {"whatsapp"}
 
 
+# Rule 3 — system/reminder tasks without Recipients must be refused at parse
+# time. Without Recipients the dispatcher has no safe routing target and the
+# agent would guess chat_id from memory. Regression for 2026-05-27 leak.
+
+def test_compute_due_tasks_refuses_system_task_without_recipients() -> None:
+    now = datetime(2026, 3, 12, 10, 0)
+    past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+    content = _make_heartbeat(
+        f"\n### Gmail scan\nId: t_gmail\nType: system\nSchedule: {past}\nRecur: every 1 hour\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now)
+    assert due == [], "task missing Recipients must not enter the due list"
+
+
+def test_compute_due_tasks_refuses_reminder_without_recipients() -> None:
+    now = datetime(2026, 3, 12, 10, 0)
+    past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+    content = _make_heartbeat(
+        f"\n### Remind: call dentist\nSchedule: {past}\nAdded: 2026-03-01\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now)
+    assert due == []
+
+
+def test_compute_due_tasks_refuses_prompt_file_task_without_recipients() -> None:
+    """Prompt-file does not substitute for Recipients — without Recipients
+    a {recipient}-templated prompt has nothing to expand."""
+    now = datetime(2026, 3, 12, 10, 0)
+    past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+    content = _make_heartbeat(
+        f"\n### Morning briefing\nType: system\nSchedule: {past}\nRecur: every 1 day\n"
+        "Prompt-file: users/{recipient}.brief.md\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, now)
+    assert due == []
+
+
+def test_compute_due_tasks_announcements_exempt_from_recipients_rule() -> None:
+    """Announcements live in a separate section and are intentionally broadcast.
+    Rule 3 applies to system/reminder tasks under ## User Tasks only."""
+    content = (
+        "# HEARTBEAT.md\n\n"
+        "## Announcements\n\n"
+        "### Homer just got a new memory feature\n\n"
+        "## User Tasks\n\n"
+    )
+    due = HeartbeatService._compute_due_tasks(content, datetime(2026, 3, 12, 10, 0))
+    assert len(due) == 1
+    assert due[0].task_type == "announcement"
+    assert due[0].recipients is None
+
+
 def test_due_task_recipient_channels_handles_mixed_and_missing() -> None:
     assert DueTask(name="x", task_type="system", schedule=None).recipient_channels() == set()
     multi = DueTask(
@@ -606,7 +658,7 @@ def test_due_task_recipient_channels_email_id_keeps_only_trailing_channel() -> N
 
 
 @pytest.mark.asyncio
-async def test_on_execute_context_wraps_execution(tmp_path) -> None:
+async def test_on_execute_context_wraps_execution(tmp_path, _accept_any_recipient) -> None:
     # Hook must run around on_execute with the group's tasks and tear down
     # even when on_execute raises.
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
@@ -622,7 +674,7 @@ async def test_on_execute_context_wraps_execution(tmp_path) -> None:
     from contextlib import contextmanager
 
     @contextmanager
-    def hook(group_tasks):
+    def hook(group_tasks, *, target=None):
         enter_calls.append(list(group_tasks))
         try:
             yield
@@ -826,7 +878,7 @@ async def test_decide_deterministic_skip_then_execute_on_due(tmp_path) -> None:
     provider = DummyProvider([])  # no LLM responses needed
     executed: list[str] = []
 
-    async def _on_execute(tasks: str, model_override: str | None = None) -> str:
+    async def _on_execute(tasks: str, model_override: str | None = None, **_kwargs) -> str:
         executed.append(tasks)
         return "reminded"
 
@@ -857,7 +909,7 @@ async def test_decide_deterministic_skips_future_task(tmp_path) -> None:
     provider = DummyProvider([])
     executed: list[str] = []
 
-    async def _on_execute(tasks: str, model_override: str | None = None) -> str:
+    async def _on_execute(tasks: str, model_override: str | None = None, **_kwargs) -> str:
         executed.append(tasks)
         return "done"
 
@@ -933,7 +985,7 @@ def test_compute_due_tasks_parses_model_preset() -> None:
     now = datetime(2026, 3, 12, 10, 0)
     past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     content = _make_heartbeat(
-        f"\n### Gmail scan\nType: system\nSchedule: {past}\nModel: flash\nRecur: every 1 hour\n"
+        f"\n### Gmail scan\nType: system\nSchedule: {past}\nModel: flash\nRecur: every 1 hour\nRecipients: primary:whatsapp\n"
     )
     due = HeartbeatService._compute_due_tasks(content, now)
     assert len(due) == 1
@@ -945,7 +997,7 @@ def test_compute_due_tasks_parses_model_literal() -> None:
     now = datetime(2026, 3, 12, 10, 0)
     past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     content = _make_heartbeat(
-        f"\n### Heavy task\nSchedule: {past}\nModel: openai/gpt-4o\n"
+        f"\n### Heavy task\nSchedule: {past}\nRecipients: primary:whatsapp\nModel: openai/gpt-4o\n"
     )
     due = HeartbeatService._compute_due_tasks(content, now)
     assert len(due) == 1
@@ -970,7 +1022,7 @@ def test_compute_due_tasks_all_presets_resolve() -> None:
     past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     for preset, expected in MODEL_PRESETS.items():
         content = _make_heartbeat(
-            f"\n### Task {preset}\nSchedule: {past}\nModel: {preset}\n"
+            f"\n### Task {preset}\nSchedule: {past}\nRecipients: primary:whatsapp\nModel: {preset}\n"
         )
         due = HeartbeatService._compute_due_tasks(content, now)
         assert len(due) == 1
@@ -985,7 +1037,7 @@ def test_compute_due_tasks_caller_supplied_presets_override_builtin() -> None:
     past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     custom = {"gemini-fast": "openrouter/google/gemini-3-flash-preview"}
     content = _make_heartbeat(
-        f"\n### Task\nSchedule: {past}\nModel: gemini-fast\n"
+        f"\n### Task\nSchedule: {past}\nRecipients: primary:whatsapp\nModel: gemini-fast\n"
     )
     due = HeartbeatService._compute_due_tasks(content, now, model_presets=custom)
     assert len(due) == 1
@@ -998,7 +1050,7 @@ def test_compute_due_tasks_empty_caller_presets_falls_back_to_builtin() -> None:
     now = datetime(2026, 3, 12, 10, 0)
     past = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     content = _make_heartbeat(
-        f"\n### Task\nSchedule: {past}\nModel: flash\n"
+        f"\n### Task\nSchedule: {past}\nRecipients: primary:whatsapp\nModel: flash\n"
     )
     due = HeartbeatService._compute_due_tasks(content, now, model_presets=None)
     assert len(due) == 1
@@ -1006,20 +1058,20 @@ def test_compute_due_tasks_empty_caller_presets_falls_back_to_builtin() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tick_groups_tasks_by_model(tmp_path, monkeypatch) -> None:
+async def test_tick_groups_tasks_by_model(tmp_path, monkeypatch, _accept_any_recipient) -> None:
     """Tasks with different models get separate on_execute calls."""
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     heartbeat_content = _make_heartbeat(
-        f"\n### Gmail scan\nType: system\nSchedule: {past}\nModel: flash\nRecur: every 1 hour\n\n"
-        f"### Morning briefing\nType: system\nSchedule: {past}\nModel: pro\nRecur: every 1 day\n\n"
-        f"### Remind: call dentist\nSchedule: {past}\n"
+        f"\n### Gmail scan\nType: system\nSchedule: {past}\nRecipients: primary:whatsapp\nModel: flash\nRecur: every 1 hour\n\n"
+        f"### Morning briefing\nType: system\nSchedule: {past}\nRecipients: primary:whatsapp\nModel: pro\nRecur: every 1 day\n\n"
+        f"### Remind: call dentist\nSchedule: {past}\nRecipients: primary:whatsapp\n"
     )
     (tmp_path / "HEARTBEAT.md").write_text(heartbeat_content, encoding="utf-8")
 
     provider = DummyProvider([])
     calls: list[tuple[str, str | None]] = []
 
-    async def _on_execute(tasks: str, model_override: str | None = None) -> str:
+    async def _on_execute(tasks: str, model_override: str | None = None, **_kwargs) -> str:
         calls.append((tasks, model_override))
         return "done"
 
@@ -1038,7 +1090,9 @@ async def test_tick_groups_tasks_by_model(tmp_path, monkeypatch) -> None:
 
     await service._tick()
 
-    # Should have 3 groups: flash, pro, None (default)
+    # Post Rule 2: each (task, recipient) dispatches separately, so 3 tasks
+    # × 1 recipient each = 3 calls. Each call carries the task's own model
+    # via the model_override arg (replacing the old per-model batching).
     assert len(calls) == 3
     models_used = {c[1] for c in calls}
     assert MODEL_PRESETS["flash"] in models_used
@@ -1047,19 +1101,22 @@ async def test_tick_groups_tasks_by_model(tmp_path, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tick_single_model_group(tmp_path, monkeypatch) -> None:
-    """All tasks with same model (or no model) run in one on_execute call."""
+async def test_tick_dispatches_each_recipient_task_separately(tmp_path, monkeypatch, _accept_any_recipient) -> None:
+    """Post Rule 2: each (task, recipient) gets its own on_execute call,
+    even when tasks share a model. The old "share one summary per model"
+    batching is gone for recipient-bearing tasks — it would have lost
+    target= per call, which is exactly the failure mode of 2026-05-27."""
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     heartbeat_content = _make_heartbeat(
-        f"\n### Task A\nSchedule: {past}\n\n"
-        f"### Task B\nSchedule: {past}\n"
+        f"\n### Task A\nSchedule: {past}\nRecipients: primary:whatsapp\n\n"
+        f"### Task B\nSchedule: {past}\nRecipients: primary:whatsapp\n"
     )
     (tmp_path / "HEARTBEAT.md").write_text(heartbeat_content, encoding="utf-8")
 
     provider = DummyProvider([])
     calls: list[tuple[str, str | None]] = []
 
-    async def _on_execute(tasks: str, model_override: str | None = None) -> str:
+    async def _on_execute(tasks: str, model_override: str | None = None, **_kwargs) -> str:
         calls.append((tasks, model_override))
         return "done"
 
@@ -1078,27 +1135,27 @@ async def test_tick_single_model_group(tmp_path, monkeypatch) -> None:
 
     await service._tick()
 
-    # Both tasks have no model -> single group with model_override=None
-    assert len(calls) == 1
-    assert calls[0][1] is None
-    assert "Task A" in calls[0][0]
-    assert "Task B" in calls[0][0]
+    # 2 tasks × 1 recipient each = 2 dispatches.
+    assert len(calls) == 2
+    messages = sorted(c[0] for c in calls)
+    assert messages == ["Task A (reminder)", "Task B (reminder)"]
+    assert all(c[1] is None for c in calls)
 
 
 @pytest.mark.asyncio
-async def test_trigger_now_groups_by_model(tmp_path) -> None:
+async def test_trigger_now_groups_by_model(tmp_path, _accept_any_recipient) -> None:
     """trigger_now groups tasks by model and calls on_execute for each."""
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     heartbeat_content = _make_heartbeat(
-        f"\n### Fast task\nSchedule: {past}\nModel: flash\n\n"
-        f"### Default task\nSchedule: {past}\n"
+        f"\n### Fast task\nSchedule: {past}\nRecipients: primary:whatsapp\nModel: flash\n\n"
+        f"### Default task\nSchedule: {past}\nRecipients: primary:whatsapp\n"
     )
     (tmp_path / "HEARTBEAT.md").write_text(heartbeat_content, encoding="utf-8")
 
     provider = DummyProvider([])
     calls: list[tuple[str, str | None]] = []
 
-    async def _on_execute(tasks: str, model_override: str | None = None) -> str:
+    async def _on_execute(tasks: str, model_override: str | None = None, **_kwargs) -> str:
         calls.append((tasks, model_override))
         return f"done with {model_override}"
 
@@ -1123,7 +1180,7 @@ async def test_decide_returns_due_tasks_with_model(tmp_path) -> None:
     """_decide returns structured DueTask list with model field when last_run_tracking=True."""
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     content = _make_heartbeat(
-        f"\n### Gmail scan\nType: system\nSchedule: {past}\nModel: haiku\nRecur: every 1 hour\n"
+        f"\n### Gmail scan\nType: system\nSchedule: {past}\nModel: haiku\nRecur: every 1 hour\nRecipients: primary:whatsapp\n"
     )
 
     provider = DummyProvider([])
@@ -1148,7 +1205,7 @@ async def test_decide_returns_due_tasks_with_model(tmp_path) -> None:
 def test_compute_due_tasks_parses_pre_check() -> None:
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     content = _make_heartbeat(
-        f"\n### Check escalations\nType: system\nSchedule: {past}\n"
+        f"\n### Check escalations\nType: system\nSchedule: {past}\nRecipients: primary:whatsapp\n"
         "Recur: every 30 minutes\nPre-check: escalations\n"
     )
     due = HeartbeatService._compute_due_tasks(content, datetime.now())
@@ -1159,7 +1216,7 @@ def test_compute_due_tasks_parses_pre_check() -> None:
 def test_compute_due_tasks_no_pre_check_returns_none() -> None:
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     content = _make_heartbeat(
-        f"\n### Gmail scan\nType: system\nSchedule: {past}\nRecur: every 1 hour\n"
+        f"\n### Gmail scan\nType: system\nSchedule: {past}\nRecur: every 1 hour\nRecipients: primary:whatsapp\n"
     )
     due = HeartbeatService._compute_due_tasks(content, datetime.now())
     assert len(due) == 1
@@ -1263,14 +1320,14 @@ async def test_tick_skips_llm_when_pre_check_empty(tmp_path) -> None:
     """Full tick: pre-check returns empty → no LLM call."""
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     heartbeat = _make_heartbeat(
-        f"\n### Check escalations\nType: system\nSchedule: {past}\n"
+        f"\n### Check escalations\nType: system\nSchedule: {past}\nRecipients: primary:whatsapp\n"
         "Recur: every 30 minutes\nPre-check: escalations\n"
     )
     (tmp_path / "HEARTBEAT.md").write_text(heartbeat)
 
     execute_calls = []
 
-    async def mock_execute(summary: str, model: str | None) -> str:
+    async def mock_execute(summary: str, model: str | None, **_kwargs) -> str:
         execute_calls.append(summary)
         return ""
 
@@ -1286,18 +1343,18 @@ async def test_tick_skips_llm_when_pre_check_empty(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tick_calls_llm_when_pre_check_has_data(tmp_path) -> None:
+async def test_tick_calls_llm_when_pre_check_has_data(tmp_path, _accept_any_recipient) -> None:
     """Full tick: pre-check returns data → LLM called."""
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     heartbeat = _make_heartbeat(
-        f"\n### Check escalations\nType: system\nSchedule: {past}\n"
+        f"\n### Check escalations\nType: system\nSchedule: {past}\nRecipients: primary:whatsapp\n"
         "Recur: every 30 minutes\nPre-check: escalations\n"
     )
     (tmp_path / "HEARTBEAT.md").write_text(heartbeat)
 
     execute_calls = []
 
-    async def mock_execute(summary: str, model: str | None) -> str:
+    async def mock_execute(summary: str, model: str | None, **_kwargs) -> str:
         execute_calls.append(summary)
         return ""
 
@@ -1313,19 +1370,19 @@ async def test_tick_calls_llm_when_pre_check_has_data(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tick_mixed_pre_check_only_runs_tasks_with_work(tmp_path) -> None:
+async def test_tick_mixed_pre_check_only_runs_tasks_with_work(tmp_path, _accept_any_recipient) -> None:
     """Two due tasks: one pre-check empty, one no pre-check → only the latter runs."""
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     heartbeat = _make_heartbeat(
-        f"\n### Gmail scan\nType: system\nSchedule: {past}\nRecur: every 1 hour\n"
-        f"\n### Check escalations\nType: system\nSchedule: {past}\n"
+        f"\n### Gmail scan\nType: system\nSchedule: {past}\nRecur: every 1 hour\nRecipients: primary:whatsapp\n"
+        f"\n### Check escalations\nType: system\nSchedule: {past}\nRecipients: primary:whatsapp\n"
         "Recur: every 30 minutes\nPre-check: escalations\n"
     )
     (tmp_path / "HEARTBEAT.md").write_text(heartbeat)
 
     execute_calls = []
 
-    async def mock_execute(summary: str, model: str | None) -> str:
+    async def mock_execute(summary: str, model: str | None, **_kwargs) -> str:
         execute_calls.append(summary)
         return ""
 
@@ -1367,7 +1424,7 @@ def test_advance_schedules_daily_task(advance_service) -> None:
     """A daily recurring task's Schedule is advanced past now after execution."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 07:00\nRecur: every 1 day\n"
+        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 07:00\nRecur: every 1 day\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Gmail scan", task_type="system", schedule="2026-03-12 07:00")]
@@ -1384,7 +1441,7 @@ def test_advance_schedules_hourly_task(advance_service) -> None:
     """An hourly recurring task advances Schedule by 1 hour past now."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 09:00\nRecur: every 1 hour\n"
+        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 09:00\nRecur: every 1 hour\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Gmail scan", task_type="system", schedule="2026-03-12 09:00")]
@@ -1400,7 +1457,7 @@ def test_advance_schedules_skips_past_now(advance_service) -> None:
     """When schedule is far in the past, it jumps forward past now."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Balance check\nType: system\nSchedule: 2026-03-10 09:00\nRecur: every 1 day\n"
+        "\n### Balance check\nType: system\nSchedule: 2026-03-10 09:00\nRecur: every 1 day\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Balance check", task_type="system", schedule="2026-03-10 09:00")]
@@ -1448,7 +1505,7 @@ def test_advance_schedules_updates_existing_last_run(advance_service) -> None:
     """If Last-run already exists, it is updated rather than duplicated."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 09:00\nLast-run: 2026-03-11 09:00\nRecur: every 1 hour\n"
+        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 09:00\nLast-run: 2026-03-11 09:00\nRecur: every 1 hour\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Gmail scan", task_type="system", schedule="2026-03-12 09:00")]
@@ -1465,7 +1522,7 @@ def test_advance_schedules_multiple_tasks(advance_service) -> None:
     """Multiple due tasks are all advanced in a single call."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 09:00\nRecur: every 1 hour\n\n"
+        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 09:00\nRecur: every 1 hour\n\nRecipients: primary:whatsapp\n"
         "### Balance check\nType: system\nSchedule: 2026-03-12 07:00\nRecur: every 1 day\n"
     )
     service = advance_service(heartbeat)
@@ -1486,7 +1543,7 @@ def test_advance_schedules_date_only(advance_service) -> None:
     """Date-only schedule (no time) stays date-only after advancement."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Weekly review\nSchedule: 2026-03-12\nRecur: every 7 days\n"
+        "\n### Weekly review\nSchedule: 2026-03-12\nRecur: every 7 days\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Weekly review", task_type="reminder", schedule="2026-03-12")]
@@ -1502,7 +1559,7 @@ def test_advance_schedules_advances_past_until(advance_service) -> None:
     """Schedule is advanced even past Until — _compute_due_tasks handles expiry."""
     now = datetime(2026, 3, 15, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Temp reminder\nSchedule: 2026-03-14 09:00\nRecur: every 1 day\nUntil: 2026-03-14\n"
+        "\n### Temp reminder\nSchedule: 2026-03-14 09:00\nRecur: every 1 day\nUntil: 2026-03-14\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Temp reminder", task_type="reminder", schedule="2026-03-14 09:00")]
@@ -1516,15 +1573,15 @@ def test_advance_schedules_advances_past_until(advance_service) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tick_advances_schedules_after_execution(tmp_path, monkeypatch) -> None:
+async def test_tick_advances_schedules_after_execution(tmp_path, monkeypatch, _accept_any_recipient) -> None:
     """Full _tick integration: schedules are advanced after on_execute completes."""
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     heartbeat = _make_heartbeat(
-        f"\n### Gmail scan\nType: system\nSchedule: {past}\nRecur: every 1 hour\n"
+        f"\n### Gmail scan\nType: system\nSchedule: {past}\nRecur: every 1 hour\nRecipients: primary:whatsapp\n"
     )
     (tmp_path / "HEARTBEAT.md").write_text(heartbeat, encoding="utf-8")
 
-    async def mock_execute(summary: str, model: str | None) -> str:
+    async def mock_execute(summary: str, model: str | None, **_kwargs) -> str:
         return "done"
 
     async def mock_eval(*a, **kw):
@@ -1548,7 +1605,7 @@ def test_advance_schedules_minute_recurrence(advance_service) -> None:
     """Minute-based recurrence advances correctly."""
     now = datetime(2026, 3, 12, 10, 35)
     heartbeat = _make_heartbeat(
-        "\n### Frequent check\nType: system\nSchedule: 2026-03-12 10:00\nRecur: every 30 minutes\n"
+        "\n### Frequent check\nType: system\nSchedule: 2026-03-12 10:00\nRecur: every 30 minutes\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Frequent check", task_type="system", schedule="2026-03-12 10:00")]
@@ -1564,7 +1621,7 @@ def test_advance_schedules_extra_whitespace(advance_service) -> None:
     """Schedule with extra whitespace after colon is still replaced correctly."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Gmail scan\nType: system\nSchedule:  2026-03-12 09:00\nRecur: every 1 hour\n"
+        "\n### Gmail scan\nType: system\nSchedule:  2026-03-12 09:00\nRecur: every 1 hour\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Gmail scan", task_type="system", schedule="2026-03-12 09:00")]
@@ -1580,7 +1637,7 @@ def test_advance_schedules_extra_whitespace(advance_service) -> None:
 def test_advance_schedules_schedule_at_eof(advance_service) -> None:
     """Last-run is inserted even when Schedule is the last line with no trailing newline."""
     now = datetime(2026, 3, 12, 10, 30)
-    content = "# Heartbeat Tasks\n## Announcements\n## User Tasks\n### Task EOF\nType: system\nSchedule: 2026-03-12 09:00\nRecur: every 1 hour"
+    content = "# Heartbeat Tasks\n## Announcements\n## User Tasks\n### Task EOF\nType: system\nSchedule: 2026-03-12 09:00\nRecipients: primary:whatsapp\nRecur: every 1 hour"
     service = advance_service(content)
     tasks = [DueTask(name="Task EOF", task_type="system", schedule="2026-03-12 09:00")]
 
@@ -1596,7 +1653,7 @@ def test_advance_schedules_weekly_recurrence(advance_service) -> None:
     """Weekly recurrence advances by 7 days."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Weekly standup\nSchedule: 2026-03-12\nRecur: every 1 week\n"
+        "\n### Weekly standup\nSchedule: 2026-03-12\nRecur: every 1 week\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Weekly standup", task_type="reminder", schedule="2026-03-12")]
@@ -1612,7 +1669,7 @@ def test_advance_schedules_biweekly_recurrence(advance_service) -> None:
     """Bi-weekly recurrence advances by 14 days."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Biweekly review\nSchedule: 2026-03-12\nRecur: every 2 weeks\n"
+        "\n### Biweekly review\nSchedule: 2026-03-12\nRecur: every 2 weeks\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Biweekly review", task_type="reminder", schedule="2026-03-12")]
@@ -1628,7 +1685,7 @@ def test_advance_schedules_zero_recurrence_defaults_to_one(advance_service) -> N
     """Recur: every 0 days defaults to 1 day to prevent infinite loops."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Bad task\nSchedule: 2026-03-12 09:00\nRecur: every 0 days\n"
+        "\n### Bad task\nSchedule: 2026-03-12 09:00\nRecur: every 0 days\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Bad task", task_type="system", schedule="2026-03-12 09:00")]
@@ -1645,7 +1702,7 @@ def test_advance_schedules_block_stops_at_section_boundary(advance_service) -> N
     """Block regex stops at ## section headers, not just ### task headers."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Last task\nType: system\nSchedule: 2026-03-12 09:00\nRecur: every 1 hour\n"
+        "\n### Last task\nType: system\nSchedule: 2026-03-12 09:00\nRecur: every 1 hour\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Last task", task_type="system", schedule="2026-03-12 09:00")]
@@ -1664,7 +1721,7 @@ def test_advance_schedules_skips_already_advanced(advance_service) -> None:
     now = datetime(2026, 3, 12, 10, 30)
     # Schedule is already in the future (LLM called --tick during execution)
     heartbeat = _make_heartbeat(
-        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 11:00\nRecur: every 1 hour\n"
+        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 11:00\nRecur: every 1 hour\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Gmail scan", task_type="system", schedule="2026-03-12 09:00")]
@@ -1685,7 +1742,7 @@ def test_advance_schedules_future_schedule_creates_last_run(advance_service) -> 
     """When Schedule is already future and no Last-run exists, write one."""
     now = datetime(2026, 3, 12, 10, 30)
     heartbeat = _make_heartbeat(
-        "\n### Balance check\nType: system\nSchedule: 2026-04-01 09:00\nRecur: every 1 day\n"
+        "\n### Balance check\nType: system\nSchedule: 2026-04-01 09:00\nRecur: every 1 day\nRecipients: primary:whatsapp\n"
     )
     service = advance_service(heartbeat)
     tasks = [DueTask(name="Balance check", task_type="system", schedule="2026-04-01 09:00")]
@@ -1699,18 +1756,18 @@ def test_advance_schedules_future_schedule_creates_last_run(advance_service) -> 
 
 
 @pytest.mark.asyncio
-async def test_tick_advances_per_group_on_failure(tmp_path, monkeypatch) -> None:
+async def test_tick_advances_per_group_on_failure(tmp_path, monkeypatch, _accept_any_recipient) -> None:
     """If one task group fails, the other group's schedule is still advanced."""
     past = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
     heartbeat = _make_heartbeat(
-        f"\n### Gmail scan\nType: system\nSchedule: {past}\nModel: flash\nRecur: every 1 hour\n\n"
-        f"### Balance check\nType: system\nSchedule: {past}\nModel: pro\nRecur: every 1 day\n"
+        f"\n### Gmail scan\nType: system\nSchedule: {past}\nRecipients: primary:whatsapp\nModel: flash\nRecur: every 1 hour\n\n"
+        f"### Balance check\nType: system\nSchedule: {past}\nRecipients: primary:whatsapp\nModel: pro\nRecur: every 1 day\n"
     )
     (tmp_path / "HEARTBEAT.md").write_text(heartbeat, encoding="utf-8")
 
     call_count = 0
 
-    async def mock_execute(summary: str, model: str | None) -> str:
+    async def mock_execute(summary: str, model: str | None, **_kwargs) -> str:
         nonlocal call_count
         call_count += 1
         if "Balance check" in summary:
@@ -1934,7 +1991,7 @@ def test_advance_schedules_falls_back_to_name_match_when_id_missing(advance_serv
     heartbeat = _make_heartbeat(
         "\n### Gmail scan\n"
         "Type: system\n"
-        "Schedule: 2026-03-12 09:00\n"
+        "Schedule: 2026-03-12 09:00\nRecipients: primary:whatsapp\n"
         "Recur: every 1 hour\n"
     )
     service = advance_service(heartbeat)
@@ -2005,13 +2062,13 @@ def test_advance_schedules_finds_block_in_section_between_user_tasks_and_complet
         "## User Tasks\n"
         "\n### Some user task\n"
         "Id: t_userrrrr\n"
-        "Schedule: 2026-06-01 08:00\n"
+        "Schedule: 2026-06-01 08:00\nRecipients: primary:whatsapp\n"
         "Recur: every 1 day\n"
         "\n"
         "## System Tasks\n"
         "\n### Nightly cleanup\n"
         "Id: t_systemmm\n"
-        "Schedule: 2026-05-08 08:00\n"
+        "Schedule: 2026-05-08 08:00\nRecipients: primary:whatsapp\n"
         "Recur: every 1 day\n"
         "\n"
         "## Completed\n"
@@ -2045,7 +2102,7 @@ def test_advance_schedules_id_lookup_logs_id_on_miss(advance_service, caplog) ->
 
     now = datetime(2026, 5, 8, 9, 0)
     # No matching block in HEARTBEAT.md — task was already removed.
-    heartbeat = _make_heartbeat("\n### Other task\nSchedule: 2026-05-08 09:00\nRecur: every 1 day\n")
+    heartbeat = _make_heartbeat("\n### Other task\nSchedule: 2026-05-08 09:00\nRecur: every 1 day\nRecipients: primary:whatsapp\n")
     service = advance_service(heartbeat)
     tasks = [DueTask(
         name="Vanished task", task_type="reminder",
@@ -2084,7 +2141,7 @@ def test_compute_due_tasks_prompt_file_none_when_absent() -> None:
     """Tasks without Prompt-file have prompt_file=None."""
     now = datetime(2026, 3, 12, 8, 0)
     content = _make_heartbeat(
-        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 07:00\n"
+        "\n### Gmail scan\nType: system\nSchedule: 2026-03-12 07:00\nRecipients: primary:whatsapp\n"
     )
     tasks = HeartbeatService._compute_due_tasks(content, now)
     assert tasks[0].prompt_file is None
@@ -2208,6 +2265,24 @@ def test_read_prompt_file_returns_none_when_file_missing(tmp_path):
 
 
 @pytest.fixture
+def _accept_any_recipient(monkeypatch):
+    """Stub _resolve_dispatch_target so any (recipient, channel) resolves to a
+    fake target. Use in heartbeat dispatch tests that care about scheduler /
+    pre-check / advance behavior — NOT recipient resolution itself — so they
+    don't need the homer sibling clone or its users.yaml fixture.
+
+    Tests that specifically exercise resolution (per-user prompt files,
+    skip-on-unresolvable, etc.) use ``homer_users_yaml_for_dispatch`` below
+    so they hit the real resolver.
+    """
+    def _stub(recipient, channel):
+        if not recipient or not channel:
+            return None
+        return (channel, f"{recipient}@test.local")
+    monkeypatch.setattr("nanobot.heartbeat.service._resolve_dispatch_target", _stub)
+
+
+@pytest.fixture
 def homer_users_yaml_for_dispatch(homer_users_yaml):
     """Pre-seed the shared fixture's users.yaml with two members so
     ``ebby:whatsapp`` and ``seun:whatsapp`` resolve."""
@@ -2234,7 +2309,7 @@ def homer_users_yaml_for_dispatch(homer_users_yaml):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_prompt_file_task_fires_per_recipient(tmp_path, homer_users_yaml_for_dispatch):
+async def test_dispatch_task_to_recipients_fires_per_recipient(tmp_path, homer_users_yaml_for_dispatch):
     """A task with Prompt-file and N recipients fires N agent calls,
     each with that recipient's prompt-file content as the message,
     and each dispatch carries the resolved (channel, handle) target so
@@ -2261,7 +2336,7 @@ async def test_dispatch_prompt_file_task_fires_per_recipient(tmp_path, homer_use
         recipients="ebby:whatsapp,seun:whatsapp",
         prompt_file="context/users/{recipient}.brief.md",
     )
-    await service._dispatch_prompt_file_task(task, stub_evaluate)
+    await service._dispatch_task_to_recipients(task, stub_evaluate)
 
     assert [msg for msg, _, _ in captured] == ["ebby content", "seun content"]
     # And each dispatch carried the resolved target — the whole point of step 4.
@@ -2272,7 +2347,7 @@ async def test_dispatch_prompt_file_task_fires_per_recipient(tmp_path, homer_use
 
 
 @pytest.mark.asyncio
-async def test_dispatch_prompt_file_task_falls_back_to_summary_on_missing_file(tmp_path, homer_users_yaml_for_dispatch):
+async def test_dispatch_task_to_recipients_falls_back_to_summary_on_missing_file(tmp_path, homer_users_yaml_for_dispatch):
     """A missing prompt file does NOT silently drop the task — falls back
     to the default task-summary so the dispatcher still runs (and the
     schedule still advances). Otherwise a typo in PromptFile would
@@ -2294,13 +2369,13 @@ async def test_dispatch_prompt_file_task_falls_back_to_summary_on_missing_file(t
         recipients="ebby:whatsapp",
         prompt_file="context/users/{recipient}.brief.md",  # file doesn't exist
     )
-    await service._dispatch_prompt_file_task(task, stub_evaluate)
+    await service._dispatch_task_to_recipients(task, stub_evaluate)
 
     assert captured == ["Morning briefing (system)"]
 
 
 @pytest.mark.asyncio
-async def test_dispatch_prompt_file_task_skips_unresolvable_recipient(tmp_path, homer_users_yaml_for_dispatch):
+async def test_dispatch_task_to_recipients_skips_unresolvable_recipient(tmp_path, homer_users_yaml_for_dispatch):
     """A specified recipient missing from users.yaml is skipped rather than
     dispatched to a fallback target — falling back would land the brief in
     an unrelated session."""
@@ -2326,14 +2401,14 @@ async def test_dispatch_prompt_file_task_skips_unresolvable_recipient(tmp_path, 
         recipients="ebby:whatsapp,ghost:whatsapp",  # ghost not in users.yaml
         prompt_file="context/users/{recipient}.brief.md",
     )
-    await service._dispatch_prompt_file_task(task, stub_evaluate)
+    await service._dispatch_task_to_recipients(task, stub_evaluate)
 
     # Only ebby resolved — ghost was skipped, not delivered to a fallback target.
     assert captured == ["ebby content"]
 
 
 @pytest.mark.asyncio
-async def test_dispatch_prompt_file_task_no_advance_when_all_unresolvable(tmp_path, homer_users_yaml_for_dispatch):
+async def test_dispatch_task_to_recipients_no_advance_when_all_unresolvable(tmp_path, homer_users_yaml_for_dispatch):
     """If a task has Recipients but EVERY one fails to resolve, the schedule
     must not advance — otherwise a misconfigured Recipients line silently
     ships the brief into the void and we lose a day's worth of delivery
@@ -2360,14 +2435,14 @@ async def test_dispatch_prompt_file_task_no_advance_when_all_unresolvable(tmp_pa
         recipients="ghost:whatsapp,phantom:whatsapp",  # neither in users.yaml
         prompt_file="context/users/{recipient}.brief.md",
     )
-    await service._dispatch_prompt_file_task(task, stub_evaluate)
+    await service._dispatch_task_to_recipients(task, stub_evaluate)
 
     assert captured == []  # No dispatch happened.
     assert advance_calls == []  # And no advance — task retries next tick.
 
 
 @pytest.mark.asyncio
-async def test_dispatch_prompt_file_task_advances_when_at_least_one_delivered(tmp_path, homer_users_yaml_for_dispatch):
+async def test_dispatch_task_to_recipients_advances_when_at_least_one_delivered(tmp_path, homer_users_yaml_for_dispatch):
     """Partial success still advances the schedule — one delivered counts.
     Otherwise an intermittent resolver failure would jam the whole task."""
     users_dir = tmp_path / "context" / "users"
@@ -2390,16 +2465,18 @@ async def test_dispatch_prompt_file_task_advances_when_at_least_one_delivered(tm
         recipients="ebby:whatsapp,ghost:whatsapp",
         prompt_file="context/users/{recipient}.brief.md",
     )
-    await service._dispatch_prompt_file_task(task, stub_evaluate)
+    await service._dispatch_task_to_recipients(task, stub_evaluate)
 
     assert advance_calls == [["Morning briefing"]]
 
 
 @pytest.mark.asyncio
-async def test_dispatch_prompt_file_task_fires_once_when_no_recipients(tmp_path):
-    """A task with Prompt-file but no Recipients fires once with target=None,
-    the legacy shared-digest path. on_execute then falls back to the
-    heartbeat's default routing. No users_loader resolution attempted."""
+async def test_dispatch_task_to_recipients_refuses_task_without_recipients(tmp_path):
+    """Rule 3 invariant: the parser refuses to enqueue a Recipients-less task,
+    so dispatch should never receive one. Belt-and-suspenders: if it does
+    (programmatic construction, bug upstream), refuse to dispatch rather
+    than firing a target=None call that would leak content to whoever the
+    agent guesses."""
     (tmp_path / "shared.md").write_text("shared brief", encoding="utf-8")
     captured: list[tuple[str, tuple[str, str] | None]] = []
 
@@ -2408,6 +2485,8 @@ async def test_dispatch_prompt_file_task_fires_once_when_no_recipients(tmp_path)
         return None
 
     service = _make_prompt_service(tmp_path, on_execute=on_execute)
+    advance_calls: list[list[str]] = []
+    service._advance_schedules = lambda tasks: advance_calls.append([t.name for t in tasks])
 
     async def stub_evaluate(*args, **kwargs):
         return False
@@ -2416,7 +2495,46 @@ async def test_dispatch_prompt_file_task_fires_once_when_no_recipients(tmp_path)
         name="Weekly digest", task_type="system",
         schedule="2026-03-12 07:00",
         prompt_file="shared.md",
+        # No recipients — should be refused.
     )
-    await service._dispatch_prompt_file_task(task, stub_evaluate)
+    await service._dispatch_task_to_recipients(task, stub_evaluate)
 
-    assert captured == [("shared brief", None)]
+    assert captured == [], "no dispatch may occur for a Recipients-less task"
+    assert advance_calls == [], "schedule must not advance when dispatch was refused"
+
+
+# Rule 2 — non-Prompt-file tasks must also fan out per recipient with target=.
+# Pre-fix, this path ignored Recipients and called on_execute(summary, model)
+# with no target. Regression for the 2026-05-27 Gmail-scan leak.
+
+@pytest.mark.asyncio
+async def test_dispatch_task_to_recipients_non_prompt_file_fans_out(tmp_path, homer_users_yaml_for_dispatch):
+    """A task WITHOUT Prompt-file but WITH Recipients fans out per recipient
+    using the task summary as the message, and each dispatch carries the
+    resolved (channel, handle) target. This is the path that leaked
+    Gmail-scan content to a guest on 2026-05-27."""
+    captured: list[tuple[str, str | None, tuple[str, str] | None]] = []
+
+    async def on_execute(msg, model, *, target=None):
+        captured.append((msg, model, target))
+        return None
+
+    service = _make_prompt_service(tmp_path, on_execute=on_execute)
+
+    async def stub_evaluate(*args, **kwargs):
+        return False
+
+    task = DueTask(
+        name="Gmail scan", task_type="system",
+        schedule="2026-03-12 09:00",
+        recipients="ebby:whatsapp,seun:whatsapp",
+        model="gemini-fast",
+        # No Prompt-file.
+    )
+    await service._dispatch_task_to_recipients(task, stub_evaluate)
+
+    # One call per recipient, each with the task-summary message and target=.
+    assert captured == [
+        ("Gmail scan (system)", "gemini-fast", ("whatsapp", "ebby@lid.whatsapp.net")),
+        ("Gmail scan (system)", "gemini-fast", ("whatsapp", "seun@lid.whatsapp.net")),
+    ]

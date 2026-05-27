@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import AbstractContextManager, nullcontext
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, Callable, Coroutine, Literal
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Literal, Protocol
 
 from loguru import logger
 from zoneinfo import ZoneInfo
@@ -264,6 +264,28 @@ MODEL_PRESETS: dict[str, str] = {
 }
 
 
+class _OnExecuteContext(Protocol):
+    """Structural type for the ``on_execute_context`` hook.
+
+    The hook receives the current dispatch's task list and (when the
+    dispatcher pre-resolved a single recipient for the call) the
+    ``target`` to pin MessageTool against. Implementations return a
+    context manager that wraps the ``on_execute`` invocation.
+
+    Defined as a Protocol rather than a plain ``Callable[...]`` so the
+    expected signature stays self-documenting and type-checkers can
+    flag drift in either direction (caller adding a kwarg the hook
+    doesn't accept, or hook narrowing the accepted shape).
+    """
+
+    def __call__(
+        self,
+        group_tasks: list["DueTask"],
+        *,
+        target: tuple[str, str] | None = None,
+    ) -> AbstractContextManager[None]: ...
+
+
 class HeartbeatService:
     """
     Periodic heartbeat service that wakes the agent to check for tasks.
@@ -283,9 +305,7 @@ class HeartbeatService:
         model: str,
         on_execute: Callable[[str, str | None], Coroutine[Any, Any, str]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
-        on_execute_context: (
-            Callable[[list["DueTask"]], AbstractContextManager[None]] | None
-        ) = None,
+        on_execute_context: _OnExecuteContext | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
         last_run_tracking: bool = False,
@@ -419,12 +439,36 @@ class HeartbeatService:
             prompt_file = prompt_file_match.group(1).strip() if prompt_file_match else None
 
             effective_due, _ = _effective_due(block, schedule_dt, schedule_str)
-            if now >= effective_due:
-                due.append(DueTask(
-                    name=task_name, task_type=task_type, schedule=schedule_str,
-                    model=model, pre_check=pre_check, recipients=recipients,
-                    id=task_id, prompt_file=prompt_file,
-                ))
+            if now < effective_due:
+                continue
+
+            # Rule 3 — every system/reminder task must declare Recipients.
+            # A task without Recipients has no safe routing target: the
+            # dispatcher would call on_execute() with no target= and the
+            # agent would guess chat_id from memory. That's the failure
+            # mode that leaked kid-related Gmail content to a guest on
+            # 2026-05-27. Prompt-file does NOT substitute — it carries
+            # per-recipient prompt content but still needs Recipients to
+            # know who to fan out to. Refuse loudly so the operator
+            # notices and adds Recipients, rather than silently dispatching
+            # to whoever the LLM picks. Announcements are exempt (different
+            # section, no Schedule, intentionally broadcast).
+            if not recipients:
+                logger.error(
+                    "Heartbeat: refusing to dispatch {!r} [id={}] — "
+                    "system/reminder tasks must declare 'Recipients:'. "
+                    "Add Recipients to HEARTBEAT.md (e.g. "
+                    "'Recipients: primary:whatsapp') and the task will "
+                    "fire on the next tick.",
+                    task_name, task_id or "<no-id>",
+                )
+                continue
+
+            due.append(DueTask(
+                name=task_name, task_type=task_type, schedule=schedule_str,
+                model=model, pre_check=pre_check, recipients=recipients,
+                id=task_id, prompt_file=prompt_file,
+            ))
 
         return due
 
@@ -948,46 +992,66 @@ class HeartbeatService:
             )
             return None
 
-    async def _dispatch_prompt_file_task(self, task: DueTask, evaluate_response) -> None:
-        """Run a single Prompt-file task, fanning out per recipient.
+    async def _dispatch_task_to_recipients(self, task: DueTask, evaluate_response) -> None:
+        """Run a single task, fanning out per recipient.
 
         Each ``(recipient_symbol, channel)`` pair from ``Recipients:`` is
-        resolved via homer's ``users_loader`` to a channel handle and the
-        resolved ``(channel, handle)`` is passed to ``on_execute`` /
+        resolved via the host's ``users_loader`` to a channel handle and
+        the resolved ``(channel, handle)`` is passed to ``on_execute`` /
         ``on_notify`` as ``target=``. The agent runs in the recipient's
-        session so ``message()`` defaults route correctly.
+        session so ``message()`` defaults route correctly — the LLM does
+        not have to (and must not) guess chat_id from memory.
 
-        Resolution failures skip that recipient (no fallback — falling
-        back to a global default would land the brief in some unrelated
-        session). Tasks with no Recipients fire once with no target,
-        preserving the legacy shared-digest path.
+        Message body per dispatch:
+          - Prompt-file tasks: read the file with ``{recipient}``
+            substitution (per-user prompt content).
+          - Other tasks: ``"<name> (<task_type>)"`` summary.
 
-        The schedule advances only when at least one delivery succeeded
-        (or when the task had no Recipients to resolve in the first
-        place). A task whose Recipients are all unresolvable retries on
-        the next tick rather than silently advancing past the failure.
+        Recipients are required. Without them there is no safe target,
+        so the parser refuses to enqueue such tasks (see Rule 3 in
+        ``_compute_due_tasks``); this method asserts the invariant
+        belt-and-suspenders.
+
+        Resolution failures skip that recipient. The schedule advances
+        only when at least one delivery succeeded — a task whose
+        Recipients are all unresolvable retries on the next tick rather
+        than silently advancing past the failure.
         """
         pairs = task.recipient_pairs()
-        delivered_any = not pairs  # No recipients → legacy path always advances.
+        if not pairs:
+            # Should be unreachable — _compute_due_tasks refuses to enqueue.
+            logger.error(
+                "Heartbeat: {!r} reached dispatch without Recipients; refusing. "
+                "(Parser invariant violated — check _compute_due_tasks.)",
+                task.name,
+            )
+            return
 
-        # Drive with [(None, None)] for the no-recipients case so the
-        # rest of the loop body stays single-branch.
-        iter_pairs: list[tuple[str | None, str | None]] = (
-            list(pairs) if pairs else [(None, None)]
-        )
-        for recipient, channel in iter_pairs:
+        any_resolved = False  # at least one recipient resolved to a target
+        for recipient, channel in pairs:
             target = _resolve_dispatch_target(recipient, channel)
-            if recipient is not None and target is None:
+            if target is None:
+                logger.warning(
+                    "Heartbeat: {!r} could not resolve recipient {!r}:{!r}; skipping.",
+                    task.name, recipient, channel,
+                )
                 continue
+            any_resolved = True
 
-            message = self._read_prompt_file(task.prompt_file or "", recipient)
-            if message is None:
-                # Missing prompt-file still dispatches — a typo in the path
-                # shouldn't silently disable the task. Use the task summary.
+            if task.prompt_file:
+                message = self._read_prompt_file(task.prompt_file, recipient)
+                if message is None:
+                    # Missing prompt-file still dispatches — a typo in the path
+                    # shouldn't silently disable the task. Use the task summary.
+                    message = f"{task.name} ({task.task_type})"
+            else:
                 message = f"{task.name} ({task.task_type})"
 
+            # Pass `target` to the context hook so the host (homer) can pin
+            # MessageTool.allowed_recipients to exactly this recipient — the
+            # hard guarantee that the LLM can't override chat_id mid-turn.
             ctx = (
-                self.on_execute_context([task])
+                self.on_execute_context([task], target=target)
                 if self.on_execute_context
                 else nullcontext()
             )
@@ -996,7 +1060,6 @@ class HeartbeatService:
                     response = await self.on_execute(
                         message, task.model, target=target,
                     )
-                delivered_any = True
                 if response:
                     should_notify = await evaluate_response(
                         response, task.name, self.provider, self.model,
@@ -1004,19 +1067,26 @@ class HeartbeatService:
                     )
                     if should_notify and self.on_notify:
                         logger.info(
-                            "Heartbeat: completed, delivering response (prompt-file, recipient={})",
-                            recipient or "<none>",
+                            "Heartbeat: completed, delivering response "
+                            "(task={!r}, recipient={!r})",
+                            task.name, recipient,
                         )
                         await self.on_notify(response, target=target)
                     else:
                         logger.info("Heartbeat: silenced by post-run evaluation")
             except Exception:
                 logger.exception(
-                    "Heartbeat: prompt-file task failed for {} (recipient={})",
-                    task.name, recipient or "<none>",
+                    "Heartbeat: task failed for {!r} (recipient={!r})",
+                    task.name, recipient,
                 )
 
-        if not delivered_any:
+        if not any_resolved:
+            # No recipient resolved — config bug (e.g., symbol missing from
+            # users.yaml). Don't advance: this is the case where retrying
+            # next tick has a chance of succeeding (operator may be fixing
+            # users.yaml right now). Distinguished from per-recipient
+            # on_execute failures, which DO advance (those are typically
+            # persistent LLM errors and retrying every tick spams).
             logger.error(
                 "Heartbeat: {!r} had Recipients but none resolved — schedule NOT "
                 "advanced; will retry next tick. Check users.yaml for the "
@@ -1084,55 +1154,64 @@ class HeartbeatService:
                             response[:80],
                         )
                 else:
-                    # Tasks with Prompt-file dispatch separately, one per
-                    # recipient, so per-user prompt files (e.g.
-                    # context/users/{recipient}.brief.md) can customize the
-                    # message per user. The remaining tasks group by model
-                    # as before and share one summary dispatch.
-                    prompt_tasks = [t for t in due_tasks if t.prompt_file]
-                    remaining_tasks = [t for t in due_tasks if not t.prompt_file]
+                    # Every system/reminder task dispatches per recipient
+                    # via _dispatch_task_to_recipients, which passes
+                    # target=(channel, handle) so the agent's message()
+                    # tool routes to the correct user without guessing.
+                    # Rule 3 (in _compute_due_tasks) guarantees every
+                    # system/reminder task has Recipients before reaching
+                    # dispatch.
+                    #
+                    # Announcements are the only remaining legacy-path
+                    # dispatch — they have no recipients (they're
+                    # broadcast updates curated at container startup) and
+                    # fall through to on_execute() without a target. If
+                    # we ever LLM-generate announcement content, add
+                    # Recipients to that path too.
+                    recipient_tasks = [t for t in due_tasks if t.recipients]
+                    broadcast_tasks = [t for t in due_tasks if not t.recipients]
 
-                    for task in prompt_tasks:
-                        await self._dispatch_prompt_file_task(task, evaluate_response)
+                    for task in recipient_tasks:
+                        await self._dispatch_task_to_recipients(task, evaluate_response)
 
-                    # Group remaining tasks by model override
-                    groups: dict[str | None, list[DueTask]] = {}
-                    for t in remaining_tasks:
-                        groups.setdefault(t.model, []).append(t)
+                    if broadcast_tasks:
+                        # Group by model override (legacy path — announcements only).
+                        groups: dict[str | None, list[DueTask]] = {}
+                        for t in broadcast_tasks:
+                            groups.setdefault(t.model, []).append(t)
 
-                    for model_override, group_tasks in groups.items():
-                        summary = ", ".join(f"{t.name} ({t.task_type})" for t in group_tasks)
-                        ctx = (
-                            self.on_execute_context(group_tasks)
-                            if self.on_execute_context
-                            else nullcontext()
-                        )
-                        try:
-                            with ctx:
-                                response = await self.on_execute(summary, model_override)
-                            if response and self._is_deliverable(response):
-                                should_notify = await evaluate_response(
-                                    response, summary, self.provider, self.model,
-                                    suppress_errors=self.suppress_errors,
-                                )
-                                if should_notify and self.on_notify:
-                                    logger.info("Heartbeat: completed, delivering response")
-                                    await self.on_notify(response)
-                                else:
-                                    logger.info("Heartbeat: silenced by post-run evaluation")
-                            elif response:
-                                logger.info(
-                                    "Heartbeat: suppressed non-deliverable response ({})",
-                                    response[:80],
-                                )
-                        except Exception:
-                            logger.exception("Heartbeat: task failed for {}", summary)
-                        finally:
-                            # Always advance schedule — even on failure — to prevent
-                            # retry spam on persistent errors (e.g. API outage).
-                            # The task will run again at its next scheduled time.
-                            if self.last_run_tracking:
-                                self._advance_schedules(group_tasks)
+                        for model_override, group_tasks in groups.items():
+                            summary = ", ".join(f"{t.name} ({t.task_type})" for t in group_tasks)
+                            ctx = (
+                                self.on_execute_context(group_tasks)
+                                if self.on_execute_context
+                                else nullcontext()
+                            )
+                            try:
+                                with ctx:
+                                    response = await self.on_execute(summary, model_override)
+                                if response and self._is_deliverable(response):
+                                    should_notify = await evaluate_response(
+                                        response, summary, self.provider, self.model,
+                                        suppress_errors=self.suppress_errors,
+                                    )
+                                    if should_notify and self.on_notify:
+                                        logger.info("Heartbeat: completed, delivering response")
+                                        await self.on_notify(response)
+                                    else:
+                                        logger.info("Heartbeat: silenced by post-run evaluation")
+                                elif response:
+                                    logger.info(
+                                        "Heartbeat: suppressed non-deliverable response ({})",
+                                        response[:80],
+                                    )
+                            except Exception:
+                                logger.exception("Heartbeat: task failed for {}", summary)
+                            finally:
+                                # Always advance schedule — even on failure — to prevent
+                                # retry spam on persistent errors (e.g. API outage).
+                                if self.last_run_tracking:
+                                    self._advance_schedules(group_tasks)
         except Exception:
             logger.exception("Heartbeat execution failed")
 

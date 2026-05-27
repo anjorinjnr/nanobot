@@ -80,6 +80,22 @@ class MessageTool(Tool, ContextAware):
         self._allowed_channels: ContextVar[frozenset[str] | None] = ContextVar(
             "message_allowed_channels", default=None
         )
+        # Hard guarantee that prevents the LLM from sending a message intended
+        # for one conversation/recipient to a different chat_id by overriding
+        # the tool argument. When set (non-None), every send must target a
+        # (channel, chat_id) in the set; anything else is refused at the tool
+        # layer, before reaching the channel or the scope guard.
+        #
+        # Set by:
+        #   - agent loop, per interactive turn → just the inbound sender
+        #   - heartbeat dispatcher, per (task, recipient) → just that recipient
+        #
+        # This is the regression net for 2026-05-27, where the heartbeat's
+        # non-prompt-file path called on_execute() with no target= and the
+        # LLM guessed a chat_id from memory (a guest's, in that case).
+        self._allowed_recipients: ContextVar[
+            frozenset[tuple[str, str]] | None
+        ] = ContextVar("message_allowed_recipients", default=None)
         self._task_tag: ContextVar[str | None] = ContextVar(
             "message_task_tag", default=None,
         )
@@ -113,20 +129,37 @@ class MessageTool(Tool, ContextAware):
         self,
         *,
         allowed_channels: Iterable[str] | None = None,
+        allowed_recipients: Iterable[tuple[str, str]] | None = None,
         task_tag: str | None = None,
     ) -> Iterator[None]:
         """Scope routing constraints to a single ``with`` block.
 
         ``allowed_channels`` (when not ``None``) refuses ``message`` calls to
         any channel outside the set — used by the heartbeat path to honor a
-        task's Recipients field. ``task_tag`` propagates into outbound
-        metadata so ChannelManager's spam guard can dedup per (recipient,
-        task) instead of per content hash. Both are ContextVar-scoped, so
-        nested or concurrent scopes don't leak.
+        task's Recipients field at the channel level.
+
+        ``allowed_recipients`` (when not ``None``) is the **hard guarantee**:
+        refuses any send whose ``(channel, chat_id)`` is not in the set.
+        Stricter than ``allowed_channels`` — pins both axes. Required for
+        per-recipient heartbeat dispatch and interactive turns so the LLM
+        cannot send a message intended for one user to a different chat_id
+        by overriding the tool arguments.
+
+        ``task_tag`` propagates into outbound metadata so ChannelManager's
+        spam guard can dedup per (recipient, task) instead of per content
+        hash. All three are ContextVar-scoped, so nested or concurrent
+        scopes don't leak.
         """
         channel_token = (
             self._allowed_channels.set(frozenset(c.lower() for c in allowed_channels))
             if allowed_channels is not None
+            else None
+        )
+        recipient_token = (
+            self._allowed_recipients.set(
+                frozenset((c.lower(), x) for (c, x) in allowed_recipients)
+            )
+            if allowed_recipients is not None
             else None
         )
         tag_token = self._task_tag.set(task_tag) if task_tag else None
@@ -135,6 +168,8 @@ class MessageTool(Tool, ContextAware):
         finally:
             if channel_token is not None:
                 self._allowed_channels.reset(channel_token)
+            if recipient_token is not None:
+                self._allowed_recipients.reset(recipient_token)
             if tag_token is not None:
                 self._task_tag.reset(tag_token)
 
@@ -142,10 +177,34 @@ class MessageTool(Tool, ContextAware):
         """Set the callback for sending messages."""
         self._send_callback = callback
 
-    def start_turn(self) -> None:
-        """Reset per-turn send tracking."""
+    def start_turn(
+        self,
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
+    ) -> None:
+        """Reset per-turn send tracking and (optionally) pin the recipient.
+
+        When ``channel`` and ``chat_id`` are both supplied, ``allowed_recipients``
+        is pinned to that single ``(channel, chat_id)`` for the turn — any
+        attempt by the agent to ``message`` a different recipient via tool
+        argument override is refused at the tool layer. Without the pin
+        (defaults), the gate is open and only the channel-level scope guard
+        applies.
+
+        The caller is responsible for invoking this at the start of every
+        turn so a previous turn's pin can't leak into the next. Heartbeat
+        dispatches use the contextmanager ``scoped(allowed_recipients=...)``
+        instead, which auto-resets at the end of the with-block.
+        """
         self._sent_in_turn = False
         self._turn_delivered_media_var.set(())
+        if channel and chat_id:
+            self._allowed_recipients.set(
+                frozenset([(channel.lower(), chat_id)])
+            )
+        else:
+            self._allowed_recipients.set(None)
 
     def turn_delivered_media_paths(self) -> list[str]:
         """Absolute paths attached via this tool to the active chat in the current turn."""
@@ -258,6 +317,28 @@ class MessageTool(Tool, ContextAware):
                 f"Error: channel {channel!r} is not permitted in this context. "
                 f"Allowed channels: {allowed_list}."
             )
+
+        # Hard recipient gate. When the caller set allowed_recipients (per-turn
+        # for interactive replies, per (task, recipient) for heartbeat
+        # dispatch), every send must match. Refuse anything else — this is
+        # the kernel-level guarantee that prevents the LLM from sending a
+        # message intended for one user to a different chat_id by guessing
+        # or overriding the tool args. Returning a string error here means
+        # the agent sees the refusal in its tool result; the message never
+        # reaches the channel.
+        allowed_targets = self._allowed_recipients.get()
+        if allowed_targets is not None:
+            if (channel.lower(), chat_id) not in allowed_targets:
+                allowed_repr = (
+                    ", ".join(f"{c}:{x}" for c, x in sorted(allowed_targets))
+                    or "<empty>"
+                )
+                return (
+                    f"Error: recipient {channel}:{chat_id} is not permitted "
+                    f"in this context. Allowed: {allowed_repr}. "
+                    "The agent cannot override recipient mid-turn; this turn "
+                    "is scoped to a specific user/conversation."
+                )
 
         if not self._send_callback:
             return "Error: Message sending not configured"

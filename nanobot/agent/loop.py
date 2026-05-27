@@ -1339,7 +1339,14 @@ class AgentLoop:
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
+                # Pin the recipient to the inbound sender for the whole turn.
+                # The agent CAN reply (default chat_id = msg.chat_id); it
+                # CANNOT message a different chat_id via tool override. This
+                # is the hard guarantee that an interactive turn with one
+                # household member can't leak content to anyone else —
+                # including other household members on different sessions
+                # and certainly including guests.
+                message_tool.start_turn(channel=msg.channel, chat_id=msg.chat_id)
 
         history = session.get_history(max_messages=0)
 

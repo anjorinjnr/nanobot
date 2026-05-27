@@ -78,6 +78,144 @@ async def test_no_scope_means_no_restriction() -> None:
     assert len(sent) == 1
 
 
+# allowed_recipients — the hard recipient gate. Stricter than allowed_channels;
+# pins the (channel, chat_id) pair so the LLM cannot override chat_id by tool
+# argument. Regression net for the 2026-05-27 leak where the heartbeat agent
+# put a guest's chat_id in a `message(...)` call meant for primary.
+
+@pytest.mark.asyncio
+async def test_scoped_blocks_disallowed_recipient() -> None:
+    """A send to a chat_id not in allowed_recipients is refused at the tool
+    layer — the message never reaches the channel and the agent sees the
+    refusal in its tool result."""
+    send, sent = _capture_send_callback()
+    tool = MessageTool(send_callback=send)
+    with tool.scoped(allowed_recipients={("whatsapp", "primary_lid")}):
+        result = await tool.execute(
+            content="leaked!", channel="whatsapp", chat_id="guest_lid",
+        )
+    assert "is not permitted" in result
+    assert "guest_lid" in result
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_scoped_allows_listed_recipient() -> None:
+    send, sent = _capture_send_callback()
+    tool = MessageTool(send_callback=send)
+    with tool.scoped(allowed_recipients={("whatsapp", "primary_lid")}):
+        result = await tool.execute(
+            content="hi", channel="whatsapp", chat_id="primary_lid",
+        )
+    assert result.startswith("Message sent")
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_scoped_recipient_check_normalizes_channel_case() -> None:
+    """Channel matching is case-insensitive (consistent with allowed_channels)
+    so 'WhatsApp' in the allow-set matches a 'whatsapp' send."""
+    send, sent = _capture_send_callback()
+    tool = MessageTool(send_callback=send)
+    with tool.scoped(allowed_recipients={("WhatsApp", "primary_lid")}):
+        result = await tool.execute(
+            content="hi", channel="whatsapp", chat_id="primary_lid",
+        )
+    assert result.startswith("Message sent")
+
+
+@pytest.mark.asyncio
+async def test_scoped_recipient_chat_id_is_exact_match() -> None:
+    """chat_ids are opaque tokens — no substring or normalization. A
+    `chat_id` that differs by a single character is rejected."""
+    send, sent = _capture_send_callback()
+    tool = MessageTool(send_callback=send)
+    with tool.scoped(allowed_recipients={("whatsapp", "primary_lid")}):
+        result = await tool.execute(
+            content="hi", channel="whatsapp", chat_id="primary_lid ",  # trailing space
+        )
+    assert "is not permitted" in result
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_scoped_recipient_releases_on_exit() -> None:
+    """After the `with` block, the recipient pin is released — verifies the
+    ContextVar reset runs."""
+    send, sent = _capture_send_callback()
+    tool = MessageTool(send_callback=send)
+    with tool.scoped(allowed_recipients={("whatsapp", "primary_lid")}):
+        pass
+    result = await tool.execute(
+        content="hi", channel="whatsapp", chat_id="other",
+    )
+    assert result.startswith("Message sent")
+
+
+@pytest.mark.asyncio
+async def test_start_turn_pins_recipient_for_interactive_turn() -> None:
+    """The agent loop calls start_turn(channel, chat_id) per turn to lock the
+    `message` tool to the inbound sender. Any attempt to message a different
+    chat_id mid-turn (e.g., the LLM hallucinating another user's LID) is
+    refused."""
+    send, sent = _capture_send_callback()
+    tool = MessageTool(send_callback=send)
+    tool.start_turn(channel="whatsapp", chat_id="ebby_lid")
+
+    bad = await tool.execute(content="hi", channel="whatsapp", chat_id="emeka_lid")
+    assert "is not permitted" in bad
+    assert sent == []
+
+    good = await tool.execute(content="hi", channel="whatsapp", chat_id="ebby_lid")
+    assert good.startswith("Message sent")
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_turn_without_args_opens_the_gate() -> None:
+    """Backward compatibility: start_turn() with no args resets the per-turn
+    pin to None, so callers that don't yet pass channel/chat_id behave as
+    before (the channel-level scope guard is the only constraint)."""
+    send, sent = _capture_send_callback()
+    tool = MessageTool(send_callback=send)
+    tool.start_turn(channel="whatsapp", chat_id="ebby_lid")
+    # Now reset: a new turn with no pin.
+    tool.start_turn()
+    result = await tool.execute(content="hi", channel="whatsapp", chat_id="anyone")
+    assert result.startswith("Message sent")
+
+
+@pytest.mark.asyncio
+async def test_start_turn_resets_previous_pin() -> None:
+    """If a turn pinned to ebby ends and the next turn pins to seun, the
+    seun pin must not leak ebby into the allowed set."""
+    send, sent = _capture_send_callback()
+    tool = MessageTool(send_callback=send)
+    tool.start_turn(channel="whatsapp", chat_id="ebby_lid")
+    tool.start_turn(channel="whatsapp", chat_id="seun_lid")
+    bad = await tool.execute(content="hi", channel="whatsapp", chat_id="ebby_lid")
+    assert "is not permitted" in bad
+
+
+@pytest.mark.asyncio
+async def test_recipient_gate_passes_when_inside_allowed_channel_but_not_recipient() -> None:
+    """The two gates are independent. A send can pass the channel gate
+    (whatsapp is allowed) but still fail the recipient gate (chat_id is not).
+    Recipient is the stricter, final gate."""
+    send, sent = _capture_send_callback()
+    tool = MessageTool(send_callback=send)
+    with tool.scoped(
+        allowed_channels={"whatsapp"},
+        allowed_recipients={("whatsapp", "primary_lid")},
+    ):
+        result = await tool.execute(
+            content="leaked!", channel="whatsapp", chat_id="guest_lid",
+        )
+    assert "is not permitted" in result
+    assert "guest_lid" in result
+    assert sent == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "bad",
