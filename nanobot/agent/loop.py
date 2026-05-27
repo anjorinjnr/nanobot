@@ -33,7 +33,7 @@ from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTo
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.search import GlobTool, GrepTool
+from nanobot.agent.tools.search import GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.self import MyTool
 from nanobot.agent.tools.spawn import SpawnTool
@@ -202,10 +202,20 @@ class AgentLoop:
         scope_context_provider: str = "",
         disable_memory_writes: bool = False,
         tools_config: ToolsConfig | None = None,
+        # Upstream v0.2.0 additions accepted for compatibility with from_config
+        # and the slash commands wired through CommandRouter (`/model`, `/history`).
+        tool_hint_max_length: int | None = None,
+        consolidation_ratio: float | None = None,
+        max_messages: int = 120,
+        model_presets: "dict[str, Any] | None" = None,
+        model_preset: str | None = None,
+        provider_snapshot_loader: Any | None = None,
+        preset_snapshot_loader: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
         _tc = tools_config or ToolsConfig()
+        self.tools_config = _tc
         defaults = AgentDefaults()
         self.bus = bus
         self._guest_workspace = guest_workspace
@@ -243,14 +253,18 @@ class AgentLoop:
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
+        from nanobot.config.schema import ToolsConfig as _ToolsConfig
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
             bus=bus,
             model=self.model,
-            web_config=self.web_config,
+            tools_config=_ToolsConfig(
+                exec=self.exec_config,
+                web=self.web_config,
+                restrict_to_workspace=restrict_to_workspace,
+            ),
             max_tool_result_chars=self.max_tool_result_chars,
-            exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
             disabled_skills=disabled_skills,
         )
@@ -296,11 +310,130 @@ class AgentLoop:
         )
         self._register_default_tools()
         if _tc.my.enable:
-            self.tools.register(MyTool(loop=self, modify_allowed=_tc.my.allow_set))
+            self.tools.register(MyTool(runtime_state=self, modify_allowed=_tc.my.allow_set))
         self._runtime_vars: dict[str, Any] = {}
         self._current_iteration: int = 0
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+
+        # Upstream v0.2.0 preset/runtime kwargs — accept and minimally wire so
+        # CommandRouter's /model and /history commands can read state. Full
+        # preset switching (provider snapshot loaders, FallbackProvider) is a
+        # separate integration on top of homer's loop.
+        self.tool_hint_max_length = tool_hint_max_length
+        self.consolidation_ratio = consolidation_ratio
+        self.max_messages = max_messages if max_messages and max_messages > 0 else 120
+        self.model_presets = dict(model_presets) if model_presets else {}
+        self._active_preset: str | None = None
+        self._provider_snapshot_loader = provider_snapshot_loader
+        self._preset_snapshot_loader = preset_snapshot_loader
+        if model_preset:
+            try:
+                self.set_model_preset(model_preset)
+            except Exception:
+                logger.exception("Failed to apply initial model_preset={}", model_preset)
+
+    @property
+    def model_preset(self) -> str | None:
+        """Currently-active preset name, or None when on defaults."""
+        return self._active_preset
+
+    @model_preset.setter
+    def model_preset(self, name: str | None) -> None:
+        self.set_model_preset(name)
+
+    def set_model_preset(self, name: str | None, *, publish_update: bool = True) -> None:
+        """Switch the active model preset for future turns.
+
+        Minimal homer implementation: looks up the preset, swaps
+        ``self.model`` / ``self.context_window_tokens`` / provider generation
+        knobs. Does NOT rebuild the provider chain or fan changes out to
+        FallbackProvider — that wiring lives in upstream's preset_helpers
+        module and isn't backported here.
+        """
+        if name is None:
+            self._active_preset = None
+            return
+        preset = self.model_presets.get(name)
+        if preset is None:
+            raise KeyError(name)
+        # Allow either a pydantic ModelPresetConfig or a plain object that
+        # exposes the same attributes (max_tokens, model, etc.).
+        new_model = getattr(preset, "model", None)
+        new_ctx = getattr(preset, "context_window_tokens", None)
+        new_max_tokens = getattr(preset, "max_tokens", None)
+        new_temperature = getattr(preset, "temperature", None)
+        new_reasoning = getattr(preset, "reasoning_effort", None)
+        if new_model:
+            self.model = new_model
+            if hasattr(self, "subagents") and self.subagents is not None:
+                self.subagents.set_provider(self.provider, new_model)
+            if hasattr(self, "consolidator") and self.consolidator is not None:
+                self.consolidator.set_provider(
+                    self.provider, new_model,
+                    new_ctx if new_ctx is not None and new_ctx > 0 else self.context_window_tokens,
+                )
+            if hasattr(self, "dream") and self.dream is not None:
+                self.dream.set_provider(self.provider, new_model)
+        if new_ctx is not None and new_ctx > 0:
+            self.context_window_tokens = new_ctx
+        gen = getattr(self.provider, "generation", None)
+        if gen is not None:
+            if new_max_tokens is not None:
+                gen.max_tokens = new_max_tokens
+            if new_temperature is not None:
+                gen.temperature = new_temperature
+            if new_reasoning is not None:
+                gen.reasoning_effort = new_reasoning
+        self._active_preset = name
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Any,
+        bus: MessageBus | None = None,
+        **extra: Any,
+    ) -> AgentLoop:
+        """Construct an AgentLoop from a Config (Nanobot SDK entry point).
+
+        Upstream v0.2.0 introduced this classmethod. Homer keeps a thinner
+        version that maps Config onto homer's __init__ kwargs. ``extra``
+        overrides any of the standard config-derived values.
+        """
+        from nanobot.bus.queue import MessageBus as _MessageBus
+        from nanobot.providers.factory import make_provider
+
+        if bus is None:
+            bus = _MessageBus()
+        defaults = config.agents.defaults
+        provider = extra.pop("provider", None) or make_provider(config)
+        # Upstream's from_config accepts image_generation_provider_configs; homer
+        # doesn't wire image generation through the loop yet, so swallow it.
+        extra.pop("image_generation_provider_configs", None)
+        return cls(
+            bus=bus,
+            provider=provider,
+            workspace=Path(config.workspace_path) if not isinstance(config.workspace_path, Path) else config.workspace_path,
+            model=extra.pop("model", None) or defaults.model,
+            max_iterations=extra.pop("max_iterations", None) or defaults.max_tool_iterations,
+            context_window_tokens=extra.pop("context_window_tokens", None) or defaults.context_window_tokens,
+            context_block_limit=defaults.context_block_limit,
+            max_tool_result_chars=defaults.max_tool_result_chars,
+            provider_retry_mode=defaults.provider_retry_mode,
+            web_config=config.tools.web,
+            exec_config=config.tools.exec,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            mcp_servers=config.tools.mcp_servers,
+            channels_config=config.channels,
+            timezone=defaults.timezone,
+            unified_session=defaults.unified_session,
+            disabled_skills=defaults.disabled_skills,
+            session_ttl_minutes=defaults.session_ttl_minutes,
+            scope_context_provider=defaults.scope_context_provider,
+            disable_memory_writes=defaults.disable_memory_writes,
+            tools_config=config.tools,
+            **extra,
+        )
 
     # ── Audit logging ────────────────────────────────────────────────────────
 
@@ -348,8 +481,7 @@ class AgentLoop:
         )
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
-        for cls in (GlobTool, GrepTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(NotebookEditTool(workspace=self.workspace, allowed_dir=allowed_dir))
         if self.exec_config.enable:
             self.tools.register(
@@ -623,16 +755,20 @@ class AgentLoop:
         sender_id: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
+        from nanobot.agent.tools.context import RequestContext
         # Compute the effective session key (accounts for unified sessions)
         # so that subagent results route to the correct pending queue.
         effective_key = UNIFIED_SESSION_KEY if self._unified_session else f"{channel}:{chat_id}"
+        ctx = RequestContext(
+            channel=channel,
+            chat_id=chat_id,
+            message_id=message_id,
+            session_key=effective_key,
+        )
         for name in ("message", "spawn", "cron", "my"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    if name == "spawn":
-                        tool.set_context(channel, chat_id, effective_key=effective_key)
-                    else:
-                        tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    tool.set_context(ctx)
         # Stamp sender identity onto the exec tool so trusted scripts can
         # authenticate the requester from the runtime, not from LLM args.
         if exec_tool := self.tools.get("exec"):
@@ -1063,10 +1199,7 @@ class AgentLoop:
 
             session, pending = self.auto_compact.prepare_session(session, key)
 
-            await self.consolidator.maybe_consolidate_by_tokens(
-                session,
-                session_summary=pending,
-            )
+            await self.consolidator.maybe_consolidate_by_tokens(session)
             # Persist subagent follow-ups into durable history BEFORE prompt
             # assembly. ContextBuilder merges adjacent same-role messages for
             # provider compatibility, which previously caused the follow-up to
@@ -1199,10 +1332,7 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        await self.consolidator.maybe_consolidate_by_tokens(
-            session,
-            session_summary=pending,
-        )
+        await self.consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(
             msg.channel, msg.chat_id, msg.metadata.get("message_id"), sender_id=msg.sender_id,

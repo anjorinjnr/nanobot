@@ -610,8 +610,42 @@ class HeartbeatService:
                     await self._tick()
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error("Heartbeat error: {}", e)
+            except Exception:
+                logger.exception("Heartbeat error")
+
+    @staticmethod
+    def _is_deliverable(response: str) -> bool:
+        """Check if a heartbeat response is suitable for user delivery.
+
+        Filters out two classes of bad output before the evaluator runs:
+
+        1. **Finalization fallback** — the runner hit empty-response retries
+           and produced a canned error message.  For heartbeat, empty output
+           is a valid "nothing to report" outcome, not a failure.
+        2. **Leaked reasoning** — the model reflected internal file names,
+           decision logic, or meta-commentary instead of a user-facing report.
+        """
+        text = response.lower()
+
+        # Runner finalization fallback
+        if "couldn't produce a final answer" in text:
+            return False
+
+        # Leaked internal reasoning patterns
+        leaked_patterns = [
+            "heartbeat.md",
+            "awareness.md",
+            "judgment call:",
+            "decision logic",
+            "valid options are",
+            "my instructions",
+            "i am supposed to",
+            "strict heartbeat interpretation",
+        ]
+        if any(pattern in text for pattern in leaked_patterns):
+            return False
+
+        return True
 
     @staticmethod
     async def _run_pre_check(command: str) -> bool:
@@ -1034,7 +1068,7 @@ class HeartbeatService:
                         task_kind="heartbeat_system", is_synthetic=True,
                     ):
                         response = await self.on_execute(tasks_str, None)
-                    if response:
+                    if response and self._is_deliverable(response):
                         should_notify = await evaluate_response(
                             response, tasks_str, self.provider, self.model,
                             suppress_errors=self.suppress_errors,
@@ -1044,6 +1078,11 @@ class HeartbeatService:
                             await self.on_notify(response)
                         else:
                             logger.info("Heartbeat: silenced by post-run evaluation")
+                    elif response:
+                        logger.info(
+                            "Heartbeat: suppressed non-deliverable response ({})",
+                            response[:80],
+                        )
                 else:
                     # Tasks with Prompt-file dispatch separately, one per
                     # recipient, so per-user prompt files (e.g.
@@ -1071,7 +1110,7 @@ class HeartbeatService:
                         try:
                             with ctx:
                                 response = await self.on_execute(summary, model_override)
-                            if response:
+                            if response and self._is_deliverable(response):
                                 should_notify = await evaluate_response(
                                     response, summary, self.provider, self.model,
                                     suppress_errors=self.suppress_errors,
@@ -1081,6 +1120,11 @@ class HeartbeatService:
                                     await self.on_notify(response)
                                 else:
                                     logger.info("Heartbeat: silenced by post-run evaluation")
+                            elif response:
+                                logger.info(
+                                    "Heartbeat: suppressed non-deliverable response ({})",
+                                    response[:80],
+                                )
                         except Exception:
                             logger.exception("Heartbeat: task failed for {}", summary)
                         finally:

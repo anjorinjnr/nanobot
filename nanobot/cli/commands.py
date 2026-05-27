@@ -34,6 +34,18 @@ from rich.table import Table
 from rich.text import Text
 
 from nanobot import __logo__, __version__
+from nanobot.agent.loop import AgentLoop
+
+
+def _sanitize_surrogates(text: str) -> str:
+    """Reconstruct surrogate pairs into real characters; replace lone surrogates.
+
+    On Windows, console input may produce lone surrogate code points (e.g.
+    ``\\ud83d\\udc08`` for U+1F408).  Round-tripping through UTF-16 reconstructs
+    paired surrogates into their actual characters and replaces unpaired ones
+    with U+FFFD.
+    """
+    return text.encode("utf-16-le", errors="surrogatepass").decode("utf-16-le", errors="replace")
 
 
 class SafeFileHistory(FileHistory):
@@ -45,8 +57,7 @@ class SafeFileHistory(FileHistory):
     """
 
     def store_string(self, string: str) -> None:
-        safe = string.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
-        super().store_string(safe)
+        super().store_string(_sanitize_surrogates(string))
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
 from nanobot.config.paths import get_workspace_path, is_default_workspace
 from nanobot.config.schema import Config
@@ -211,8 +222,40 @@ async def _print_interactive_response(
     await run_in_terminal(_write)
 
 
-def _print_cli_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
-    """Print a CLI progress line, pausing the spinner if needed."""
+def _print_cli_progress_line(
+    text: str,
+    thinking: ThinkingSpinner | None,
+    renderer: object | None = None,
+) -> None:
+    """Print a CLI progress line, pausing the spinner if needed.
+
+    When *renderer* (a ``StreamRenderer``) is supplied:
+      * stop and clear any transient ``_live`` frame first, so the trace
+        line doesn't get clobbered by the next live update;
+      * open the assistant header (``ensure_header``) so the trace appears
+        *under* the bot row, not stranded under "You";
+      * pause via ``renderer.pause_spinner()`` so the renderer's own
+        spinner state stays in sync;
+      * print to ``renderer.console`` (which the renderer owns) instead
+        of the module-level ``console``.
+    """
+    if renderer is not None:
+        live = getattr(renderer, "_live", None)
+        if live is not None:
+            try:
+                live.stop()
+            finally:
+                renderer._live = None
+        ensure_header = getattr(renderer, "ensure_header", None)
+        if callable(ensure_header):
+            ensure_header()
+        pause_cm = renderer.pause_spinner() if hasattr(renderer, "pause_spinner") else (
+            thinking.pause() if thinking else nullcontext()
+        )
+        target_console = getattr(renderer, "console", console)
+        with pause_cm:
+            target_console.print(f"  [dim]↳ {text}[/dim]")
+        return
     with thinking.pause() if thinking else nullcontext():
         console.print(f"  [dim]↳ {text}[/dim]")
 
@@ -221,6 +264,60 @@ async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner 
     """Print an interactive progress line, pausing the spinner if needed."""
     with thinking.pause() if thinking else nullcontext():
         await _print_interactive_line(text)
+
+
+async def _print_cli_reasoning(
+    text: str, thinking: ThinkingSpinner | None, renderer: object | None = None,
+) -> None:
+    """Render the model's reasoning channel content in dim italic."""
+    def _write() -> None:
+        ansi = _render_interactive_ansi(
+            lambda c: c.print(f"  [dim italic]✻ {text}[/dim italic]")
+        )
+        print_formatted_text(ANSI(ansi), end="")
+
+    with thinking.pause() if thinking else nullcontext():
+        await run_in_terminal(_write)
+
+
+async def _maybe_print_interactive_progress(
+    msg, thinking, channels_config, renderer=None,
+) -> bool:
+    """Decide how (or whether) to surface a `_progress` / `_retry_wait` / reasoning
+    frame to the interactive CLI. Returns True iff the message was handled.
+
+    Routing rules (mirrors upstream v0.2.0):
+      * ``_retry_wait``       → always show as a progress line (the user needs
+        to see why the prompt looks frozen).
+      * ``_reasoning`` /
+        ``_reasoning_delta``  → show via ``_print_cli_reasoning`` when
+        ``channels_config.show_reasoning`` is True; otherwise suppressed.
+        The ``send_progress`` knob is orthogonal — reasoning has its own gate.
+      * other ``_progress``   → show as a progress line, gated by
+        ``send_progress`` / ``send_tool_hints``.
+      * everything else       → return False (caller renders the message itself).
+    """
+    metadata = msg.metadata or {}
+    if metadata.get("_retry_wait"):
+        await _print_interactive_progress_line(msg.content, thinking)
+        return True
+
+    is_reasoning = bool(metadata.get("_reasoning") or metadata.get("_reasoning_delta"))
+    if is_reasoning:
+        if getattr(channels_config, "show_reasoning", True):
+            await _print_cli_reasoning(msg.content, thinking, renderer)
+        return True
+
+    if metadata.get("_progress"):
+        is_tool_hint = bool(metadata.get("_tool_hint"))
+        if is_tool_hint and not getattr(channels_config, "send_tool_hints", False):
+            return True
+        if not is_tool_hint and not getattr(channels_config, "send_progress", True):
+            return True
+        await _print_interactive_progress_line(msg.content, thinking)
+        return True
+
+    return False
 
 
 def _is_exit_command(command: str) -> bool:
@@ -406,75 +503,18 @@ def _onboard_plugins(config_path: Path) -> None:
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config.
 
-    Routing is driven by ``ProviderSpec.backend`` in the registry.
+    Delegates instantiation + validation to
+    ``nanobot.providers.factory.make_provider`` (the upstream canonical
+    factory) and wraps its ``ValueError`` in a friendly ``typer.Exit``.
     """
     from nanobot.providers.base import GenerationSettings
-    from nanobot.providers.registry import find_by_name
+    from nanobot.providers.factory import make_provider
 
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
-    spec = find_by_name(provider_name) if provider_name else None
-    backend = spec.backend if spec else "openai_compat"
-
-    # --- validation ---
-    if backend == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
-            console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
-            console.print("Set them in ~/.nanobot/config.json under providers.azure_openai section")
-            console.print("Use the model field to specify the deployment name.")
-            raise typer.Exit(1)
-    elif backend == "openai_compat" and not model.startswith("bedrock/"):
-        needs_key = not (p and p.api_key)
-        exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
-        if needs_key and not exempt:
-            console.print("[red]Error: No API key configured.[/red]")
-            console.print("Set one in ~/.nanobot/config.json under providers section")
-            raise typer.Exit(1)
-
-    # --- instantiation by backend ---
-    if backend == "openai_codex":
-        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-
-        provider = OpenAICodexProvider(default_model=model)
-    elif backend == "azure_openai":
-        from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
-
-        provider = AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
-            default_model=model,
-        )
-    elif backend == "github_copilot":
-        from nanobot.providers.github_copilot_provider import GitHubCopilotProvider
-        provider = GitHubCopilotProvider(default_model=model)
-    elif backend == "anthropic":
-        from nanobot.providers.anthropic_provider import AnthropicProvider
-
-        provider = AnthropicProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
-    else:
-        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
-
-        provider = OpenAICompatProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            spec=spec,
-        )
-
-    # Tag the resolved provider name so $ai_generation telemetry can split
-    # spend by upstream (anthropic / gemini / openrouter / ...).
-    if spec is not None:
-        provider.provider_name = spec.name
-    elif backend == "anthropic":
-        provider.provider_name = "anthropic"
-
+    try:
+        provider = make_provider(config)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
     defaults = config.agents.defaults
     provider.generation = GenerationSettings(
         temperature=defaults.temperature,
@@ -560,7 +600,6 @@ def serve(
         raise typer.Exit(1)
 
     from loguru import logger
-    from nanobot.agent.loop import AgentLoop
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
     from nanobot.session.manager import SessionManager
@@ -659,7 +698,6 @@ def _run_gateway(
     open_browser_url: str | None = None,
 ) -> None:
     """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
-    from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.cron.service import CronService
@@ -732,9 +770,11 @@ def _run_gateway(
         from nanobot.utils.evaluator import evaluate_response
 
         reminder_note = (
-            "[Scheduled Task] Timer finished.\n\n"
-            f"Task '{job.name}' has been triggered.\n"
-            f"Scheduled instruction: {job.payload.message}"
+            "The scheduled time has arrived. Deliver this reminder to the user "
+            "now, as a brief and natural message in their language. Speak "
+            "directly to them — do not narrate progress, summarize, include "
+            "user IDs, or add status reports like 'Done' or 'Reminded'.\n\n"
+            f"Reminder: {job.payload.message}"
         )
 
         cron_tool = agent.tools.get("cron")
@@ -1103,7 +1143,6 @@ def agent(
     """Interact with the agent directly."""
     from loguru import logger
 
-    from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.cron.service import CronService
 
@@ -1127,30 +1166,12 @@ def agent(
         logger.disable("nanobot")
 
     _gw_cli = config.agents.defaults.guest_workspace
-    agent_loop = AgentLoop(
+    agent_loop = AgentLoop.from_config(
+        config,
         bus=bus,
         provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
-        web_config=config.tools.web,
-        context_block_limit=config.agents.defaults.context_block_limit,
-        max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
-        provider_retry_mode=config.agents.defaults.provider_retry_mode,
-        exec_config=config.tools.exec,
         cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-        timezone=config.agents.defaults.timezone,
         guest_workspace=Path(_gw_cli) if _gw_cli else None,
-        unified_session=config.agents.defaults.unified_session,
-        disabled_skills=config.agents.defaults.disabled_skills,
-        session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
-        scope_context_provider=config.agents.defaults.scope_context_provider,
-        disable_memory_writes=config.agents.defaults.disable_memory_writes,
-        tools_config=config.tools,
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):
@@ -1501,6 +1522,12 @@ app.add_typer(provider_app, name="provider")
 
 
 _LOGIN_HANDLERS: dict[str, callable] = {}
+_LOGOUT_HANDLERS: dict[str, callable] = {}
+
+_PROVIDER_DISPLAY: dict[str, str] = {
+    "openai_codex": "OpenAI Codex",
+    "github_copilot": "GitHub Copilot",
+}
 
 
 def _register_login(name: str):
@@ -1511,11 +1538,16 @@ def _register_login(name: str):
     return decorator
 
 
-@provider_app.command("login")
-def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
-):
-    """Authenticate with an OAuth provider."""
+def _register_logout(name: str):
+    def decorator(fn):
+        _LOGOUT_HANDLERS[name] = fn
+        return fn
+
+    return decorator
+
+
+def _resolve_oauth_provider(provider: str):
+    """Resolve and validate an OAuth provider configuration."""
     from nanobot.providers.registry import PROVIDERS
 
     key = provider.replace("-", "_")
@@ -1524,6 +1556,15 @@ def provider_login(
         names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)
         console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: {names}")
         raise typer.Exit(1)
+    return spec
+
+
+@provider_app.command("login")
+def provider_login(
+    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+):
+    """Authenticate with an OAuth provider."""
+    spec = _resolve_oauth_provider(provider)
 
     handler = _LOGIN_HANDLERS.get(spec.name)
     if not handler:
@@ -1532,6 +1573,75 @@ def provider_login(
 
     console.print(f"{__logo__} OAuth Login - {spec.label}\n")
     handler()
+
+
+@provider_app.command("logout")
+def provider_logout(
+    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+):
+    """Log out from an OAuth provider."""
+    spec = _resolve_oauth_provider(provider)
+
+    handler = _LOGOUT_HANDLERS.get(spec.name)
+    if not handler:
+        console.print(f"[red]Logout not implemented for {spec.label}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} OAuth Logout - {spec.label}\n")
+    handler()
+
+
+def _delete_oauth_files(token_path: Path, provider_label: str) -> None:
+    """Delete OAuth token + lock files, reporting the result."""
+    removed_paths: list[Path] = []
+    skipped: list[tuple[Path, OSError]] = []
+    for path in (token_path, token_path.with_suffix(".lock")):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            skipped.append((path, exc))
+            continue
+        removed_paths.append(path)
+
+    if not removed_paths and not skipped:
+        console.print(f"[yellow]! No local OAuth credentials found for {provider_label}[/yellow]")
+        return
+
+    if removed_paths:
+        console.print(f"[green]✓ Logged out from {provider_label}[/green]")
+        for path in removed_paths:
+            console.print(f"[dim]Removed: {path}[/dim]")
+    for path, exc in skipped:
+        console.print(f"[yellow]! Could not remove {path}: {exc}[/yellow]")
+
+
+@_register_logout("openai_codex")
+def _logout_openai_codex() -> None:
+    """Clear local OAuth credentials for OpenAI Codex."""
+    try:
+        from oauth_cli_kit.providers import OPENAI_CODEX_PROVIDER
+        from oauth_cli_kit.storage import FileTokenStorage
+    except ImportError:
+        console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
+        raise typer.Exit(1)
+
+    storage = FileTokenStorage(token_filename=OPENAI_CODEX_PROVIDER.token_filename)
+    _delete_oauth_files(storage.get_token_path(), _PROVIDER_DISPLAY["openai_codex"])
+
+
+@_register_logout("github_copilot")
+def _logout_github_copilot() -> None:
+    """Clear local OAuth credentials for GitHub Copilot."""
+    try:
+        from nanobot.providers.github_copilot_provider import get_storage
+    except ImportError:
+        console.print("[red]GitHub Copilot provider unavailable. Ensure oauth-cli-kit is installed.[/red]")
+        raise typer.Exit(1)
+
+    storage = get_storage()
+    _delete_oauth_files(storage.get_token_path(), _PROVIDER_DISPLAY["github_copilot"])
 
 
 @_register_login("openai_codex")

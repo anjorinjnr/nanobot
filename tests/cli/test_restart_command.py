@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import InboundMessage
 from nanobot.providers.base import LLMResponse
 
 
@@ -160,6 +160,7 @@ class TestRestartCommand:
         session = MagicMock()
         session.get_history.return_value = [{"role": "user"}] * 3
         loop.sessions = MagicMock()
+        loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
         loop._start_time = time.time() - 125
         loop._last_usage = {"prompt_tokens": 0, "completion_tokens": 0}
@@ -186,6 +187,7 @@ class TestRestartCommand:
         loop, _bus = _make_loop()
         session = MagicMock()
         session.get_history.return_value = [{"role": "user"}]
+        loop.sessions = MagicMock()
         loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
         loop.consolidator.estimate_session_prompt_tokens = MagicMock(
@@ -228,6 +230,7 @@ class TestRestartCommand:
         session = MagicMock()
         session.get_history.return_value = [{"role": "user"}]
         loop.sessions = MagicMock()
+        loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
         loop._last_usage = {"prompt_tokens": 1200, "completion_tokens": 34}
         loop.consolidator.estimate_session_prompt_tokens = MagicMock(
@@ -245,10 +248,102 @@ class TestRestartCommand:
         assert "Tasks: 0 active" in response.content
 
     @pytest.mark.asyncio
+    async def test_history_shows_recent_messages(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.get_history.return_value = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "tool", "content": "tool result"},  # should be filtered out
+            {"role": "user", "content": "How are you?"},
+            {"role": "assistant", "content": "I am doing well."},
+        ]
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "👤 You: Hello" in response.content
+        assert "🤖 Bot: Hi there!" in response.content
+        assert "tool result" not in response.content  # tool messages filtered
+        assert response.metadata == {"render_as": "text"}
+
+    @pytest.mark.asyncio
+    async def test_history_respects_count_argument(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.get_history.return_value = [
+            {"role": "user", "content": f"message {i}"} for i in range(20)
+        ]
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history 3")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "Last 3 message(s)" in response.content
+        assert "message 19" in response.content  # most recent
+        assert "message 0" not in response.content  # too old
+
+    @pytest.mark.asyncio
+    async def test_history_clamps_count_and_extracts_text_blocks(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.get_history.return_value = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "visible text"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+                ],
+            },
+            *({"role": "assistant", "content": f"reply {i}"} for i in range(60)),
+        ]
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history 999")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "Last 50 message(s)" in response.content
+        assert "visible text" not in response.content
+        assert "reply 59" in response.content
+        assert "reply 9" not in response.content
+
+    @pytest.mark.asyncio
+    async def test_history_invalid_count_returns_usage(self):
+        loop, _bus = _make_loop()
+
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history nope")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content.startswith("Usage: /history [count]")
+
+    @pytest.mark.asyncio
+    async def test_history_empty_session(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.get_history.return_value = []
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "No conversation history yet." in response.content
+
+    @pytest.mark.asyncio
     async def test_process_direct_preserves_render_metadata(self):
         loop, _bus = _make_loop()
         session = MagicMock()
         session.get_history.return_value = []
+        loop.sessions = MagicMock()
         loop.sessions = MagicMock()
         loop.sessions.get_or_create.return_value = session
         loop.subagents = MagicMock()
