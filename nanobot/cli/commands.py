@@ -941,11 +941,26 @@ def _run_gateway(
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
     @contextmanager
-    def heartbeat_execute_context(group_tasks: list[DueTask]):
-        """Clamp MessageTool to the group's Recipients channels, tag outgoing
-        sends so the spam guard can dedup per task, and set the
+    def heartbeat_execute_context(
+        group_tasks: list[DueTask],
+        *,
+        target: tuple[str, str] | None = None,
+    ):
+        """Clamp MessageTool to the group's Recipients channels, pin the
+        recipient when one is supplied by the per-recipient dispatcher, tag
+        outgoing sends so the spam guard can dedup per task, and set the
         ``$ai_generation`` task_kind so per-call telemetry knows this run is
-        heartbeat-driven (system vs user-defined)."""
+        heartbeat-driven (system vs user-defined).
+
+        ``target`` is the kernel-level guarantee: when the heartbeat fan-out
+        pre-resolves a (channel, chat_id) for this dispatch, we pin
+        MessageTool.allowed_recipients to exactly that pair. Any attempt by
+        the LLM to override chat_id mid-turn — the failure shape of
+        2026-05-27 — is refused at the tool layer. ``target`` is None only
+        for the legacy broadcast path (announcements with no Recipients);
+        in that case the recipient gate stays open, matching prior behavior
+        for that narrow case.
+        """
         from nanobot.analytics.llm_telemetry import llm_telemetry_context
 
         # ``system`` Type tasks are Homer's built-in maintenance (gmail
@@ -966,10 +981,13 @@ def _run_gateway(
             # Use "|" so task names that legitimately contain "," can't alias.
             tag = "|".join(sorted({t.name for t in group_tasks if t.task_type != "announcement"}))
 
+        allowed_recipients = [target] if target is not None else None
+
         with llm_telemetry_context(task_kind=kind, is_synthetic=True):
             if isinstance(message_tool, MessageTool):
                 with message_tool.scoped(
                     allowed_channels=allowed or None,
+                    allowed_recipients=allowed_recipients,
                     task_tag=tag or None,
                 ):
                     yield

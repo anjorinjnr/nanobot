@@ -284,7 +284,7 @@ class HeartbeatService:
         on_execute: Callable[[str, str | None], Coroutine[Any, Any, str]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         on_execute_context: (
-            Callable[[list["DueTask"]], AbstractContextManager[None]] | None
+            Callable[..., AbstractContextManager[None]] | None
         ) = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
@@ -1027,8 +1027,11 @@ class HeartbeatService:
             else:
                 message = f"{task.name} ({task.task_type})"
 
+            # Pass `target` to the context hook so the host (homer) can pin
+            # MessageTool.allowed_recipients to exactly this recipient — the
+            # hard guarantee that the LLM can't override chat_id mid-turn.
             ctx = (
-                self.on_execute_context([task])
+                self.on_execute_context([task], target=target)
                 if self.on_execute_context
                 else nullcontext()
             )
