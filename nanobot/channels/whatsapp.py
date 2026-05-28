@@ -22,6 +22,7 @@ from pydantic import Field
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.whatsapp_health import WhatsAppHealthMonitor
 from nanobot.channels.whatsapp_client import (
     InboundMessage as WAInboundMessage,
     WhatsAppClient,
@@ -78,6 +79,17 @@ class WhatsAppConfig(Base):
     # workspace isolation in multi-agent deployments where main and guest
     # have different filtered sender maps.
     sender_map_path: str | None = None
+
+    # Connection-health alerting. When the WA link drops/flaps/logs out,
+    # ping an admin on another channel (their Telegram stays up when WA is
+    # down) so the outage is visible without tailing logs. Opt-in: empty
+    # alert_chat_id → no alerts (the monitor still tracks state + telemetry).
+    alert_channel: str = ""              # e.g. "telegram"
+    alert_chat_id: str = ""              # admin's chat id on alert_channel
+    disconnect_alert_after_s: int = 60   # grace period before a "still down" alert
+    flap_threshold: int = 3              # transitions within flap_window_s → unstable alert
+    flap_window_s: int = 60
+    alert_debounce_s: int = 300          # at most one alert per condition per window
 
 
 def _whatsapp_auth_dir() -> Path:
@@ -136,6 +148,29 @@ class WhatsAppChannel(BaseChannel):
         self._sender_map: dict[str, str] = {}
         self._greeted_sessions: OrderedDict[str, None] = OrderedDict()
         self._lid_to_phone: dict[str, str] = {}
+        self._health = self._build_health_monitor()
+
+    def _build_health_monitor(self) -> WhatsAppHealthMonitor:
+        """Wire a health monitor that pings the configured admin channel on
+        WA outages. With no alert_chat_id, send_alert is None and the monitor
+        only tracks state + telemetry (opt-in alerting)."""
+        cfg = self.config
+        send_alert = None
+        if cfg.alert_channel and cfg.alert_chat_id:
+            async def _send_alert(text: str) -> None:
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=cfg.alert_channel,
+                    chat_id=cfg.alert_chat_id,
+                    content=text,
+                ))
+            send_alert = _send_alert
+        return WhatsAppHealthMonitor(
+            send_alert=send_alert,
+            disconnect_alert_after_s=cfg.disconnect_alert_after_s,
+            flap_threshold=cfg.flap_threshold,
+            flap_window_s=cfg.flap_window_s,
+            alert_debounce_s=cfg.alert_debounce_s,
+        )
 
     # ----------------------------------------------------------- lifecycle
 
@@ -354,6 +389,12 @@ class WhatsAppChannel(BaseChannel):
 
     async def _on_status(self, status: str) -> None:
         logger.info("WhatsApp status: {}", status)
+        # Health monitor: alert an admin on another channel when WA drops /
+        # flaps / logs out. Never let a monitor error break status handling.
+        try:
+            await self._health.on_status_change(status)
+        except Exception:
+            logger.exception("WA health monitor error on status={}", status)
         if status == "connected":
             self._connected = True
             self._connected_event.set()
