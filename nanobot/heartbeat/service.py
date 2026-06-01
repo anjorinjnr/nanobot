@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import re
 import shlex
 from dataclasses import dataclass
@@ -25,7 +26,9 @@ if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
 
 _SCHED_PAT = re.compile(r"Schedule:\s*(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)")
-_RECUR_PAT = re.compile(r"Recur:\s*every\s+(\d+)\s+(minute|hour|day|week)s?", re.IGNORECASE)
+_RECUR_PAT = re.compile(
+    r"Recur:\s*every\s+(\d+)\s+(minute|hour|day|week|month)s?", re.IGNORECASE,
+)
 _UNTIL_PAT = re.compile(r"Until:\s*(\d{4}-\d{2}-\d{2})")
 _LASTRUN_PAT = re.compile(r"Last-run:[^\n]*")
 _LASTRUN_VALUE_PAT = re.compile(
@@ -37,6 +40,31 @@ _RECIPIENTS_PAT = re.compile(r"^Recipients:\s*(.+)", re.MULTILINE)
 # `Id:` substrings inside free-form fields. Blocks predating the rollout
 # may not have an Id line — callers must handle None gracefully.
 _ID_PAT = re.compile(r"^Id:\s*(t_[a-z2-7]{8})\s*$", re.MULTILINE)
+
+
+def _apply_recur(dt: datetime, n: int, unit: str) -> datetime | None:
+    """Return ``dt`` advanced by ``n`` units, or ``None`` for unknown units.
+
+    Month arithmetic uses calendar months (not fixed 30-day deltas) so
+    ``every 1 month`` lands on the same day-of-month where possible,
+    clamped to the last day when the target month is shorter (Jan 31 +
+    1 month → Feb 28/29).
+    """
+    if unit == "minute":
+        return dt + timedelta(minutes=n)
+    if unit == "hour":
+        return dt + timedelta(hours=n)
+    if unit == "day":
+        return dt + timedelta(days=n)
+    if unit == "week":
+        return dt + timedelta(weeks=n)
+    if unit == "month":
+        total = dt.month - 1 + n
+        new_year = dt.year + total // 12
+        new_month = total % 12 + 1
+        last_day = calendar.monthrange(new_year, new_month)[1]
+        return dt.replace(year=new_year, month=new_month, day=min(dt.day, last_day))
+    return None
 
 
 def _effective_due(
@@ -60,15 +88,12 @@ def _effective_due(
         )
         amount = int(recur_match.group(1))
         unit = recur_match.group(2).lower()
-        delta = {
-            "minute": timedelta(minutes=amount),
-            "hour": timedelta(hours=amount),
-            "day": timedelta(days=amount),
-            "week": timedelta(weeks=amount),
-        }.get(unit, timedelta())
-    except (ValueError, KeyError):
+        next_run = _apply_recur(last_run_dt, amount, unit)
+        if next_run is None:
+            return schedule_dt, schedule_str
+    except ValueError:
         return schedule_dt, schedule_str
-    effective = max(schedule_dt, last_run_dt + delta)
+    effective = max(schedule_dt, next_run)
     return effective, effective.strftime("%Y-%m-%d %H:%M")
 
 def filter_heartbeat_response(
@@ -894,19 +919,22 @@ class HeartbeatService:
                     changed = True
                 continue
 
-            if recur_unit == "minute":
-                delta = timedelta(minutes=recur_n)
-            elif recur_unit == "hour":
-                delta = timedelta(hours=recur_n)
-            elif recur_unit == "week":
-                delta = timedelta(weeks=recur_n)
-            else:
-                delta = timedelta(days=recur_n)
-
-            next_dt = current_dt + delta
-            if next_dt <= now_naive:
-                intervals = (now_naive - next_dt) // delta + 1
-                next_dt += delta * intervals
+            next_dt = _apply_recur(current_dt, recur_n, recur_unit)
+            if next_dt is None:
+                # Unknown unit slipped past _RECUR_PAT — refuse to silently
+                # advance by a guessed delta (the regression that re-fired
+                # `every 1 month` tasks every tick because the unit had no
+                # branch here).
+                continue
+            # For variable-length units (month) the modulo trick doesn't
+            # work, so step until we're past now_naive. Bounded by the
+            # iteration count of (now - current_dt) / unit, which is tiny
+            # for any realistic clock skew.
+            while next_dt <= now_naive:
+                stepped = _apply_recur(next_dt, recur_n, recur_unit)
+                if stepped is None or stepped <= next_dt:
+                    break  # defensive: avoid infinite loop on bad input
+                next_dt = stepped
 
             if recur_unit in ("minute", "hour") or has_time:
                 next_str = next_dt.strftime("%Y-%m-%d %H:%M")

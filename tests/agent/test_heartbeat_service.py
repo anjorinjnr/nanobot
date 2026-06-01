@@ -1617,6 +1617,50 @@ def test_advance_schedules_minute_recurrence(advance_service) -> None:
     assert "Schedule: 2026-03-12 11:00" in updated
 
 
+def test_advance_schedules_monthly_recurrence(advance_service) -> None:
+    """`Recur: every 1 month` advances by one calendar month past now.
+
+    Regression: prior to the month-unit fix, _RECUR_PAT silently rejected
+    `month`, _advance_schedules_locked never wrote a new Schedule, and the
+    task re-fired every heartbeat tick (~26 deliveries in 10 minutes on a
+    real container on 2026-06-01).
+    """
+    now = datetime(2026, 6, 1, 13, 20)
+    heartbeat = _make_heartbeat(
+        "\n### Monthly report\nId: t_monthtest\nType: system\nSchedule: 2026-06-01 09:00\nRecur: every 1 month\nRecipients: primary:whatsapp\n"
+    )
+    service = advance_service(heartbeat)
+    tasks = [DueTask(
+        name="Monthly report", task_type="system",
+        schedule="2026-06-01 09:00", id="t_monthtest",
+    )]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    assert "Schedule: 2026-07-01 09:00" in updated
+    assert "Schedule: 2026-06-01 09:00" not in updated
+    assert "Last-run: 2026-06-01 13:20" in updated
+
+
+def test_advance_schedules_monthly_clamps_to_last_day(advance_service) -> None:
+    """Jan 31 + 1 month clamps to Feb 28/29 (calendar arithmetic, not 30-day delta)."""
+    now = datetime(2026, 2, 1, 9, 0)
+    heartbeat = _make_heartbeat(
+        "\n### Month-end report\nType: system\nSchedule: 2026-01-31 09:00\nRecur: every 1 month\nRecipients: primary:whatsapp\n"
+    )
+    service = advance_service(heartbeat)
+    tasks = [DueTask(name="Month-end report", task_type="system", schedule="2026-01-31 09:00")]
+
+    with _fixed_now(now):
+        service._advance_schedules(tasks)
+
+    updated = service.heartbeat_file.read_text()
+    # 2026 is not a leap year — Feb has 28 days.
+    assert "Schedule: 2026-02-28 09:00" in updated
+
+
 def test_advance_schedules_extra_whitespace(advance_service) -> None:
     """Schedule with extra whitespace after colon is still replaced correctly."""
     now = datetime(2026, 3, 12, 10, 30)
