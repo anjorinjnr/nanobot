@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import re
 import shlex
 from dataclasses import dataclass
@@ -25,7 +26,9 @@ if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
 
 _SCHED_PAT = re.compile(r"Schedule:\s*(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)")
-_RECUR_PAT = re.compile(r"Recur:\s*every\s+(\d+)\s+(minute|hour|day|week)s?", re.IGNORECASE)
+_RECUR_PAT = re.compile(
+    r"Recur:\s*every\s+(\d+)\s+(minute|hour|day|week|month)s?", re.IGNORECASE,
+)
 _UNTIL_PAT = re.compile(r"Until:\s*(\d{4}-\d{2}-\d{2})")
 _LASTRUN_PAT = re.compile(r"Last-run:[^\n]*")
 _LASTRUN_VALUE_PAT = re.compile(
@@ -37,6 +40,41 @@ _RECIPIENTS_PAT = re.compile(r"^Recipients:\s*(.+)", re.MULTILINE)
 # `Id:` substrings inside free-form fields. Blocks predating the rollout
 # may not have an Id line — callers must handle None gracefully.
 _ID_PAT = re.compile(r"^Id:\s*(t_[a-z2-7]{8})\s*$", re.MULTILINE)
+
+
+_FIXED_RECUR_DELTAS: dict[str, Callable[[int], timedelta]] = {
+    "minute": lambda n: timedelta(minutes=n),
+    "hour": lambda n: timedelta(hours=n),
+    "day": lambda n: timedelta(days=n),
+    "week": lambda n: timedelta(weeks=n),
+}
+
+
+def _recur_delta(n: int, unit: str) -> timedelta | None:
+    """Fixed-length delta for a recur unit, or ``None`` for variable-length
+    units (month) that need calendar arithmetic via :func:`_apply_recur`."""
+    factory = _FIXED_RECUR_DELTAS.get(unit)
+    return factory(n) if factory else None
+
+
+def _apply_recur(dt: datetime, n: int, unit: str) -> datetime | None:
+    """Return ``dt`` advanced by ``n`` units, or ``None`` for unknown units.
+
+    Month arithmetic uses calendar months (not fixed 30-day deltas) so
+    ``every 1 month`` lands on the same day-of-month where possible,
+    clamped to the last day when the target month is shorter (Jan 31 +
+    1 month → Feb 28/29).
+    """
+    delta = _recur_delta(n, unit)
+    if delta is not None:
+        return dt + delta
+    if unit == "month":
+        total = dt.month - 1 + n
+        new_year = dt.year + total // 12
+        new_month = total % 12 + 1
+        last_day = calendar.monthrange(new_year, new_month)[1]
+        return dt.replace(year=new_year, month=new_month, day=min(dt.day, last_day))
+    return None
 
 
 def _effective_due(
@@ -60,15 +98,12 @@ def _effective_due(
         )
         amount = int(recur_match.group(1))
         unit = recur_match.group(2).lower()
-        delta = {
-            "minute": timedelta(minutes=amount),
-            "hour": timedelta(hours=amount),
-            "day": timedelta(days=amount),
-            "week": timedelta(weeks=amount),
-        }.get(unit, timedelta())
-    except (ValueError, KeyError):
+        next_run = _apply_recur(last_run_dt, amount, unit)
+        if next_run is None:
+            return schedule_dt, schedule_str
+    except ValueError:
         return schedule_dt, schedule_str
-    effective = max(schedule_dt, last_run_dt + delta)
+    effective = max(schedule_dt, next_run)
     return effective, effective.strftime("%Y-%m-%d %H:%M")
 
 def filter_heartbeat_response(
@@ -894,19 +929,33 @@ class HeartbeatService:
                     changed = True
                 continue
 
-            if recur_unit == "minute":
-                delta = timedelta(minutes=recur_n)
-            elif recur_unit == "hour":
-                delta = timedelta(hours=recur_n)
-            elif recur_unit == "week":
-                delta = timedelta(weeks=recur_n)
+            delta = _recur_delta(recur_n, recur_unit)
+            if delta is not None:
+                # Fixed-length units: jump past now in one modulo step so a
+                # very stale `every 1 minute` task doesn't loop thousands of
+                # times.
+                next_dt = current_dt + delta
+                if next_dt <= now_naive:
+                    intervals = (now_naive - next_dt) // delta + 1
+                    next_dt += delta * intervals
             else:
-                delta = timedelta(days=recur_n)
-
-            next_dt = current_dt + delta
-            if next_dt <= now_naive:
-                intervals = (now_naive - next_dt) // delta + 1
-                next_dt += delta * intervals
+                # Variable-length units (month): months have unequal day
+                # counts so the modulo trick doesn't apply. Step calendar-
+                # accurately until past now. Bounded by the iteration count
+                # of (now - current_dt) / unit — at most ~12/year stale.
+                next_dt = _apply_recur(current_dt, recur_n, recur_unit)
+                if next_dt is None:
+                    # Unknown unit slipped past _RECUR_PAT — refuse to
+                    # silently advance by a guessed delta (the regression
+                    # that re-fired `every 1 month` tasks every tick).
+                    continue
+                while next_dt <= now_naive:
+                    stepped = _apply_recur(next_dt, recur_n, recur_unit)
+                    if stepped is None:
+                        # Defends against a future unit added to _RECUR_PAT
+                        # without a matching _apply_recur branch.
+                        break
+                    next_dt = stepped
 
             if recur_unit in ("minute", "hour") or has_time:
                 next_str = next_dt.strftime("%Y-%m-%d %H:%M")
