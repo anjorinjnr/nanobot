@@ -42,6 +42,21 @@ _RECIPIENTS_PAT = re.compile(r"^Recipients:\s*(.+)", re.MULTILINE)
 _ID_PAT = re.compile(r"^Id:\s*(t_[a-z2-7]{8})\s*$", re.MULTILINE)
 
 
+_FIXED_RECUR_DELTAS: dict[str, Callable[[int], timedelta]] = {
+    "minute": lambda n: timedelta(minutes=n),
+    "hour": lambda n: timedelta(hours=n),
+    "day": lambda n: timedelta(days=n),
+    "week": lambda n: timedelta(weeks=n),
+}
+
+
+def _recur_delta(n: int, unit: str) -> timedelta | None:
+    """Fixed-length delta for a recur unit, or ``None`` for variable-length
+    units (month) that need calendar arithmetic via :func:`_apply_recur`."""
+    factory = _FIXED_RECUR_DELTAS.get(unit)
+    return factory(n) if factory else None
+
+
 def _apply_recur(dt: datetime, n: int, unit: str) -> datetime | None:
     """Return ``dt`` advanced by ``n`` units, or ``None`` for unknown units.
 
@@ -50,14 +65,9 @@ def _apply_recur(dt: datetime, n: int, unit: str) -> datetime | None:
     clamped to the last day when the target month is shorter (Jan 31 +
     1 month → Feb 28/29).
     """
-    if unit == "minute":
-        return dt + timedelta(minutes=n)
-    if unit == "hour":
-        return dt + timedelta(hours=n)
-    if unit == "day":
-        return dt + timedelta(days=n)
-    if unit == "week":
-        return dt + timedelta(weeks=n)
+    delta = _recur_delta(n, unit)
+    if delta is not None:
+        return dt + delta
     if unit == "month":
         total = dt.month - 1 + n
         new_year = dt.year + total // 12
@@ -919,22 +929,33 @@ class HeartbeatService:
                     changed = True
                 continue
 
-            next_dt = _apply_recur(current_dt, recur_n, recur_unit)
-            if next_dt is None:
-                # Unknown unit slipped past _RECUR_PAT — refuse to silently
-                # advance by a guessed delta (the regression that re-fired
-                # `every 1 month` tasks every tick because the unit had no
-                # branch here).
-                continue
-            # For variable-length units (month) the modulo trick doesn't
-            # work, so step until we're past now_naive. Bounded by the
-            # iteration count of (now - current_dt) / unit, which is tiny
-            # for any realistic clock skew.
-            while next_dt <= now_naive:
-                stepped = _apply_recur(next_dt, recur_n, recur_unit)
-                if stepped is None or stepped <= next_dt:
-                    break  # defensive: avoid infinite loop on bad input
-                next_dt = stepped
+            delta = _recur_delta(recur_n, recur_unit)
+            if delta is not None:
+                # Fixed-length units: jump past now in one modulo step so a
+                # very stale `every 1 minute` task doesn't loop thousands of
+                # times.
+                next_dt = current_dt + delta
+                if next_dt <= now_naive:
+                    intervals = (now_naive - next_dt) // delta + 1
+                    next_dt += delta * intervals
+            else:
+                # Variable-length units (month): months have unequal day
+                # counts so the modulo trick doesn't apply. Step calendar-
+                # accurately until past now. Bounded by the iteration count
+                # of (now - current_dt) / unit — at most ~12/year stale.
+                next_dt = _apply_recur(current_dt, recur_n, recur_unit)
+                if next_dt is None:
+                    # Unknown unit slipped past _RECUR_PAT — refuse to
+                    # silently advance by a guessed delta (the regression
+                    # that re-fired `every 1 month` tasks every tick).
+                    continue
+                while next_dt <= now_naive:
+                    stepped = _apply_recur(next_dt, recur_n, recur_unit)
+                    if stepped is None:
+                        # Defends against a future unit added to _RECUR_PAT
+                        # without a matching _apply_recur branch.
+                        break
+                    next_dt = stepped
 
             if recur_unit in ("minute", "hour") or has_time:
                 next_str = next_dt.strftime("%Y-%m-%d %H:%M")
