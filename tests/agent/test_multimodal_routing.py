@@ -85,3 +85,25 @@ def test_vision_model_used_only_for_the_multimodal_turn():
     v = "google/gemini-3-flash-preview"
     assert _select(m, v, _TXT) == m   # text → cheap default
     assert _select(m, v, _IMG) == v   # image → vision
+
+
+def test_cli_direct_agentloop_constructions_forward_multimodal_model():
+    """Regression guard: the gateway/serve commands build AgentLoop directly
+    (not via from_config), so each direct construction MUST forward
+    multimodal_model — otherwise per-turn routing silently no-ops in the
+    gateway, which is the path homer actually runs.
+    """
+    import pathlib
+    import nanobot.cli.commands as cmds
+
+    src = pathlib.Path(cmds.__file__).read_text(encoding="utf-8")
+    # `AgentLoop(` matches only direct constructions; `AgentLoop.from_config(`
+    # contains `AgentLoop.`, not `AgentLoop(`.
+    n_direct = src.count("AgentLoop(")
+    n_multimodal = src.count("multimodal_model=")
+    assert n_direct >= 1, "expected at least one direct AgentLoop construction"
+    assert n_multimodal >= n_direct, (
+        f"{n_direct} direct AgentLoop() construction(s) but only {n_multimodal} "
+        "multimodal_model= kwarg(s) — a construction is dropping multimodal_model, "
+        "so per-turn vision routing will no-op there."
+    )
