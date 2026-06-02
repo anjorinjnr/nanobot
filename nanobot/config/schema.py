@@ -127,6 +127,13 @@ class AgentDefaults(Base):
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
+    # Optional vision-capable model id, used ONLY for turns whose content is
+    # multimodal (image/audio/etc.) and only when it differs from `model`.
+    # Lets a cheap text-only default (e.g. deepseek) coexist with a multimodal
+    # model (e.g. gemini) without paying the multimodal premium on text-only
+    # turns. Must be reachable via the same `provider` (true for OpenRouter,
+    # which routes by model-id prefix). Empty/None disables per-turn routing.
+    multimodal_model: str | None = None
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
     context_block_limit: int | None = None
