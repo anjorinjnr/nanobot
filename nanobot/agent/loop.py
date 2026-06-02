@@ -211,6 +211,7 @@ class AgentLoop:
         model_preset: str | None = None,
         provider_snapshot_loader: Any | None = None,
         preset_snapshot_loader: Any | None = None,
+        multimodal_model: str | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -223,6 +224,10 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        # Vision-capable model used only for multimodal turns (see
+        # _select_dispatch_model). Routed through the same provider — for
+        # OpenRouter that's just a different model-id prefix.
+        self.multimodal_model = multimodal_model or None
         self.max_iterations = (
             max_iterations if max_iterations is not None else defaults.max_tool_iterations
         )
@@ -415,6 +420,7 @@ class AgentLoop:
             provider=provider,
             workspace=Path(config.workspace_path) if not isinstance(config.workspace_path, Path) else config.workspace_path,
             model=extra.pop("model", None) or defaults.model,
+            multimodal_model=extra.pop("multimodal_model", None) or defaults.multimodal_model,
             max_iterations=extra.pop("max_iterations", None) or defaults.max_tool_iterations,
             context_window_tokens=extra.pop("context_window_tokens", None) or defaults.context_window_tokens,
             context_block_limit=defaults.context_block_limit,
@@ -434,6 +440,52 @@ class AgentLoop:
             tools_config=config.tools,
             **extra,
         )
+
+    # ── Per-turn model routing ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _messages_have_multimodal(messages: list[dict[str, Any]] | None) -> bool:
+        """True if any message carries a non-text content block.
+
+        OpenAI-style content is either a plain string (text) or a list of
+        typed blocks; image/audio/etc. arrive as blocks with a ``type`` other
+        than the text variants. We treat any such block as multimodal.
+        """
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") not in (None, "text", "input_text", "output_text")
+                ):
+                    return True
+        return False
+
+    def _select_dispatch_model(self, messages: list[dict[str, Any]] | None) -> str:
+        """Pick the model for this turn.
+
+        Routes to ``self.multimodal_model`` only when it's configured, differs
+        from the text default, and the turn actually contains multimodal
+        content — so text-only turns keep using the cheap default. The chosen
+        model rides the loop's existing provider (for OpenRouter that's the
+        same provider with a different model-id prefix).
+        """
+        if (
+            self.multimodal_model
+            and self.multimodal_model != self.model
+            and self._messages_have_multimodal(messages)
+        ):
+            logger.info(
+                "Multimodal content detected — routing turn to {} (text default: {})",
+                self.multimodal_model,
+                self.model,
+            )
+            return self.multimodal_model
+        return self.model
 
     # ── Audit logging ────────────────────────────────────────────────────────
 
@@ -935,7 +987,7 @@ class AgentLoop:
         result = await self.runner.run(AgentRunSpec(
             initial_messages=initial_messages,
             tools=self.tools,
-            model=model_override or self.model,
+            model=model_override or self._select_dispatch_model(initial_messages),
             max_iterations=self.max_iterations,
             max_tool_result_chars=self.max_tool_result_chars,
             hook=hook,
