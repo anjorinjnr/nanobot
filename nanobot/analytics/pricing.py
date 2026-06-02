@@ -32,11 +32,20 @@ USD_PER_MTOK: dict[str, tuple[float, float] | tuple[float, float, float]] = {
     "gemini/gemini-3-flash-preview": (0.30, 2.50),
     "gemini/gemini-3.1-pro-preview": (1.25, 10.00),
     # OpenRouter — DeepSeek
-    # Both slugs exist in the wild: switch_model.py's `default-cheap`
-    # preset emits `deepseek/deepseek-v3.2` (which litellm prefixes to
-    # `openrouter/deepseek/deepseek-v3.2`), while OR also exposes the
-    # `deepseek-chat-v3.2` and `:free` variants. Price them all the
-    # same — the v3.2 SKU is one price tier.
+    # V4 (released 2026-04-24) is the current default tier: the
+    # `default-cheap`/`cheap`/`deepseek-flash` presets emit
+    # `deepseek/deepseek-v4-flash` (litellm prefixes to
+    # `openrouter/deepseek/deepseek-v4-flash`); `deepseek-pro` emits the
+    # pro variant. Without these rows default-tier calls price at $0.
+    # Rates pulled from the OpenRouter models API (per-MTok); the third
+    # element is the cache-read rate — V4 cache reads are ~5x (flash) /
+    # ~120x (pro) cheaper than fresh input, so omitting it would bill
+    # cache hits at the input rate and badly overstate Homer's cost.
+    "openrouter/deepseek/deepseek-v4-flash": (0.0983, 0.1966, 0.0197),
+    "openrouter/deepseek/deepseek-v4-pro": (0.4350, 0.8700, 0.0036),
+    # V3.2 retained for back-compat with pre-V4 tasks/telemetry. Both
+    # slugs exist in the wild (litellm-prefixed `deepseek/deepseek-v3.2`
+    # and OR's `deepseek-chat-v3.2` / `:free` variants); one price tier.
     "openrouter/deepseek/deepseek-v3.2": (0.27, 0.41),
     "openrouter/deepseek/deepseek-chat-v3.2": (0.27, 0.41),
     "openrouter/deepseek/deepseek-chat-v3.2:free": (0.0, 0.0),
