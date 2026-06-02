@@ -267,16 +267,22 @@ class DueTask:
         return list(self._iter_recipient_entries())
 
 
-# Canonical preset slate — kept in lockstep with homer's tools/switch_model.py
-# MODELS dict. Every entry resolves to an OpenRouter slug (vendor/model) because
+# Built-in fallback slate — used only when a gateway config supplies no
+# `modelPresets`. The canonical source of truth is homer's tools/presets.py;
+# hosted tenants ship that slate via the config template and override this.
+# Kept roughly in lockstep so bare/non-hosted nanobot still resolves presets.
+# Every entry resolves to an OpenRouter slug (vendor/model) because
 # the consolidation migrated all tenant LLM traffic to OpenRouter sub-keys.
 # Older aliases (flash25, flash, pro, sonnet, haiku) are retained for back-compat
 # with tasks predating the consolidation but should be considered deprecated.
 MODEL_PRESETS: dict[str, str] = {
     # OpenRouter-routed canonical presets
     "auto":            "openrouter/auto",
-    "cheap":           "deepseek/deepseek-v3.2",
-    "default-cheap":   "deepseek/deepseek-v3.2",
+    "cheap":           "deepseek/deepseek-v4-flash",
+    "default-cheap":   "deepseek/deepseek-v4-flash",
+
+    "deepseek-flash":  "deepseek/deepseek-v4-flash",
+    "deepseek-pro":    "deepseek/deepseek-v4-pro",
 
     "gemini-fast":     "google/gemini-2.5-flash",
     "gemini-balanced": "google/gemini-2.5-pro",
