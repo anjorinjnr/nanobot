@@ -15,7 +15,7 @@ from loguru import logger
 
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
+from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook, TurnMetadata
 from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.runner import (
     STOP_EMPTY_FINAL,
@@ -250,6 +250,27 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+        # Homer fork: register lifecycle adapters so analytics + persistence
+        # flow through the AgentHook surface instead of inline
+        # _process_message calls. Each impl env-gates itself, so registration
+        # is a no-op when the corresponding env vars are unset (OSS deploys,
+        # CI). Order is independent — both run inside the composite's
+        # error-isolated fan-out.
+        from nanobot.analytics.analytics_agent_hook import AnalyticsAgentHook
+        from nanobot.analytics.chat_persist_hook import ChatPersistAgentHook
+        self._extra_hooks.append(
+            AnalyticsAgentHook(schedule_background=self._schedule_background)
+        )
+        self._extra_hooks.append(
+            ChatPersistAgentHook(schedule_background=self._schedule_background)
+        )
+        # Composite used for turn-scoped lifecycle (before_turn / after_turn).
+        # Distinct from the per-iteration composite built in _run_agent_loop —
+        # turn hooks fire once per _process_message, iteration hooks fire once
+        # per LLM step.
+        self._turn_hook: AgentHook = (
+            CompositeHook(self._extra_hooks) if self._extra_hooks else AgentHook()
+        )
         self._scope_context_provider = scope_context_provider or ""
         self._scope_context_fn: Callable[[str], str] | None = None
         self._disable_memory_writes = bool(disable_memory_writes)
@@ -1306,14 +1327,8 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        # PostHog analytics — capture inbound context. Skip for synthetic
-        # messages (heartbeat, cron) so we don't record agent-initiated
-        # activity as user-sent messages.
-        from nanobot.analytics.hook import get_analytics_hook
-        _analytics = get_analytics_hook()
         _synthetic = bool(msg.metadata.get("synthetic"))
         _synthetic_trigger_kind = str(msg.metadata.get("trigger_kind") or "synthetic")
-        _synthetic_start = time.monotonic() if _synthetic else 0.0
 
         # Pre-turn quota gate (default-tier weekly token budget). Bails fast
         # for synthetic / byok / managed turns; on a hard cap-hit we send
@@ -1340,34 +1355,24 @@ class AgentLoop:
         sessions = guest[1] if guest else self.sessions
         blocked_tools = guest[2] if guest else frozenset()
 
-        _analytics_ctx = None if _synthetic else _analytics.on_message_received(
+        # Per-turn AgentHook lifecycle. The same TurnMetadata instance is
+        # passed to before_turn and after_turn so hooks can stash state on it
+        # (e.g. chat_persist and analytics each stash their inbound ctx).
+        # Failures are isolated inside the composite — a faulty hook can't
+        # break the turn.
+        turn = TurnMetadata(
             channel=msg.channel,
             sender_id=msg.sender_id,
+            chat_id=msg.chat_id,
             content=msg.content,
-            media=msg.media,
+            media=[p for p in (msg.media or []) if isinstance(p, str) and p],
             timestamp=msg.timestamp,
+            is_synthetic=_synthetic,
+            message_id=msg.metadata.get("message_id"),
             is_guest=guest is not None,
+            trigger_kind=_synthetic_trigger_kind if _synthetic else None,
         )
-
-        # hist_chat_messages persistence (homer family-history). No-op unless
-        # HOMER_CHAT_PERSIST_ENABLED + Supabase env are set; failures swallow.
-        # Synthetic turns (heartbeat/cron) are not chat and shouldn't land in
-        # the contributor's transcript.
-        from nanobot.analytics.chat_persist import get_chat_persist_hook
-        _chat_persist = get_chat_persist_hook()
-        _chat_ctx = None
-        if not _synthetic:
-            try:
-                _chat_ctx = await _chat_persist.on_message_received(
-                    channel=msg.channel,
-                    sender_id=msg.sender_id,
-                    content=msg.content,
-                    media=msg.media,
-                    timestamp=msg.timestamp,
-                    schedule_background=self._schedule_background,
-                )
-            except Exception:
-                logger.debug("chat_persist on_message_received error (non-fatal)", exc_info=True)
+        await self._turn_hook.before_turn(turn)
 
         key = session_key or msg.session_key
         session = sessions.get_or_create(key)
@@ -1543,55 +1548,16 @@ class AgentLoop:
             preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
             logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        # PostHog analytics — fire events after response is built. The
-        # user-facing path emits message_sent / agent_responded; the
-        # synthetic path emits a single agent_initiated_action so
-        # proactive work (briefings, reminder fires, scheduled tasks)
-        # is visible without polluting the user-message funnel.
-        if _analytics_ctx is not None:
-            _tools = tools_used or []
-            escalation_used = "escalate" in _tools or "resolve_escalation" in _tools
-            try:
-                await _analytics.on_response_sent(
-                    _analytics_ctx,
-                    response_content=final_content,
-                    tools_used=_tools,
-                    escalation_triggered=escalation_used,
-                    schedule_background=self._schedule_background,
-                )
-            except Exception:
-                logger.debug("Analytics hook error (non-fatal)", exc_info=True)
-        elif _synthetic:
-            # The empty-final placeholder isn't a "real" response — drop it
-            # before reporting so had_outbound stays accurate.
-            _final = (
-                None
-                if stop_reason in (STOP_EMPTY_FINAL, STOP_INTENTIONAL_SILENCE)
-                else final_content
-            )
-            try:
-                _analytics.track_agent_initiated_action(
-                    trigger_kind=_synthetic_trigger_kind,
-                    response_content=_final,
-                    tools_used=tools_used or [],
-                    latency_ms=int((time.monotonic() - _synthetic_start) * 1000),
-                )
-            except Exception:
-                logger.debug("agent_initiated_action emit failed", exc_info=True)
-
-        # Persist assistant reply to hist_chat_messages. _chat_ctx is None
-        # when persistence is disabled, the channel is unsupported, or the
-        # sender didn't resolve to a contributor — all already logged in
-        # on_message_received.
-        if _chat_ctx is not None:
-            try:
-                await _chat_persist.on_response_sent(
-                    _chat_ctx,
-                    response_content=final_content,
-                    schedule_background=self._schedule_background,
-                )
-            except Exception:
-                logger.debug("chat_persist on_response_sent error (non-fatal)", exc_info=True)
+        # Fire after_turn lifecycle. Hooks read state stashed during
+        # before_turn and consume the now-populated reply fields on turn:
+        # analytics fires message_sent/agent_responded (user) or
+        # agent_initiated_action (synthetic); chat_persist pairs the
+        # contributor ctx with the assistant reply. Errors are isolated
+        # inside the composite.
+        turn.response_content = final_content
+        turn.stop_reason = stop_reason
+        turn.tools_used = list(tools_used or [])
+        await self._turn_hook.after_turn(turn)
 
         meta = dict(msg.metadata or {})
         streamed = on_stream is not None and stop_reason != STOP_ERROR
