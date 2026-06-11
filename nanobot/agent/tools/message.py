@@ -280,6 +280,31 @@ class MessageTool(Tool, ContextAware):
                 return "Error: buttons must be a list of list of strings"
         default_channel = self._default_channel.get()
         default_chat_id = self._default_chat_id.get()
+
+        # During a heartbeat dispatch the default channel/chat_id point at a
+        # synthetic "user" placeholder, NOT a deliverable chat. Falling back
+        # to those silently routes the message to nowhere reachable — the
+        # tool reports success, the bus drops the send, and the user sees
+        # nothing. Detect heartbeat context via the task_tag scoped var
+        # (set by heartbeat_execute_context for every non-announcement task)
+        # and require explicit routing args. Fail loudly so the agent retries
+        # with a chat_id it actually resolved from the task's Recipients.
+        in_heartbeat = self._task_tag.get() is not None
+        if in_heartbeat:
+            if not chat_id:
+                return (
+                    "Error: chat_id is required during heartbeat dispatches. "
+                    "Look up the recipient's chat_id from USER.md — the task's "
+                    "Recipients field carries an alias like `primary:whatsapp`; "
+                    "resolve the alias to the participant's JID for that channel."
+                )
+            if not channel:
+                return (
+                    "Error: channel is required during heartbeat dispatches. "
+                    "The task's Recipients field carries the channel after the "
+                    "colon, e.g. `primary:whatsapp` -> channel='whatsapp'."
+                )
+
         channel = channel or default_channel
         explicit_chat_id = chat_id
         if (
