@@ -29,9 +29,12 @@ P95/P99 latency dashboards. See issue #52.
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
 import os
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterator
 
 from nanobot.analytics.pricing import estimate_cost_usd
@@ -291,13 +294,73 @@ def emit_retry_aggregate(props: dict[str, Any]) -> None:
         logger.debug("emit_retry_aggregate failed: %s", exc)
 
 
+def _cost_ledger_path() -> Path | None:
+    """Local per-call cost ledger path, or None when not configured.
+
+    Tenant containers can't read PostHog back (capture-only key), so the
+    weekly cost report sums this local ledger instead of re-estimating from
+    session logs. Defaults under the agent workspace (bind-mounted /data, so
+    it survives image rebuilds); overridable via ``NANOBOT_COST_LEDGER``.
+    """
+    override = os.environ.get("NANOBOT_COST_LEDGER")
+    if override:
+        return Path(override)
+    workspace = os.environ.get("HOMER_WORKSPACE")
+    if workspace:
+        return Path(workspace) / "analytics" / "llm_ledger.jsonl"
+    return None
+
+
+def _append_cost_ledger(props: dict[str, Any]) -> None:
+    """Append one compact cost row to the local ledger. Fire-and-forget.
+
+    Carries the actually-routed model and the provider's authoritative
+    charge (``cost_served``) when present, so the report is correct
+    per-model, cache-aware, and includes tool/heartbeat calls the session
+    log never records. Must never raise — observability can't crash callers.
+
+    Concurrency: a single JSON line is well under PIPE_BUF, so O_APPEND
+    writes from the main and guest gateway processes are atomic and don't
+    interleave.
+    """
+    try:
+        path = _cost_ledger_path()
+        if path is None:
+            return
+        row: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "model": props.get("$ai_model"),
+            "provider": props.get("$ai_provider"),
+            "in": props.get("$ai_input_tokens", 0),
+            "out": props.get("$ai_output_tokens", 0),
+            "cache": props.get("$ai_cache_read_input_tokens", 0),
+            "cost": props.get("$ai_total_cost_usd", 0.0),
+            "task": props.get("task_kind"),
+            "retry": props.get("retry_count", 1),
+            "err": bool(props.get("$ai_is_error", False)),
+        }
+        served = props.get("$ai_model_served")
+        if served:
+            row["model_served"] = served
+        cost_served = props.get("$ai_cost_usd_served")
+        if cost_served is not None:
+            row["cost_served"] = cost_served
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except Exception as exc:  # noqa: BLE001 — ledger must never crash telemetry
+        logger.debug("cost ledger append failed: %s", exc)
+
+
 def _emit_event(props: dict[str, Any]) -> None:
     """Send one ``$ai_generation`` capture call.
 
     Centralized so the default emission path and the retry-aggregation
     path share the same posthog wiring (init guard, distinct_id, group
-    identify).
+    identify) — and the same local cost-ledger append.
     """
+    # Local ledger first, independent of PostHog availability.
+    _append_cost_ledger(props)
     try:
         hid = _household_id()
         from nanobot.analytics.hook import get_analytics_hook
